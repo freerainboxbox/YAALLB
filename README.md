@@ -10,6 +10,8 @@ You can specify a VRAM limit on your Apple Silicon Mac in MB, and YAALLB will se
 
 ```
 main.py            FastAPI app and CLI launcher (--address, --port)
+abstractions/      Base types: Provider, Model, ModelDescriptor, LoadOptions
+providers/         Concrete providers: LMStudioProvider, DwarfStarProvider
 tests/             pytest suite
 pyproject.toml     Project metadata and dependencies (uv-managed)
 ```

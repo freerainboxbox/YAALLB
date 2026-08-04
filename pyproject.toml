@@ -8,3 +8,6 @@ dependencies = [
     "pytest>=9.1.1",
     "uvicorn>=0.30",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
