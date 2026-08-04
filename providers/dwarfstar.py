@@ -14,6 +14,10 @@ class DwarfStarProvider(Provider):
         self.host = host
         self.port = port
 
+    @property
+    def endpoint_uri(self) -> str:
+        return f"http://{self.host}:{self.port}/v1"
+
     def getModelsDescriptors(self) -> list[ModelDescriptor]:
         # TODO: query ds4's model list endpoint.
         return []

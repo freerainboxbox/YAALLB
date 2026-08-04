@@ -10,6 +10,11 @@ if TYPE_CHECKING:
 class Provider(ABC):
     @property
     @abstractmethod
+    def endpoint_uri(self) -> str:
+        """Base URI where all reverse proxy requests are forwarded."""
+
+    @property
+    @abstractmethod
     def Model(self) -> type["Model"]:
         """The concrete Model subclass this provider creates."""
 
