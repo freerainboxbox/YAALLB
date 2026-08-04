@@ -6,4 +6,5 @@ dependencies = [
     "fastapi>=0.141.1",
     "lmstudio>=1.5.0",
     "pytest>=9.1.1",
+    "uvicorn>=0.30",
 ]
