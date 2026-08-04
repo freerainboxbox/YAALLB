@@ -1,6 +1,6 @@
 ## Yet Another Apple LLM Load Balancer
 
-A VRAM-aware LLM load balancer, quick and dirty, to point to your existing LLM runners, and is VRAM-aware.
+A VRAM-aware LLM load balancer, quick and dirty, to point to your existing LLM runners.
 
 Currently targets LM Studio and antirez/ds4. More may be supported later.
 
