@@ -28,6 +28,7 @@ import uvicorn
 
 DEFAULT_VRAM_LIMIT_MIB = 24576
 DEFAULT_CTX_LENGTH = 4096
+STARTUP_ATTEMPTS = 10
 
 DEFAULT_YAALLB_CONFIG = {
     "address": "127.0.0.1",
@@ -197,6 +198,46 @@ def model_not_found_error(model_id: str) -> dict:
     }
 
 
+def startup_failure(provider: Provider, response: Response, detail: str):
+    """Handle a provider that isn't ready yet (e.g. ds4-server still starting).
+
+    Each failed startup attempt bumps a per-provider counter. While it is
+    below STARTUP_ATTEMPTS the request is answered 503 with Retry-After: 2 so
+    the client can retry; once the counter reaches STARTUP_ATTEMPTS, answer 500
+    instead. The counter resets when the provider eventually serves a request.
+    """
+    failures = getattr(provider, "startup_failures", 0) + 1
+    provider.startup_failures = failures
+    if failures < STARTUP_ATTEMPTS:
+        log.warning(
+            f"provider {provider.endpoint_uri} not ready "
+            f"({failures}/{STARTUP_ATTEMPTS}): {detail}"
+        )
+        response.status_code = 503
+        response.headers["Retry-After"] = "2"
+        return {
+            "error": {
+                "message": f"provider {provider.endpoint_uri} starting",
+                "type": "temporarily_unavailable",
+                "param": None,
+                "code": "provider_starting",
+            }
+        }
+    log.error(
+        f"provider {provider.endpoint_uri} failed to start "
+        f"after {STARTUP_ATTEMPTS} attempts: {detail}"
+    )
+    response.status_code = 500
+    return {
+        "error": {
+            "message": f"provider {provider.endpoint_uri} failed to start",
+            "type": "server_error",
+            "param": None,
+            "code": "provider_start_failed",
+        }
+    }
+
+
 async def _forward_chat(provider: Provider, body: dict, stream: bool):
     """Proxy /v1/chat/completions to the provider.
 
@@ -249,31 +290,22 @@ async def chat_completions(body: dict, response: Response):
     )
     try:
         result = await _forward_chat(provider, forward_body, stream)
-    except httpx.HTTPError:
-        log.error(f"upstream {provider.endpoint_uri} unreachable")
+    except httpx.HTTPError as e:
         SCHEDULER.release(model)
-        response.status_code = 502
-        return {
-            "error": {
-                "message": f"upstream {provider.endpoint_uri} unreachable",
-                "type": "api_error",
-                "param": None,
-                "code": "upstream_unreachable",
-            }
-        }
+        return startup_failure(
+            provider, response, f"connection error: {e}"
+        )
 
     if stream:
         client, upstream = result
         if upstream.status_code != 200:
-            log.error(
-                f"upstream {provider.endpoint_uri} "
-                f"error status={upstream.status_code}"
-            )
             SCHEDULER.release(model)
             await client.aclose()
-            response.status_code = upstream.status_code
-            return await upstream.aread()
+            return startup_failure(
+                provider, response, f"upstream status {upstream.status_code}"
+            )
 
+        provider.startup_failures = 0
         async def event_stream():
             try:
                 async for chunk in upstream.aiter_raw():
@@ -290,9 +322,11 @@ async def chat_completions(body: dict, response: Response):
 
     upstream = result
     if upstream.status_code != 200:
-        log.error(
-            f"upstream {provider.endpoint_uri} error status={upstream.status_code}"
+        SCHEDULER.release(model)
+        return startup_failure(
+            provider, response, f"upstream status {upstream.status_code}"
         )
+    provider.startup_failures = 0
     SCHEDULER.release(model)
     return Response(
         content=upstream.content,

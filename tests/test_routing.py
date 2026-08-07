@@ -5,6 +5,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 import main
+from main import STARTUP_ATTEMPTS
 from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model as BaseModel
@@ -153,7 +154,7 @@ def test_chat_completions_sends_api_key_header(monkeypatch):
     assert headers == {"Authorization": "Bearer sk-test"}
 
 
-def test_chat_completions_forwards_upstream_status(monkeypatch):
+def test_chat_completions_upstream_not_ready_returns_503(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     main.PROVIDERS = [prov_a]
     main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
@@ -168,8 +169,67 @@ def test_chat_completions_forwards_upstream_status(monkeypatch):
             "/v1/chat/completions", json={"model": "model-a", "messages": []}
         )
 
+    # A non-200 upstream during startup becomes 503 + Retry-After: 2.
     assert resp.status_code == 503
-    assert resp.json() == {"error": {"message": "boom"}}
+    assert resp.headers["retry-after"] == "2"
+    assert resp.json()["error"]["code"] == "provider_starting"
+    assert prov_a.startup_failures == 1
+
+
+def test_chat_completions_connection_error_retries_then_500(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    class RaisingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def aclose(self):
+            pass
+
+        async def post(self, url, json, headers):
+            raise httpx.ConnectError("ds4-server not up")
+
+        def build_request(self, method, url, json, headers):
+            return {"url": url, "json": json, "headers": headers}
+
+        async def send(self, req, stream=False):
+            raise httpx.ConnectError("ds4-server not up")
+
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: RaisingClient())
+
+    with TestClient(main.app) as client:
+        for _ in range(STARTUP_ATTEMPTS - 1):
+            resp = client.post(
+                "/v1/chat/completions", json={"model": "model-a", "messages": []}
+            )
+            assert resp.status_code == 503
+            assert resp.headers["retry-after"] == "2"
+        # The 10th failure escalates to 500.
+        resp = client.post(
+            "/v1/chat/completions", json={"model": "model-a", "messages": []}
+        )
+        assert resp.status_code == 500
+        assert resp.json()["error"]["code"] == "provider_start_failed"
+
+
+def test_chat_completions_success_resets_startup_failures(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    prov_a.startup_failures = 9
+    fake = FakeAsyncClient(nonstream=FakeResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        client.post("/v1/chat/completions", json={"model": "model-a", "messages": []})
+
+    assert prov_a.startup_failures == 0
 
 
 def test_chat_completions_streams_sse(monkeypatch):

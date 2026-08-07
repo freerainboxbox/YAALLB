@@ -116,9 +116,14 @@ still enforces the budget) when sudo is denied or a password is required.
 Each provider's `host`/`port` (or `endpoint_uri`) doubles as the reverse-proxy
 target: `/v1/chat/completions` schedules a model, then forwards the request
 body to `{endpoint_uri}/chat/completions` and relays the upstream response
-back. `stream: true` requests are proxied as an SSE stream; upstream failures
-return `502 upstream unreachable`. The model stays in-flight (so it isn't
-evicted) until the upstream reply completes.
+back. `stream: true` requests are proxied as an SSE stream. The model stays
+in-flight (so it isn't evicted) until the upstream reply completes.
+
+When a provider isn't ready yet (e.g. ds4-server is still starting up),
+YAALLB answers `503` with `Retry-After: 2` so the client can retry, instead
+of surfacing a 4XX/connection error. Each failure bumps a per-provider
+startup counter; after `STARTUP_ATTEMPTS` (10) failures it escalates to
+`500`. The counter resets once the provider serves a request successfully.
 
 ### ds4
 
