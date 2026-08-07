@@ -541,3 +541,108 @@ def test_load_providers_disabled_types(tmp_path):
 def test_load_providers_missing_config(tmp_path):
     providers = main.load_providers(str(tmp_path / "nope.json"))
     assert providers == []
+
+
+def test_set_iogpu_wired_limit_success(monkeypatch):
+    calls = []
+    current = 107520
+
+    def fake_run(argv, **kw):
+        calls.append((argv, kw))
+        if argv == ["/usr/sbin/sysctl", "-n", "iogpu.wired_limit_mb"]:
+            class Read:
+                returncode = 0
+                stdout = str(current)
+                stderr = ""
+
+            return Read()
+        class Write:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return Write()
+
+    monkeypatch.setattr("main.shutil.which", lambda _: "/usr/sbin/sysctl")
+    monkeypatch.setattr("main.subprocess.run", fake_run)
+
+    assert main.set_iogpu_wired_limit(112640) is True
+    write_argv, write_kw = calls[1]
+    assert write_argv == ["/usr/sbin/sysctl", "-w", "iogpu.wired_limit_mb=112640"]
+    assert write_kw["timeout"] == 10
+
+
+def test_set_iogpu_wired_limit_already_set(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        class Read:
+            returncode = 0
+            stdout = "112640"
+            stderr = ""
+
+        return Read()
+
+    monkeypatch.setattr("main.shutil.which", lambda _: "/usr/sbin/sysctl")
+    monkeypatch.setattr("main.subprocess.run", fake_run)
+
+    assert main.set_iogpu_wired_limit(112640) is True
+    # No write attempted: only the read happened.
+    assert calls == [["/usr/sbin/sysctl", "-n", "iogpu.wired_limit_mb"]]
+
+
+def test_set_iogpu_wired_limit_not_permitted(monkeypatch):
+    def fake_run(argv, **kw):
+        if argv == ["/usr/sbin/sysctl", "-n", "iogpu.wired_limit_mb"]:
+            class Read:
+                returncode = 0
+                stdout = "107520"
+                stderr = ""
+
+            return Read()
+        class Write:
+            returncode = 1
+            stdout = ""
+            stderr = "Operation not permitted"
+
+        return Write()
+
+    monkeypatch.setattr("main.shutil.which", lambda _: "/usr/sbin/sysctl")
+    monkeypatch.setattr("main.subprocess.run", fake_run)
+
+    assert main.set_iogpu_wired_limit(112640) is False
+
+
+def test_set_iogpu_wired_limit_unreadable_still_writes(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        if argv == ["/usr/sbin/sysctl", "-n", "iogpu.wired_limit_mb"]:
+            class Read:
+                returncode = 1
+                stdout = ""
+                stderr = ""
+
+            return Read()
+        class Write:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return Write()
+
+    monkeypatch.setattr("main.shutil.which", lambda _: "/usr/sbin/sysctl")
+    monkeypatch.setattr("main.subprocess.run", fake_run)
+
+    assert main.set_iogpu_wired_limit(112640) is True
+    assert calls == [
+        ["/usr/sbin/sysctl", "-n", "iogpu.wired_limit_mb"],
+        ["/usr/sbin/sysctl", "-w", "iogpu.wired_limit_mb=112640"],
+    ]
+
+
+def test_set_iogpu_wired_limit_no_sysctl(monkeypatch):
+    monkeypatch.setattr("main.shutil.which", lambda _: None)
+    assert main.set_iogpu_wired_limit(112640) is False

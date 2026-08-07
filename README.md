@@ -74,6 +74,13 @@ Requests for an eviction target are **line-cut** (served first out of the
 queue) and **drained** (in-flight I/O completes) before the model is actually
 unloaded, so no request is cut off mid-generation.
 
+On startup YAALLB sets the macOS Metal VRAM cap to match `vram_limit_mb` via
+`sysctl iogpu.wired_limit_mb=<mb>`. It first reads the current value (no
+privileges needed); if it already matches, no write is attempted, so you only
+need `sudo` once after a reboot — unless you change `vram_limit_mb`. The write
+itself is privileged: YAALLB logs a warning and continues (the software
+scheduler still enforces the budget) when it is not permitted.
+
 Each provider's `host`/`port` (or `endpoint_uri`) doubles as the reverse-proxy
 target: `/v1/chat/completions` schedules a model, then forwards the request
 body to `{endpoint_uri}/chat/completions` and relays the upstream response

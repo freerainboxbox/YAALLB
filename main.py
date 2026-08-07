@@ -8,6 +8,8 @@ every provider.
 
 import argparse
 import json
+import shutil
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -82,6 +84,72 @@ def load_vram_limit(config_path: str) -> int:
     with open(config_path) as f:
         config = json.load(f)
     return config.get("vram_limit_mb", DEFAULT_VRAM_LIMIT_MIB)
+
+
+def read_iogpu_wired_limit() -> int | None:
+    """Read the current macOS Metal VRAM cap in MiB (no privileges needed).
+
+    Returns None if the sysctl is unavailable or cannot be read.
+    """
+    sysctl = shutil.which("sysctl")
+    if sysctl is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [sysctl, "-n", "iogpu.wired_limit_mb"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return int(proc.stdout.strip())
+    except ValueError:
+        return None
+
+
+def set_iogpu_wired_limit(vram_limit_mb: int) -> bool:
+    """Set the macOS Metal VRAM cap to match YAALLB's budget.
+
+    Requires root (sudo), since the kernel sysctl is privileged. Returns True
+    on success. On failure logs a warning; YAALLB's own scheduler still enforces
+    the budget in software regardless.
+    """
+    current = read_iogpu_wired_limit()
+    if current == vram_limit_mb:
+        log.info(
+            f"iogpu.wired_limit_mb already {vram_limit_mb}; no sudo needed"
+        )
+        return True
+    log.info(
+        f"iogpu.wired_limit_mb={current if current is not None else '?'}, "
+        f"target={vram_limit_mb} -> requesting write"
+    )
+    sysctl = shutil.which("sysctl")
+    if sysctl is None:
+        log.warning("sysctl unavailable; cannot set iogpu.wired_limit_mb")
+        return False
+    try:
+        proc = subprocess.run(
+            [sysctl, "-w", f"iogpu.wired_limit_mb={vram_limit_mb}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as e:
+        log.warning(f"failed to set iogpu.wired_limit_mb: {e}")
+        return False
+    if proc.returncode != 0:
+        log.warning(
+            f"could not set iogpu.wired_limit_mb={vram_limit_mb} "
+            f"(requires root): {proc.stderr.strip()}"
+        )
+        return False
+    log.info(f"set iogpu.wired_limit_mb={vram_limit_mb}")
+    return True
 
 
 def model_not_found_error(model_id: str) -> dict:
@@ -222,12 +290,15 @@ def main() -> None:
 
     providers = load_providers(args.config)
     PROVIDERS.extend(providers)
-    SCHEDULER = Scheduler(PROVIDERS, load_vram_limit(args.config))
+    vram_limit_mb = load_vram_limit(args.config)
+    SCHEDULER = Scheduler(PROVIDERS, vram_limit_mb)
+
+    set_iogpu_wired_limit(vram_limit_mb)
 
     log.info(
         f"starting yaallb on {args.address}:{args.port} "
         f"providers={[p._type_id for p in providers]} "
-        f"vram_limit={load_vram_limit(args.config)} MiB"
+        f"vram_limit={vram_limit_mb} MiB"
     )
 
     uvicorn.run(app, host=args.address, port=args.port)
