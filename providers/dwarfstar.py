@@ -61,6 +61,7 @@ DS4_COMMAND_TEMPLATE = "{binary} -m {gguf_path} {host_port} {options} --ctx {ctx
 
 class DwarfStarProvider(Provider):
     _type_id = "ds4"
+    single_resident = True
 
     class Model(BaseModel):
         def memory(self) -> float:

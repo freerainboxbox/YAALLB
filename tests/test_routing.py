@@ -9,6 +9,7 @@ from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model as BaseModel
 from abstractions.provider import Provider
+from scheduling import Scheduler
 
 
 class FakeProvider(Provider):
@@ -49,35 +50,159 @@ class FakeProvider(Provider):
 @pytest.fixture(autouse=True)
 def reset_providers():
     main.PROVIDERS = []
+    main.SCHEDULER = None
     yield
     main.PROVIDERS = []
+    main.SCHEDULER = None
 
 
-def test_chat_completions_happy_path():
+class FakeResponse:
+    def __init__(
+        self,
+        content=b'{"choices":[{"index":0}],"usage":{}}',
+        status_code=200,
+        content_type="application/json",
+    ):
+        self.content = content
+        self.status_code = status_code
+        self.headers = {"content-type": content_type}
+
+
+class FakeStreamResponse:
+    def __init__(self, chunks=(b'data: {"x":1}\n\n', b"data: [DONE]\n\n")):
+        self.chunks = chunks
+        self.status_code = 200
+        self.headers = {"content-type": "text/event-stream"}
+
+    async def aiter_raw(self):
+        for c in self.chunks:
+            yield c
+
+    async def aread(self):
+        return b'{"error":{"message":"boom"}}'
+
+
+class FakeAsyncClient:
+    def __init__(self, nonstream=None, stream=None):
+        self.nonstream = nonstream
+        self.stream = stream
+        self.calls = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def aclose(self):
+        pass
+
+    async def post(self, url, json, headers):
+        self.calls.append(("post", url, json, headers))
+        return self.nonstream
+
+    def build_request(self, method, url, json, headers):
+        return {"url": url, "json": json, "headers": headers}
+
+    async def send(self, req, stream=False):
+        self.calls.append(("send", req["url"], req["json"], req["headers"]))
+        return self.stream
+
+
+def test_chat_completions_forwards_to_provider(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
-    prov_b = FakeProvider("http://b.example/v1", ["model-b"])
-    main.PROVIDERS = [prov_a, prov_b]
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
 
-    resp = TestClient(main.app).post(
-        "/v1/chat/completions",
-        json={"model": "model-a", "messages": []},
-    )
+    fake = FakeAsyncClient(nonstream=FakeResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "max_tokens": 512},
+        )
 
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["model"] == "model-a"
-    assert body["provider"] == prov_a.endpoint_uri
-    assert body["status"] == "routed"
+    assert resp.json() == {"choices": [{"index": 0}], "usage": {}}
+    method, url, json, headers = fake.calls[0]
+    assert method == "post"
+    assert url == "http://a.example/v1/chat/completions"
+    assert json["model"] == "model-a"
+    assert json["max_tokens"] == 512
+    assert headers == {}
+
+    # Model released once the upstream request completes.
+    model = main.SCHEDULER.resident[0]
+    assert main.SCHEDULER.in_flight[model] == 0
+
+
+def test_chat_completions_sends_api_key_header(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.api_key = "sk-test"
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(nonstream=FakeResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        client.post("/v1/chat/completions", json={"model": "model-a", "messages": []})
+
+    method, url, json, headers = fake.calls[0]
+    assert headers == {"Authorization": "Bearer sk-test"}
+
+
+def test_chat_completions_forwards_upstream_status(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(
+        nonstream=FakeResponse(b'{"error":{"message":"boom"}}', status_code=503)
+    )
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions", json={"model": "model-a", "messages": []}
+        )
+
+    assert resp.status_code == 503
+    assert resp.json() == {"error": {"message": "boom"}}
+
+
+def test_chat_completions_streams_sse(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "stream": True, "messages": []},
+        )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert resp.content == b'data: {"x":1}\n\ndata: [DONE]\n\n'
+    assert fake.calls[0][0] == "send"
+    assert fake.calls[0][1] == "http://a.example/v1/chat/completions"
 
 
 def test_chat_completions_not_found():
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
 
-    resp = TestClient(main.app).post(
-        "/v1/chat/completions",
-        json={"model": "does-not-exist"},
-    )
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "does-not-exist"},
+        )
 
     assert resp.status_code == 404
     body = resp.json()["error"]

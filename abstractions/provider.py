@@ -10,6 +10,11 @@ if TYPE_CHECKING:
 
 
 class Provider(ABC):
+    # Whether this provider can hold only a single loaded model at a time
+    # (e.g. ds4). When true, any resident model from the provider serves all
+    # of that provider's model IDs.
+    single_resident = False
+
     def __init__(self, _instance_id: int = 0, config: dict | None = None) -> None:
         self._instance_id = _instance_id
         self.api_key: str | None = None
@@ -48,7 +53,7 @@ class Provider(ABC):
         return resp.json().get("data", [])
 
     def _auth_headers(self) -> dict:
-        if self.api_key:
+        if getattr(self, "api_key", None):
             return {"Authorization": f"Bearer {self.api_key}"}
         return {}
 

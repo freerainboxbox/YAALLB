@@ -43,6 +43,7 @@ list of instance config objects:
 
 ```json
 {
+  "vram_limit_mb": 24576,
   "ds4": [ {config for instance 0}, {config for instance 1}, ... ],
   "lms":  [ ... ],
   ... (other provider types, defined later)
@@ -53,6 +54,20 @@ The position in each list is that instance's `_instance_id`. Types that are
 absent are simply disabled. Each instance object is applied on top of the
 provider's built-in defaults, so you only need to write the fields you want
 to override.
+
+`vram_limit_mb` (top-level, default `24576`) is the global VRAM budget in
+MiB. YAALLB keeps models resident under this budget: when a new load would
+exceed it, the least-impact resident models are evicted first (requests for
+evicted models are drained/line-cut first so in-flight I/O completes), then
+the model is loaded. Models that report `memory() == 0` (future cloud
+providers) are loaded without eviction.
+
+Each provider's `host`/`port` (or `endpoint_uri`) doubles as the reverse-proxy
+target: `/v1/chat/completions` schedules a model, then forwards the request
+body to `{endpoint_uri}/chat/completions` and relays the upstream response
+back. `stream: true` requests are proxied as an SSE stream; upstream failures
+return `502 upstream unreachable`. The model stays in-flight (so it isn't
+evicted) until the upstream reply completes.
 
 ### ds4
 
