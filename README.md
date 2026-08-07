@@ -10,6 +10,8 @@ You can specify a VRAM limit on your Apple Silicon Mac in MB, and YAALLB will se
 
 ```
 main.py            FastAPI app, OpenAI-compatible routes, CLI launcher
+scheduling.py      VRAM-aware model scheduler and eviction
+log.py             Colored, ISO-timestamped logging to stderr
 abstractions/      Base types: Provider, Model, ModelDescriptor, LoadOptions; routing
 providers/         Concrete providers: LMStudioProvider, DwarfStarProvider
 config.json        Provider instances per type ("lms", "ds4", ...)

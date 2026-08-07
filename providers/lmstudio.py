@@ -1,6 +1,7 @@
 import re
 import subprocess
 
+import log
 from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model as BaseModel
@@ -14,12 +15,17 @@ def _estimate_gpu_memory(model_id: str, ctx_length: int) -> float:
         text=True,
     )
     if proc.returncode != 0:
+        log.error(
+            f"lms estimate failed for {model_id} "
+            f"(exit {proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
+        )
         raise RuntimeError(
             f"lms estimate failed (exit {proc.returncode}): "
             f"{proc.stderr.strip() or proc.stdout.strip()}"
         )
     match = re.search(r"Estimated GPU Memory:\s*([\d.]+)\s*(MiB|GiB)", proc.stdout)
     if match is None:
+        log.error(f"unexpected lms output for {model_id}: {proc.stdout!r}")
         raise RuntimeError(
             f"unexpected lms output, no GPU memory estimate: {proc.stdout!r}"
         )

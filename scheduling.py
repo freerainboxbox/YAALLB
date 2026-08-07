@@ -1,9 +1,14 @@
 import asyncio
 from collections import defaultdict
 
+import log
 from abstractions.model import Model
 from abstractions.provider import Provider
 from abstractions.routing import lookup_model
+
+
+def _provider_label(provider: Provider) -> str:
+    return f"{provider._type_id}#{getattr(provider, '_instance_id', 0)}"
 
 
 class ModelNotFound(Exception):
@@ -137,10 +142,24 @@ class Scheduler:
             shortfall = mem - self.current_free()
             if shortfall > 0:
                 to_evict = select_evictions(self.resident, shortfall)
+                log.warning(
+                    f"reallocate: new model={model_id} "
+                    f"provider={_provider_label(provider)} "
+                    f"evicting=[{', '.join(m.descriptor.modelId for m in to_evict)}]"
+                )
                 await self._quiesce(to_evict)
                 for m in to_evict:
+                    log.warning(
+                        f"unload model={m.descriptor.modelId} "
+                        f"provider={_provider_label(m.descriptor.provider)}"
+                    )
                     m.descriptor.provider.unloadModel(m)
                 self.resident = [m for m in self.resident if m not in to_evict]
+        log.warning(
+            f"load model={model_id} "
+            f"provider={_provider_label(provider)} "
+            f"ctx={load_options.ctx_length}"
+        )
         provider.loadModel(model)
         self.resident.append(model)
         self.in_flight[model] += 1

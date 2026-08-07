@@ -15,6 +15,7 @@ import httpx
 from fastapi import FastAPI, Response
 from starlette.responses import StreamingResponse
 
+import log
 from abstractions.load_options import LoadOptions
 from abstractions.provider import Provider
 from abstractions.routing import lookup_model
@@ -110,14 +111,21 @@ async def chat_completions(body: dict, response: Response):
     try:
         model = await SCHEDULER.submit(model_id, LoadOptions(ctx_length=ctx_length))
     except ModelNotFound:
+        log.error(f"model not found: {model_id}")
         response.status_code = 404
         return model_not_found_error(model_id)
 
     provider = model.descriptor.provider
     stream = body.get("stream", False)
+    log.info(
+        f"chat request model={model_id} "
+        f"provider={provider._type_id}#{getattr(provider, '_instance_id', 0)} "
+        f"stream={stream} ctx={ctx_length}"
+    )
     try:
         result = await _forward_chat(provider, body, stream)
     except httpx.HTTPError:
+        log.error(f"upstream {provider.endpoint_uri} unreachable")
         SCHEDULER.release(model)
         response.status_code = 502
         return {
@@ -132,6 +140,10 @@ async def chat_completions(body: dict, response: Response):
     if stream:
         client, upstream = result
         if upstream.status_code != 200:
+            log.error(
+                f"upstream {provider.endpoint_uri} "
+                f"error status={upstream.status_code}"
+            )
             SCHEDULER.release(model)
             await client.aclose()
             response.status_code = upstream.status_code
@@ -152,6 +164,10 @@ async def chat_completions(body: dict, response: Response):
         )
 
     upstream = result
+    if upstream.status_code != 200:
+        log.error(
+            f"upstream {provider.endpoint_uri} error status={upstream.status_code}"
+        )
     SCHEDULER.release(model)
     return Response(
         content=upstream.content,
@@ -191,8 +207,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    PROVIDERS.extend(load_providers(args.config))
+    providers = load_providers(args.config)
+    PROVIDERS.extend(providers)
     SCHEDULER = Scheduler(PROVIDERS, load_vram_limit(args.config))
+
+    log.info(
+        f"starting yaallb on {args.address}:{args.port} "
+        f"providers={[p._type_id for p in providers]} "
+        f"vram_limit={load_vram_limit(args.config)} MiB"
+    )
 
     uvicorn.run(app, host=args.address, port=args.port)
 
