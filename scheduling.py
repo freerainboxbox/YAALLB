@@ -11,6 +11,12 @@ def _provider_label(provider: Provider) -> str:
     return f"{provider._type_id}#{getattr(provider, '_instance_id', 0)}"
 
 
+# How long stop() waits for queued/in-flight requests to drain before force
+# tearing down the coordinator, so a stuck upstream or disconnected client
+# can't hang graceful shutdown forever.
+STOP_DRAIN_TIMEOUT = 30.0
+
+
 class ModelNotFound(Exception):
     def __init__(self, model_id: str) -> None:
         super().__init__(f"model not found: {model_id}")
@@ -71,12 +77,17 @@ class Scheduler:
         if self._task is None:
             self._task = asyncio.create_task(self._run())
 
-    async def stop(self) -> None:
+    async def stop(self, timeout: float = STOP_DRAIN_TIMEOUT) -> None:
         if self._task is None:
             return
         # Graceful shutdown: flush queued requests and wait for in-flight ones
-        # to finish before tearing down the coordinator.
+        # to finish before tearing down the coordinator. The drain is bounded
+        # by a deadline so a stuck upstream (or disconnected client) that never
+        # releases its model can't hang shutdown indefinitely.
+        deadline = asyncio.get_running_loop().time() + timeout
         while self.pending or any(self.in_flight.values()):
+            if asyncio.get_running_loop().time() >= deadline:
+                break
             await asyncio.sleep(0)
         self._wake.set()
         self._task.cancel()

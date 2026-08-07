@@ -256,6 +256,20 @@ def test_scheduler_stop_waits_for_in_flight():
     run(scenario())
 
 
+def test_scheduler_stop_times_out_when_in_flight_never_drains():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 100})
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        m1 = await s.submit("m1", LoadOptions())  # never released
+        # stop() must not hang forever: it force-tears-down after the drain
+        # deadline even when an in-flight stream never completes.
+        await s.stop(timeout=0.05)
+        assert s._task is None
+
+    run(scenario())
+
+
 def test_scheduler_load_runs_off_thread():
     import threading
 
