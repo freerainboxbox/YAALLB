@@ -65,7 +65,7 @@ class DwarfStarProvider(Provider):
 
     class Model(BaseModel):
         def memory(self) -> float:
-            ctx = self.loadOptions.ctx_length
+            ctx = self.descriptor.provider._effective_ctx()
             if ctx >= 4224:
                 return 83065.32 + 16416 * ctx / (2**20)
             return 83065.32 + 0.015655 * ctx
@@ -77,6 +77,7 @@ class DwarfStarProvider(Provider):
         self.gguf_path: str | None = None
         self.binary: str = DS4_DEFAULT_BINARY
         self.options: dict = {}
+        self.ctx_length: int | None = None
         self.resident_model: BaseModel | None = None
         self._process: subprocess.Popen | None = None
         super().__init__(_instance_id, config)
@@ -85,6 +86,15 @@ class DwarfStarProvider(Provider):
     def endpoint_uri(self) -> str:
         return f"http://{self.host}:{self.port}/v1"
 
+    def _effective_ctx(self) -> int:
+        # ds4 sets --ctx once at startup and both served models inherit it, so
+        # the provider-level ctx_length (when set) overrides any per-model one.
+        if self.ctx_length is not None:
+            return self.ctx_length
+        if self.resident_model is not None:
+            return self.resident_model.loadOptions.ctx_length
+        return DS4_CONTEXT_LENGTH
+
     def getModelsDescriptors(self) -> list[ModelDescriptor]:
         return [
             ModelDescriptor("deepseek-v4-flash", self),
@@ -92,9 +102,7 @@ class DwarfStarProvider(Provider):
         ]
 
     def getOAIModels(self) -> list[dict]:
-        ctx_length = DS4_CONTEXT_LENGTH
-        if self.resident_model is not None:
-            ctx_length = self.resident_model.loadOptions.ctx_length
+        ctx_length = self._effective_ctx()
 
         def model_entry(model_id: str) -> dict:
             return {
@@ -132,7 +140,7 @@ class DwarfStarProvider(Provider):
         return self.Model(descriptor, loadOptions)
 
     def _build_command(self, model: BaseModel) -> list[str]:
-        ctx_length = model.loadOptions.ctx_length
+        ctx_length = self._effective_ctx()
 
         host_port = []
         if self.host != DS4_DEFAULT_HOST:

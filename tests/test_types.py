@@ -4,7 +4,7 @@ from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model
 from abstractions.provider import Provider
-from providers.dwarfstar import DwarfStarProvider
+from providers.dwarfstar import DS4_CONTEXT_LENGTH, DwarfStarProvider
 from providers.lmstudio import LMStudioProvider
 
 
@@ -109,10 +109,15 @@ def test_providers_list_descriptors(monkeypatch):
 
 
 def test_dwarfstar_memory_piecewise():
+    # Without a provider ctx_length, memory uses the resident model's ctx
+    # (or DS4_CONTEXT_LENGTH when nothing is resident). With one set, the
+    # provider-level ctx wins regardless of the model's load options.
     p = DwarfStarProvider()
     small = p.createModel(ModelDescriptor("b", p), LoadOptions(ctx_length=4096))
-    assert small.memory() == pytest.approx(83065.32 + 0.015655 * 4096)
-    big = p.createModel(ModelDescriptor("b", p), LoadOptions(ctx_length=8192))
+    assert small.memory() == pytest.approx(83065.32 + 16416 * DS4_CONTEXT_LENGTH / (2**20))
+
+    p2 = DwarfStarProvider(config={"ctx_length": 8192})
+    big = p2.createModel(ModelDescriptor("b", p2), LoadOptions(ctx_length=4096))
     assert big.memory() == pytest.approx(83065.32 + 16416 * 8192 / (2**20))
 
 

@@ -383,10 +383,38 @@ def test_dwarfstar_build_command():
     ]
 
 
+def test_dwarfstar_provider_ctx_overrides_model_ctx():
+    from providers.dwarfstar import DwarfStarProvider
+
+    provider = DwarfStarProvider(
+        config={
+            "ds4_dir": "/path/to/ds4",
+            "gguf_path": "./ds4flash-0731.gguf",
+            "ctx_length": 262144,
+        }
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=1000000)
+    )
+
+    # Provider-level ctx_length wins over the model's load options.
+    assert provider._build_command(model) == [
+        "./ds4-server",
+        "-m",
+        "./ds4flash-0731.gguf",
+        "--ctx",
+        "262144",
+    ]
+    # And both served models report it in /v1/models.
+    assert [m["context_length"] for m in provider.getOAIModels()] == [262144, 262144]
+
+
 def test_dwarfstar_build_command_omits_defaults():
     from providers.dwarfstar import DwarfStarProvider
 
-    provider = DwarfStarProvider(config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf"})
+    provider = DwarfStarProvider(
+        config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf", "ctx_length": 4096}
+    )
     model = provider.createModel(
         ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=4096)
     )
@@ -409,6 +437,7 @@ def test_dwarfstar_build_command_overrides():
             "gguf_path": "m.gguf",
             "host": "0.0.0.0",
             "port": 9000,
+            "ctx_length": 4096,
             "options": {"power": 50, "cors": True, "tokens": 2048},
         }
     )
@@ -461,7 +490,7 @@ def test_dwarfstar_load_spawns_process(monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
 
     provider = DwarfStarProvider(
-        config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf"}
+        config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf", "ctx_length": 4096}
     )
     model = provider.createModel(
         ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=4096)
@@ -710,3 +739,85 @@ def test_main_wires_scheduler_globals(tmp_path, monkeypatch):
     assert main.PROVIDERS != []
     assert started["host"] == "127.0.0.1"
     assert started["port"] == 4343
+
+
+def test_load_yaallb_config_defaults(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"vram_limit_mb": 1}))
+    cfg = main.load_yaallb_config(str(path))
+    assert cfg == {"address": "127.0.0.1", "port": 4343, "ctx_length": 4096}
+
+
+def test_load_yaallb_config_reads_values(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {"yaallb": {"address": "0.0.0.0", "port": 8000, "ctx_length": 8192}}
+        )
+    )
+    cfg = main.load_yaallb_config(str(path))
+    assert cfg == {"address": "0.0.0.0", "port": 8000, "ctx_length": 8192}
+
+
+def test_load_yaallb_config_missing_file(tmp_path):
+    cfg = main.load_yaallb_config(str(tmp_path / "nope.json"))
+    assert cfg == {"address": "127.0.0.1", "port": 4343, "ctx_length": 4096}
+
+
+def test_model_overrides_for():
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {
+        "model-a": {"ctx_length": 8192, "temperature": 0.7}
+    }
+    assert main.model_overrides_for(prov_a, "model-a") == {
+        "ctx_length": 8192,
+        "temperature": 0.7,
+    }
+    assert main.model_overrides_for(prov_a, "model-b") == {}
+    assert main.model_overrides_for(FakeProvider("http://b/v1", ["x"]), "x") == {}
+
+
+def test_chat_completions_applies_ctx_and_override(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"ctx_length": 8192, "temperature": 0.7}}
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(nonstream=FakeResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": []},
+        )
+
+    assert resp.status_code == 200
+    method, url, json, headers = fake.calls[0]
+    # ctx_length came from the model override (request specified neither).
+    assert main.SCHEDULER.resident[0].loadOptions.ctx_length == 8192
+    # temperature was injected into the forwarded body.
+    assert json["temperature"] == 0.7
+    # ctx_length itself is not forwarded to the upstream.
+    assert "ctx_length" not in json
+
+
+def test_chat_completions_client_ctx_wins_over_override(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"ctx_length": 8192, "temperature": 0.7}}
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(nonstream=FakeResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "context_length": 4096, "messages": []},
+        )
+
+    assert main.SCHEDULER.resident[0].loadOptions.ctx_length == 4096
+    method, url, json, headers = fake.calls[0]
+    assert json["context_length"] == 4096
+    assert json["temperature"] == 0.7

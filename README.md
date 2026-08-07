@@ -46,16 +46,48 @@ list of instance config objects:
 ```json
 {
   "vram_limit_mb": 24576,
+  "yaallb": {
+    "address": "127.0.0.1",
+    "port": 4343,
+    "ctx_length": 4096
+  },
   "ds4": [ {config for instance 0}, {config for instance 1}, ... ],
   "lms":  [ ... ],
   ... (other provider types, defined later)
 }
 ```
 
+The `yaallb` object holds server-level settings: `address` and `port` are the
+bind address/port, and `ctx_length` is the default context length used when a
+request specifies neither `context_length` nor `max_tokens`. The CLI flags
+`--address` and `--port` override these only when explicitly passed; otherwise
+config.json is the source of truth.
+
 The position in each list is that instance's `_instance_id`. Types that are
 absent are simply disabled. Each instance object is applied on top of the
 provider's built-in defaults, so you only need to write the fields you want
 to override.
+
+Each provider instance may carry an optional `model_overrides` map, keyed by
+model ID, of per-model parameters. `ctx_length` there overrides the default
+context length for that model (when the request doesn't set one), and any
+other keys (e.g. `temperature`, `top_p`) are injected into the forwarded
+request body as defaults when the client didn't specify them:
+
+```json
+{
+  "lms": [
+    {
+      "host": "127.0.0.1",
+      "port": 1234,
+      "model_overrides": {
+        "qwen/qwen3-0.6b-mlx": { "ctx_length": 8192, "temperature": 0.7 }
+      }
+    }
+  ]
+}
+```
+
 
 `vram_limit_mb` (top-level, default `24576`) is the global VRAM budget in
 MiB. When a new load would exceed it, YAALLB picks the **least-impact
@@ -102,10 +134,14 @@ directory.
 | `port` | `8000` | no — ds4 bind port, also the reverse-proxy target |
 | `binary` | `./ds4-server` | no — program to run, relative to `ds4_dir` |
 | `options` | `{}` | no — overrides for ds4-server flags (see below) |
+| `ctx_length` | — | no — provider-level context length, overrides the per-model one |
 
 `ctx_length` is **not** part of `options`: it is already carried by
 `LoadOptions`, and at load time YAALLB appends `--ctx {ctx_length}` to the
-command from the model being loaded.
+command. ds4 sets `--ctx` once at startup and both of its served models
+(`deepseek-v4-flash`, `deepseek-v4-pro`) inherit it, so the provider-level
+`ctx_length` (when set) overrides any per-model `ctx_length` and is what
+`/v1/models` reports for both models.
 
 `options` keys are the ds4-server flag names with dashes turned into
 underscores. A flag is only emitted when its value differs from the default

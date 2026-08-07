@@ -27,6 +27,13 @@ from scheduling import ModelNotFound, Scheduler
 import uvicorn
 
 DEFAULT_VRAM_LIMIT_MIB = 24576
+DEFAULT_CTX_LENGTH = 4096
+
+DEFAULT_YAALLB_CONFIG = {
+    "address": "127.0.0.1",
+    "port": 4343,
+    "ctx_length": DEFAULT_CTX_LENGTH,
+}
 
 PROVIDER_TYPES = {
     "lms": LMStudioProvider,
@@ -84,6 +91,26 @@ def load_vram_limit(config_path: str) -> int:
     with open(config_path) as f:
         config = json.load(f)
     return config.get("vram_limit_mb", DEFAULT_VRAM_LIMIT_MIB)
+
+
+def load_yaallb_config(config_path: str) -> dict:
+    """Read the server-level settings (bind address, port, default ctx_length).
+
+    Falls back to defaults for keys that are absent.
+    """
+    cfg = dict(DEFAULT_YAALLB_CONFIG)
+    if not Path(config_path).exists():
+        return cfg
+    with open(config_path) as f:
+        config = json.load(f)
+    cfg.update(config.get("yaallb", {}))
+    return cfg
+
+
+def model_overrides_for(provider: Provider, model_id: str) -> dict:
+    """Per-model overrides configured on a provider, or {} if none."""
+    overrides = getattr(provider, "model_overrides", None) or {}
+    return overrides.get(model_id, {}) or {}
 
 
 def read_iogpu_wired_limit() -> int | None:
@@ -192,13 +219,26 @@ async def _forward_chat(provider: Provider, body: dict, stream: bool):
 @app.post("/v1/chat/completions")
 async def chat_completions(body: dict, response: Response):
     model_id = body.get("model")
-    ctx_length = body.get("context_length") or body.get("max_tokens") or 4096
+    provider = lookup_model(PROVIDERS, model_id)
+    overrides = model_overrides_for(provider, model_id) if provider else {}
+    default_ctx = overrides.get("ctx_length") or DEFAULT_CTX_LENGTH
+    ctx_length = (
+        body.get("context_length") or body.get("max_tokens") or default_ctx
+    )
     try:
         model = await SCHEDULER.submit(model_id, LoadOptions(ctx_length=ctx_length))
     except ModelNotFound:
         log.error(f"model not found: {model_id}")
         response.status_code = 404
         return model_not_found_error(model_id)
+
+    # Apply non-ctx model overrides (temperature, top_p, ...) as defaults when
+    # the client didn't specify them; they ride along in the forwarded body.
+    forward_body = dict(body)
+    for key, value in overrides.items():
+        if key == "ctx_length":
+            continue
+        forward_body.setdefault(key, value)
 
     provider = model.descriptor.provider
     stream = body.get("stream", False)
@@ -208,7 +248,7 @@ async def chat_completions(body: dict, response: Response):
         f"stream={stream} ctx={ctx_length}"
     )
     try:
-        result = await _forward_chat(provider, body, stream)
+        result = await _forward_chat(provider, forward_body, stream)
     except httpx.HTTPError:
         log.error(f"upstream {provider.endpoint_uri} unreachable")
         SCHEDULER.release(model)
@@ -292,21 +332,30 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    yaallb = load_yaallb_config(args.config)
+
     global SCHEDULER, PROVIDERS
     providers = load_providers(args.config)
     PROVIDERS.extend(providers)
     vram_limit_mb = load_vram_limit(args.config)
     SCHEDULER = Scheduler(PROVIDERS, vram_limit_mb)
 
+    # CLI flags override config only when explicitly passed (differs from the
+    # CLI defaults); otherwise config.json is the source of truth.
+    address = yaallb["address"] if args.address == "127.0.0.1" else args.address
+    port = yaallb["port"] if args.port == 4343 else args.port
+    global DEFAULT_CTX_LENGTH
+    DEFAULT_CTX_LENGTH = yaallb["ctx_length"]
+
     set_iogpu_wired_limit(vram_limit_mb)
 
     log.info(
-        f"starting yaallb on {args.address}:{args.port} "
+        f"starting yaallb on {address}:{port} "
         f"providers={[p._type_id for p in providers]} "
-        f"vram_limit={vram_limit_mb} MiB"
+        f"vram_limit={vram_limit_mb} MiB default_ctx={yaallb['ctx_length']}"
     )
 
-    uvicorn.run(app, host=args.address, port=args.port)
+    uvicorn.run(app, host=address, port=port)
 
 
 if __name__ == "__main__":
