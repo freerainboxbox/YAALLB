@@ -59,7 +59,19 @@ def test_load_and_unload_alias_to_provider():
     assert not model.loaded
 
 
-def test_providers_concrete_memory():
+def test_providers_concrete_memory(monkeypatch):
+    import subprocess
+
+    def fake_run(argv, **kw):
+        class Proc:
+            returncode = 0
+            stdout = "Estimated GPU Memory:   20.39 GiB"
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
     p1 = LMStudioProvider()
     m1 = p1.createModel(ModelDescriptor("a", p1), LoadOptions())
     assert isinstance(m1.memory(), float)
@@ -82,3 +94,100 @@ def test_dwarfstar_memory_piecewise():
     assert small.memory() == pytest.approx(83065.32 + 0.015655 * 4096)
     big = p.createModel(ModelDescriptor("b", p), LoadOptions(ctx_length=8192))
     assert big.memory() == pytest.approx(83065.32 + 16416 * 8192 / (2**20))
+
+
+def test_lmstudio_memory_parses_gib(monkeypatch):
+    import subprocess
+    from providers.lmstudio import LMStudioProvider
+
+    calls = {}
+
+    def fake_run(argv, **kw):
+        calls["argv"] = argv
+        class Proc:
+            returncode = 0
+            stdout = (
+                "Model: google/gemma-4-26b-a4b-qat\n"
+                "Context Length: 100,000\n"
+                "Estimated GPU Memory:   20.39 GiB\n"
+                "Estimated Total Memory: 20.39 GiB\n"
+            )
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    p = LMStudioProvider()
+    m = p.createModel(
+        ModelDescriptor("google/gemma-4-26b-a4b-qat", p), LoadOptions(ctx_length=100000)
+    )
+    assert m.memory() == pytest.approx(20.39 * 1024)
+    assert calls["argv"] == [
+        "lms",
+        "load",
+        "-y",
+        "--estimate-only",
+        "-c",
+        "100000",
+        "google/gemma-4-26b-a4b-qat",
+    ]
+
+
+def test_lmstudio_memory_parses_mib(monkeypatch):
+    import subprocess
+    from providers.lmstudio import LMStudioProvider
+
+    def fake_run(argv, **kw):
+        class Proc:
+            returncode = 0
+            stdout = "Estimated GPU Memory:   444.28 MiB"
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    p = LMStudioProvider()
+    m = p.createModel(ModelDescriptor("qwen3-0.6b-mlx", p), LoadOptions(ctx_length=100000))
+    assert m.memory() == pytest.approx(444.28)
+
+
+def test_lmstudio_memory_raises_on_nonzero_exit(monkeypatch):
+    import subprocess
+    from providers.lmstudio import LMStudioProvider
+
+    def fake_run(argv, **kw):
+        class Proc:
+            returncode = 1
+            stdout = ""
+            stderr = "boom"
+
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    p = LMStudioProvider()
+    m = p.createModel(ModelDescriptor("nope", p), LoadOptions())
+    with pytest.raises(RuntimeError):
+        m.memory()
+
+
+def test_lmstudio_memory_raises_on_unparseable(monkeypatch):
+    import subprocess
+    from providers.lmstudio import LMStudioProvider
+
+    def fake_run(argv, **kw):
+        class Proc:
+            returncode = 0
+            stdout = "unexpected output"
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    p = LMStudioProvider()
+    m = p.createModel(ModelDescriptor("nope", p), LoadOptions())
+    with pytest.raises(RuntimeError):
+        m.memory()

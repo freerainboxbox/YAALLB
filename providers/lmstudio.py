@@ -1,7 +1,32 @@
+import re
+import subprocess
+
 from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model as BaseModel
 from abstractions.provider import Provider
+
+
+def _estimate_gpu_memory(model_id: str, ctx_length: int) -> float:
+    proc = subprocess.run(
+        ["lms", "load", "-y", "--estimate-only", "-c", str(ctx_length), model_id],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"lms estimate failed (exit {proc.returncode}): "
+            f"{proc.stderr.strip() or proc.stdout.strip()}"
+        )
+    match = re.search(r"Estimated GPU Memory:\s*([\d.]+)\s*(MiB|GiB)", proc.stdout)
+    if match is None:
+        raise RuntimeError(
+            f"unexpected lms output, no GPU memory estimate: {proc.stdout!r}"
+        )
+    value = float(match.group(1))
+    if match.group(2) == "GiB":
+        return value * 1024
+    return value
 
 
 class LMStudioProvider(Provider):
@@ -9,8 +34,9 @@ class LMStudioProvider(Provider):
 
     class Model(BaseModel):
         def memory(self) -> float:
-            # TODO: project footprint from LM Studio model metadata.
-            return 0.0
+            return _estimate_gpu_memory(
+                self.descriptor.modelId, self.loadOptions.ctx_length
+            )
 
     def __init__(self, _instance_id: int = 0, config: dict | None = None) -> None:
         self.host = "127.0.0.1"
