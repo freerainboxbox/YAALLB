@@ -523,6 +523,31 @@ def test_dwarfstar_provider_ctx_overrides_model_ctx():
     assert [m["context_length"] for m in provider.getOAIModels()] == [262144, 262144]
 
 
+def test_dwarfstar_build_command_preserves_spaces():
+    from providers.dwarfstar import DwarfStarProvider
+
+    provider = DwarfStarProvider(
+        config={
+            "ds4_dir": "/tmp/ds4",
+            "gguf_path": "model with space.gguf",
+            "ctx_length": 4096,
+        }
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=4096)
+    )
+
+    # A gguf_path containing spaces must stay a single argv token, not be
+    # re-split by shell word-splitting.
+    assert provider._build_command(model) == [
+        "./ds4-server",
+        "-m",
+        "model with space.gguf",
+        "--ctx",
+        "4096",
+    ]
+
+
 def test_dwarfstar_build_command_omits_defaults():
     from providers.dwarfstar import DwarfStarProvider
 

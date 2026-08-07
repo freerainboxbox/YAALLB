@@ -1,4 +1,3 @@
-import shlex
 import subprocess
 
 from abstractions.descriptor import ModelDescriptor
@@ -55,8 +54,6 @@ DS4_OPTIONS = {
     "disable_exact_dsml_tool_replay": ("--disable-exact-dsml-tool-replay", "flag", False),
     "tool_memory_max_ids": ("--tool-memory-max-ids", "value", 100000),
 }
-
-DS4_COMMAND_TEMPLATE = "{binary} -m {gguf_path} {host_port} {options} --ctx {ctx_length}"
 
 
 class DwarfStarProvider(Provider):
@@ -142,31 +139,25 @@ class DwarfStarProvider(Provider):
     def _build_command(self, model: BaseModel) -> list[str]:
         ctx_length = self._effective_ctx()
 
-        host_port = []
-        if self.host != DS4_DEFAULT_HOST:
-            host_port += ["--host", self.host]
-        if self.port != DS4_DEFAULT_PORT:
-            host_port += ["--port", str(self.port)]
+        command = [self.binary, "-m", self.gguf_path]
 
-        options = []
+        if self.host != DS4_DEFAULT_HOST:
+            command += ["--host", self.host]
+        if self.port != DS4_DEFAULT_PORT:
+            command += ["--port", str(self.port)]
+
         for key, (flag, kind, default) in DS4_OPTIONS.items():
             if key not in self.options:
                 continue
             value = self.options[key]
             if kind == "flag":
                 if value is True:
-                    options.append(flag)
+                    command.append(flag)
             elif value != default:
-                options += [flag, str(value)]
+                command += [flag, str(value)]
 
-        command = DS4_COMMAND_TEMPLATE.format(
-            binary=self.binary,
-            gguf_path=self.gguf_path,
-            host_port=" ".join(host_port),
-            options=" ".join(options),
-            ctx_length=ctx_length,
-        )
-        return shlex.split(command)
+        command += ["--ctx", str(ctx_length)]
+        return command
 
     def loadModel(self, model: BaseModel) -> None:
         if self.ds4_dir is None:
