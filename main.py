@@ -6,17 +6,41 @@ lists of every provider. Reverse proxy forwarding is not wired yet.
 """
 
 import argparse
+import json
+from pathlib import Path
 
 from fastapi import FastAPI, Response
 
 from abstractions.provider import Provider
 from abstractions.routing import lookup_model
+from providers.dwarfstar import DwarfStarProvider
+from providers.lmstudio import LMStudioProvider
 import uvicorn
 
 app = FastAPI()
 
-# Populated at runtime once providers are configured; tests inject fakes.
+# Populated at runtime from config.json; tests inject fakes.
 PROVIDERS: list[Provider] = []
+
+PROVIDER_TYPES = {
+    "lms": LMStudioProvider,
+    "ds4": DwarfStarProvider,
+}
+
+
+def load_providers(config_path: str) -> list[Provider]:
+    providers = []
+    if not Path(config_path).exists():
+        return providers
+    with open(config_path) as f:
+        config = json.load(f)
+    for type_id, instances in config.items():
+        provider_cls = PROVIDER_TYPES.get(type_id)
+        if provider_cls is None:
+            continue
+        for instance_id, instance_config in enumerate(instances):
+            providers.append(provider_cls(instance_id, instance_config))
+    return providers
 
 
 def model_not_found_error(model_id: str) -> dict:
@@ -68,7 +92,14 @@ def main() -> None:
         default=4343,
         help="Port to listen on. (default: %(default)s)",
     )
+    parser.add_argument(
+        "--config",
+        default=str(Path(__file__).resolve().parent / "config.json"),
+        help="Path to config.json. (default: %(default)s)",
+    )
     args = parser.parse_args()
+
+    PROVIDERS.extend(load_providers(args.config))
 
     uvicorn.run(app, host=args.address, port=args.port)
 

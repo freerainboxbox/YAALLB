@@ -1,3 +1,5 @@
+import json
+
 import pytest
 import httpx
 from fastapi.testclient import TestClient
@@ -10,6 +12,8 @@ from abstractions.provider import Provider
 
 
 class FakeProvider(Provider):
+    _type_id = "fake"
+
     class Model(BaseModel):
         def memory(self) -> float:
             return 0.0
@@ -157,3 +161,50 @@ def test_dwarfstar_resident_model_and_context(monkeypatch):
     provider.unloadModel(model)
     assert getattr(provider, "resident_model", None) is None
     assert [m["context_length"] for m in provider.getOAIModels()] == [1000000, 1000000]
+
+
+def test_provider_type_ids():
+    from providers.dwarfstar import DwarfStarProvider
+    from providers.lmstudio import LMStudioProvider
+
+    assert LMStudioProvider()._type_id == "lms"
+    assert DwarfStarProvider()._type_id == "ds4"
+    assert LMStudioProvider()._instance_id == 0
+
+
+def test_load_providers_from_config(tmp_path):
+    config = {
+        "lms": [{"host": "10.0.0.1", "port": 9999}],
+        "ds4": [{}, {"host": "0.0.0.0", "port": 8080}],
+    }
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+
+    providers = main.load_providers(str(path))
+
+    assert [p._type_id for p in providers] == ["lms", "ds4", "ds4"]
+    assert providers[0]._instance_id == 0
+    assert providers[0].host == "10.0.0.1"
+    assert providers[0].port == 9999
+    assert providers[1]._instance_id == 0
+    assert providers[1].host == "127.0.0.1"
+    assert providers[1].port == 8000
+    assert providers[2]._instance_id == 1
+    assert providers[2].host == "0.0.0.0"
+    assert providers[2].port == 8080
+
+
+def test_load_providers_disabled_types(tmp_path):
+    config = {"lms": [{}], "unknown": [{}]}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+
+    providers = main.load_providers(str(path))
+
+    assert len(providers) == 1
+    assert providers[0]._type_id == "lms"
+
+
+def test_load_providers_missing_config(tmp_path):
+    providers = main.load_providers(str(tmp_path / "nope.json"))
+    assert providers == []

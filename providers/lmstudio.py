@@ -5,14 +5,17 @@ from abstractions.provider import Provider
 
 
 class LMStudioProvider(Provider):
+    _type_id = "lms"
+
     class Model(BaseModel):
         def memory(self) -> float:
             # TODO: project footprint from LM Studio model metadata.
             return 0.0
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 1234) -> None:
-        self.host = host
-        self.port = port
+    def __init__(self, _instance_id: int = 0, config: dict | None = None) -> None:
+        self.host = "127.0.0.1"
+        self.port = 1234
+        super().__init__(_instance_id, config)
 
     @property
     def endpoint_uri(self) -> str:

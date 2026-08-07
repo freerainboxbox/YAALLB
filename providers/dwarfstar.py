@@ -11,6 +11,8 @@ DS4_CONTEXT_LENGTH = 1000000
 
 
 class DwarfStarProvider(Provider):
+    _type_id = "ds4"
+
     class Model(BaseModel):
         def memory(self) -> float:
             ctx = self.loadOptions.ctx_length
@@ -18,10 +20,11 @@ class DwarfStarProvider(Provider):
                 return 83065.32 + 16416 * ctx / (2**20)
             return 83065.32 + 0.015655 * ctx
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 4343) -> None:
-        self.host = host
-        self.port = port
+    def __init__(self, _instance_id: int = 0, config: dict | None = None) -> None:
+        self.host = "127.0.0.1"
+        self.port = 8000
         self.resident_model: BaseModel | None = None
+        super().__init__(_instance_id, config)
 
     @property
     def endpoint_uri(self) -> str:

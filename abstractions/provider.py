@@ -10,6 +10,17 @@ if TYPE_CHECKING:
 
 
 class Provider(ABC):
+    def __init__(self, _instance_id: int = 0, config: dict | None = None) -> None:
+        self._instance_id = _instance_id
+        if config:
+            for key, value in config.items():
+                setattr(self, key, value)
+
+    @property
+    @abstractmethod
+    def _type_id(self) -> str:
+        """Provider type identifier, e.g. "lms" or "ds4"."""
+
     @property
     @abstractmethod
     def endpoint_uri(self) -> str:
