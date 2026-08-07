@@ -131,13 +131,13 @@ def test_lmstudio_memory_parses_gib(monkeypatch):
         calls["argv"] = argv
         class Proc:
             returncode = 0
-            stdout = (
+            stdout = ""
+            stderr = (
                 "Model: google/gemma-4-26b-a4b-qat\n"
                 "Context Length: 100,000\n"
                 "Estimated GPU Memory:   20.39 GiB\n"
                 "Estimated Total Memory: 20.39 GiB\n"
             )
-            stderr = ""
 
         return Proc()
 
@@ -166,8 +166,8 @@ def test_lmstudio_memory_parses_mib(monkeypatch):
     def fake_run(argv, **kw):
         class Proc:
             returncode = 0
-            stdout = "Estimated GPU Memory:   444.28 MiB"
-            stderr = ""
+            stdout = ""
+            stderr = "Estimated GPU Memory:   444.28 MiB"
 
         return Proc()
 

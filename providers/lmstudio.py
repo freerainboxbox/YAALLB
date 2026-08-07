@@ -26,11 +26,21 @@ def _estimate_gpu_memory(model_id: str, ctx_length: int) -> float:
             f"lms estimate failed (exit {proc.returncode}): "
             f"{proc.stderr.strip() or proc.stdout.strip()}"
         )
-    match = re.search(r"Estimated GPU Memory:\s*([\d.]+)\s*(MiB|GiB)", proc.stdout)
+    match = re.search(
+        r"Estimated GPU Memory:\s*([\d.]+)\s*(MiB|GiB)", proc.stderr
+    )
     if match is None:
-        log.error(f"unexpected lms output for {model_id}: {proc.stdout!r}")
+        match = re.search(
+            r"Estimated GPU Memory:\s*([\d.]+)\s*(MiB|GiB)", proc.stdout
+        )
+    if match is None:
+        log.error(
+            f"unexpected lms output for {model_id}: "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
         raise RuntimeError(
-            f"unexpected lms output, no GPU memory estimate: {proc.stdout!r}"
+            f"unexpected lms output, no GPU memory estimate: "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
         )
     value = float(match.group(1))
     if match.group(2) == "GiB":
