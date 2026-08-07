@@ -681,3 +681,32 @@ def test_set_iogpu_wired_limit_no_sudo(monkeypatch):
     monkeypatch.setattr("main.subprocess.run", fake_run)
 
     assert main.set_iogpu_wired_limit(112640) is False
+
+
+def test_main_wires_scheduler_globals(tmp_path, monkeypatch):
+    config = {"vram_limit_mb": 112640, "lms": [{"host": "127.0.0.1", "port": 1234}]}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+
+    started = {}
+
+    def fake_uvicorn_run(app, **kw):
+        started["app"] = app
+        started["host"] = kw["host"]
+        started["port"] = kw["port"]
+
+    monkeypatch.setattr("main.uvicorn.run", fake_uvicorn_run)
+    monkeypatch.setattr(
+        "main.set_iogpu_wired_limit", lambda _: True
+    )
+    monkeypatch.setattr(
+        "sys.argv", ["yaallb", "--config", str(path)]
+    )
+
+    main.main()
+
+    # The module globals must be assigned so routes can use them at runtime.
+    assert main.SCHEDULER is not None
+    assert main.PROVIDERS != []
+    assert started["host"] == "127.0.0.1"
+    assert started["port"] == 4343

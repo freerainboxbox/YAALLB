@@ -292,6 +292,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    global SCHEDULER, PROVIDERS
     providers = load_providers(args.config)
     PROVIDERS.extend(providers)
     vram_limit_mb = load_vram_limit(args.config)
