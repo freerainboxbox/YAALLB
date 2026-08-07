@@ -57,6 +57,8 @@ list of instance config objects:
 }
 ```
 
+When relevant, providers can have API keys specified at the provider level as `"api_key"`.
+
 The `yaallb` object holds server-level settings: `address` and `port` are the
 bind address/port, and `ctx_length` is the default context length used when a
 request specifies no `context_length`. `max_tokens` is a client-side constraint
@@ -89,7 +91,6 @@ request body as defaults when the client didn't specify them:
   ]
 }
 ```
-
 
 `vram_limit_mb` (top-level, default `24576`) is the global VRAM budget in
 MiB. When a new load would exceed it, YAALLB picks the **least-impact
@@ -139,25 +140,27 @@ SSE error event (`code: provider_start_failed`) is emitted. Each failure bumps
 a per-provider startup counter, and the counter resets once the provider
 serves a request successfully.
 
-### ds4
+### Providers
+
+#### ds4
 
 `ds4` is spawned and terminated by YAALLB (it has no native load/unload), so
 each instance needs to know how to launch `ds4-server` from a working
 directory.
 
-| key | default | required |
-|-----|---------|----------|
-| `ds4_dir` | — | yes — path to your ds4 build; the working directory the server runs from |
-| `gguf_path` | — | yes — path to the GGUF model loaded by ds4 (relative to `ds4_dir`) |
-| `host` | `127.0.0.1` | no — ds4 bind address, also the reverse-proxy target |
-| `port` | `8000` | no — ds4 bind port, also the reverse-proxy target |
-| `binary` | `./ds4-server` | no — program to run, relative to `ds4_dir` |
-| `options` | `{}` | no — overrides for ds4-server flags (see below) |
-| `ctx_length` | — | no — provider-level context length, overrides the per-model one |
+| key          | default        | required                                                                 |
+| ------------ | -------------- | ------------------------------------------------------------------------ |
+| `ds4_dir`    | —              | yes — path to your ds4 build; the working directory the server runs from |
+| `gguf_path`  | —              | yes — path to the GGUF model loaded by ds4 (relative to `ds4_dir`)       |
+| `host`       | `127.0.0.1`    | no — ds4 bind address, also the reverse-proxy target                     |
+| `port`       | `8000`         | no — ds4 bind port, also the reverse-proxy target                        |
+| `binary`     | `./ds4-server` | no — program to run, relative to `ds4_dir`                               |
+| `options`    | `{}`           | no — overrides for ds4-server flags (see below)                          |
+| `ctx_length` | —              | no — provider-level context length, overrides the per-model one          |
 
-`ctx_length` is **not** part of `options`: it is already carried by
-`LoadOptions`, and at load time YAALLB appends `--ctx {ctx_length}` to the
-command. ds4 sets `--ctx` once at startup and both of its served models
+`ctx_length` is available as a provider-level override,
+and is a key in the provider object (see usage below) rather than model-level (so NOT in the "options" key).
+ds4 sets `--ctx` once at startup and both of its served models
 (`deepseek-v4-flash`, `deepseek-v4-pro`) inherit it, so the provider-level
 `ctx_length` (when set) overrides any per-model `ctx_length` and is what
 `/v1/models` reports for both models.
@@ -167,38 +170,38 @@ underscores. A flag is only emitted when its value differs from the default
 shown below (booleans only when `true`), so `ds4-server` applies its own
 defaults for everything you don't set.
 
-| options key | flag | kind | default |
-|---|---|---|---|
-| `backend` | `--backend` | value | — |
-| `metal` | `--metal` | flag | false |
-| `cuda` | `--cuda` | flag | false |
-| `cpu` | `--cpu` | flag | false |
-| `gpu_vram` | `--gpu-vram` | value | — |
-| `gpu_devices` | `--gpu-devices` | value | — |
-| `cuda_tensor_parallel` | `--cuda-tensor-parallel` | flag | false |
-| `tokens` | `-n` | value | — |
-| `threads` | `-t` | value | — |
-| `power` | `--power` | value | 100 |
-| `ssd_streaming` | `--ssd-streaming` | flag | false |
-| `ssd_streaming_cold` | `--ssd-streaming-cold` | flag | false |
-| `ssd_streaming_cache_experts` | `--ssd-streaming-cache-experts` | value | — |
-| `ssd_streaming_full_layers` | `--ssd-streaming-full-layers` | value | — |
-| `ssd_streaming_preload_experts` | `--ssd-streaming-preload-experts` | value | — |
-| `simulate_used_memory` | `--simulate-used-memory` | value | — |
-| `prefill_chunk` | `--prefill-chunk` | value | — |
-| `cors` | `--cors` | flag | false |
-| `trace` | `--trace` | value | — |
-| `batched_session` | `--batched-session` | value | — |
-| `kv_disk_dir` | `--kv-disk-dir` | value | — |
-| `kv_disk_space_mb` | `--kv-disk-space-mb` | value | 4096 |
-| `kv_cache_min_tokens` | `--kv-cache-min-tokens` | value | 512 |
-| `kv_cache_cold_max_tokens` | `--kv-cache-cold-max-tokens` | value | 30000 |
-| `kv_cache_continued_interval_tokens` | `--kv-cache-continued-interval-tokens` | value | 10000 |
-| `kv_cache_boundary_trim_tokens` | `--kv-cache-boundary-trim-tokens` | value | 32 |
-| `kv_cache_boundary_align_tokens` | `--kv-cache-boundary-align-tokens` | value | 2048 |
-| `kv_cache_reject_different_quant` | `--kv-cache-reject-different-quant` | flag | false |
-| `disable_exact_dsml_tool_replay` | `--disable-exact-dsml-tool-replay` | flag | false |
-| `tool_memory_max_ids` | `--tool-memory-max-ids` | value | 100000 |
+| options key                          | flag                                   | kind  | default |
+| ------------------------------------ | -------------------------------------- | ----- | ------- |
+| `backend`                            | `--backend`                            | value | —       |
+| `metal`                              | `--metal`                              | flag  | false   |
+| `cuda`                               | `--cuda`                               | flag  | false   |
+| `cpu`                                | `--cpu`                                | flag  | false   |
+| `gpu_vram`                           | `--gpu-vram`                           | value | —       |
+| `gpu_devices`                        | `--gpu-devices`                        | value | —       |
+| `cuda_tensor_parallel`               | `--cuda-tensor-parallel`               | flag  | false   |
+| `tokens`                             | `-n`                                   | value | —       |
+| `threads`                            | `-t`                                   | value | —       |
+| `power`                              | `--power`                              | value | 100     |
+| `ssd_streaming`                      | `--ssd-streaming`                      | flag  | false   |
+| `ssd_streaming_cold`                 | `--ssd-streaming-cold`                 | flag  | false   |
+| `ssd_streaming_cache_experts`        | `--ssd-streaming-cache-experts`        | value | —       |
+| `ssd_streaming_full_layers`          | `--ssd-streaming-full-layers`          | value | —       |
+| `ssd_streaming_preload_experts`      | `--ssd-streaming-preload-experts`      | value | —       |
+| `simulate_used_memory`               | `--simulate-used-memory`               | value | —       |
+| `prefill_chunk`                      | `--prefill-chunk`                      | value | —       |
+| `cors`                               | `--cors`                               | flag  | false   |
+| `trace`                              | `--trace`                              | value | —       |
+| `batched_session`                    | `--batched-session`                    | value | —       |
+| `kv_disk_dir`                        | `--kv-disk-dir`                        | value | —       |
+| `kv_disk_space_mb`                   | `--kv-disk-space-mb`                   | value | 4096    |
+| `kv_cache_min_tokens`                | `--kv-cache-min-tokens`                | value | 512     |
+| `kv_cache_cold_max_tokens`           | `--kv-cache-cold-max-tokens`           | value | 30000   |
+| `kv_cache_continued_interval_tokens` | `--kv-cache-continued-interval-tokens` | value | 10000   |
+| `kv_cache_boundary_trim_tokens`      | `--kv-cache-boundary-trim-tokens`      | value | 32      |
+| `kv_cache_boundary_align_tokens`     | `--kv-cache-boundary-align-tokens`     | value | 2048    |
+| `kv_cache_reject_different_quant`    | `--kv-cache-reject-different-quant`    | flag  | false   |
+| `disable_exact_dsml_tool_replay`     | `--disable-exact-dsml-tool-replay`     | flag  | false   |
+| `tool_memory_max_ids`                | `--tool-memory-max-ids`                | value | 100000  |
 
 For example, the manual command
 
@@ -220,15 +223,14 @@ is configured as:
       "options": {
         "kv_disk_dir": "/tmp/ds4-0731-kv",
         "kv_disk_space_mb": 262144
-      }
+      },
+      "ctx_length": 1000000
     }
   ]
 }
 ```
 
-`--ctx 1000000` is supplied at load time via `LoadOptions(ctx_length=1000000)`.
-
-### lms
+#### lms
 
 LM Studio serves its own API natively; instances only need `host` and
 `port` (defaults `127.0.0.1` and `1234`), plus `api_key` when server
@@ -238,7 +240,7 @@ YAALLB drives LM Studio through its management REST API (`/api/v1`):
 `getModelsDescriptors` lists LLMs from `GET /api/v1/models`, `loadModel`
 posts to `POST /api/v1/models/load` (with `context_length`), and `unloadModel`
 posts to `POST /api/v1/models/unload`. VRAM estimates still come from the
-`lms` CLI (`--estimate-only`).
+`lms` CLI (`--estimate-only`). This is a limitation of the LM Studio API.
 
 LM Studio blocks on `POST /api/v1/models/load` until the model finishes
 loading, so YAALLB gives that call a long timeout (`LMS_LOAD_TIMEOUT`, 300s)
@@ -253,3 +255,7 @@ never becoming ready within the deadline) raises.
 On exit (Ctrl-C/SIGTERM), YAALLB flushes queued and in-flight requests, then
 unloads every resident model: LM Studio instances get the unload API route
 called, and ds4 instances simply terminate their spawned server process.
+
+## Roadmap
+
+llama.cpp, mlx-lm, mlx-vlm, oMLX, and cloud API providers should be supported eventually.
