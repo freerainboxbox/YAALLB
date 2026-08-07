@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 class Provider(ABC):
     def __init__(self, _instance_id: int = 0, config: dict | None = None) -> None:
         self._instance_id = _instance_id
+        self.api_key: str | None = None
         if config:
             for key, value in config.items():
                 setattr(self, key, value)
@@ -42,9 +43,14 @@ class Provider(ABC):
         providers that cannot answer that endpoint natively (e.g. ds4, which
         is spawned/terminated by Python rather than serving its own API).
         """
-        resp = httpx.get(self.endpoint_uri + "/models")
+        resp = httpx.get(self.endpoint_uri + "/models", headers=self._auth_headers())
         resp.raise_for_status()
         return resp.json().get("data", [])
+
+    def _auth_headers(self) -> dict:
+        if self.api_key:
+            return {"Authorization": f"Bearer {self.api_key}"}
+        return {}
 
     @abstractmethod
     def createModel(

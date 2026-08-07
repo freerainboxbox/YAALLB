@@ -106,8 +106,9 @@ def test_getoaimodels_default_queries_endpoint(monkeypatch):
     provider = LMStudioProvider()
     captured = {}
 
-    def fake_get(url: str):
+    def fake_get(url: str, headers: dict | None = None):
         captured["url"] = url
+        captured["headers"] = headers
         class Resp:
             def raise_for_status(self):
                 pass
@@ -124,6 +125,30 @@ def test_getoaimodels_default_queries_endpoint(monkeypatch):
     data = provider.getOAIModels()
     assert data == [{"id": "x", "object": "model", "created": 1, "owned_by": "o"}]
     assert captured["url"] == "http://127.0.0.1:1234/v1/models"
+    assert captured["headers"] == {}
+
+
+def test_getoaimodels_sends_api_key_header(monkeypatch):
+    from providers.lmstudio import LMStudioProvider
+
+    provider = LMStudioProvider(config={"api_key": "sk-test"})
+    captured = {}
+
+    def fake_get(url: str, headers: dict | None = None):
+        captured["headers"] = headers
+        class Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"object": "list", "data": []}
+
+        return Resp()
+
+    monkeypatch.setattr("httpx.get", fake_get)
+
+    provider.getOAIModels()
+    assert captured["headers"] == {"Authorization": "Bearer sk-test"}
 
 
 def test_dwarfstar_getoaimodels_hardcoded(monkeypatch):
