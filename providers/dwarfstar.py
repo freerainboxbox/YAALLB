@@ -83,11 +83,16 @@ class DwarfStarProvider(Provider):
     def endpoint_uri(self) -> str:
         return f"http://{self.host}:{self.port}/v1"
 
-    def _effective_ctx(self) -> int:
+    def _effective_ctx(self, model: BaseModel | None = None) -> int:
         # ds4 sets --ctx once at startup and both served models inherit it, so
         # the provider-level ctx_length (when set) overrides any per-model one.
+        # A loading model is passed explicitly: at spawn time resident_model is
+        # still None, so without it the fallback DS4_CONTEXT_LENGTH would be
+        # spawned while memory()//v1/models account the request's ctx.
         if self.ctx_length is not None:
             return self.ctx_length
+        if model is not None:
+            return model.loadOptions.ctx_length
         if self.resident_model is not None:
             return self.resident_model.loadOptions.ctx_length
         return DS4_CONTEXT_LENGTH
@@ -137,7 +142,7 @@ class DwarfStarProvider(Provider):
         return self.Model(descriptor, loadOptions)
 
     def _build_command(self, model: BaseModel) -> list[str]:
-        ctx_length = self._effective_ctx()
+        ctx_length = self._effective_ctx(model)
 
         command = [self.binary, "-m", self.gguf_path]
 

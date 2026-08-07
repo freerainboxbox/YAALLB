@@ -519,6 +519,28 @@ def test_dwarfstar_build_command():
     ]
 
 
+def test_dwarfstar_build_command_uses_load_options_ctx():
+    from providers.dwarfstar import DwarfStarProvider
+
+    provider = DwarfStarProvider(
+        config={"ds4_dir": "/path/to/ds4", "gguf_path": "./ds4flash-0731.gguf"}
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    )
+
+    # With no provider-level ctx_length, the spawned --ctx comes from the
+    # loading model's load options, matching what memory() and /v1/models
+    # report once the model is resident.
+    assert provider._build_command(model) == [
+        "./ds4-server",
+        "-m",
+        "./ds4flash-0731.gguf",
+        "--ctx",
+        "8192",
+    ]
+
+
 def test_dwarfstar_provider_ctx_overrides_model_ctx():
     from providers.dwarfstar import DwarfStarProvider
 
