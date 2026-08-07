@@ -4,7 +4,7 @@ A VRAM-aware LLM load balancer, quick and dirty, to point to your existing LLM r
 
 Currently targets LM Studio and antirez/ds4. More may be supported later.
 
-You can specify a VRAM limit on your Apple Silicon Mac in MB, and YAALLB will set `iogpu.wired_limit_mb` to that limit and respect your memory by unloading the least recently used model when asked.
+You can specify a VRAM limit on your Apple Silicon Mac in MB, and YAALLB will set `iogpu.wired_limit_mb` to that limit and respect your memory by evicting the least-impact resident models when a new load would exceed the budget.
 
 ## Layout
 
@@ -58,11 +58,21 @@ provider's built-in defaults, so you only need to write the fields you want
 to override.
 
 `vram_limit_mb` (top-level, default `24576`) is the global VRAM budget in
-MiB. YAALLB keeps models resident under this budget: when a new load would
-exceed it, the least-impact resident models are evicted first (requests for
-evicted models are drained/line-cut first so in-flight I/O completes), then
-the model is loaded. Models that report `memory() == 0` (future cloud
-providers) are loaded without eviction.
+MiB. When a new load would exceed it, YAALLB picks the **least-impact
+eviction set** from the resident models (those reporting `memory() > 0`):
+
+- Candidate A: the smallest single resident model that alone frees enough.
+- Candidate B: greedily accumulate resident models smallest-to-next-smallest
+  until the freed total covers the shortfall.
+
+Whichever set over-evicts the least (is closest to the shortfall) is chosen,
+ties breaking toward the single model. If neither candidate can free enough,
+the request fails rather than over-committing. Models reporting `memory() == 0`
+(future cloud providers) are never evicted and load without eviction.
+
+Requests for an eviction target are **line-cut** (served first out of the
+queue) and **drained** (in-flight I/O completes) before the model is actually
+unloaded, so no request is cut off mid-generation.
 
 Each provider's `host`/`port` (or `endpoint_uri`) doubles as the reverse-proxy
 target: `/v1/chat/completions` schedules a model, then forwards the request
