@@ -16,6 +16,11 @@ def _provider_label(provider: Provider) -> str:
 # can't hang graceful shutdown forever.
 STOP_DRAIN_TIMEOUT = 30.0
 
+# Poll interval while waiting for in-flight requests to drain (stop() and
+# eviction quiesce). sleep(0) would busy-spin a core for the whole drain,
+# which lasts as long as the longest in-flight generation.
+DRAIN_POLL_INTERVAL = 0.05
+
 
 class ModelNotFound(Exception):
     def __init__(self, model_id: str) -> None:
@@ -88,7 +93,7 @@ class Scheduler:
         while self.pending or any(self.in_flight.values()):
             if asyncio.get_running_loop().time() >= deadline:
                 break
-            await asyncio.sleep(0)
+            await asyncio.sleep(DRAIN_POLL_INTERVAL)
         self._wake.set()
         self._task.cancel()
         try:
@@ -213,4 +218,4 @@ class Scheduler:
             # Drain: wait until no eviction model has outstanding requests.
             if not any(self.in_flight[m] > 0 for m in eviction_models):
                 return
-            await asyncio.sleep(0)
+            await asyncio.sleep(DRAIN_POLL_INTERVAL)
