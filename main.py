@@ -114,9 +114,9 @@ def read_iogpu_wired_limit() -> int | None:
 def set_iogpu_wired_limit(vram_limit_mb: int) -> bool:
     """Set the macOS Metal VRAM cap to match YAALLB's budget.
 
-    Requires root (sudo), since the kernel sysctl is privileged. Returns True
-    on success. On failure logs a warning; YAALLB's own scheduler still enforces
-    the budget in software regardless.
+    The kernel sysctl is privileged, so the write runs under sudo. Returns
+    True on success. On failure logs a warning; YAALLB's own scheduler still
+    enforces the budget in software regardless.
     """
     current = read_iogpu_wired_limit()
     if current == vram_limit_mb:
@@ -126,15 +126,19 @@ def set_iogpu_wired_limit(vram_limit_mb: int) -> bool:
         return True
     log.info(
         f"iogpu.wired_limit_mb={current if current is not None else '?'}, "
-        f"target={vram_limit_mb} -> requesting write"
+        f"target={vram_limit_mb} -> requesting sudo write"
     )
     sysctl = shutil.which("sysctl")
+    sudo = shutil.which("sudo")
     if sysctl is None:
         log.warning("sysctl unavailable; cannot set iogpu.wired_limit_mb")
         return False
+    if sudo is None:
+        log.warning("sudo unavailable; cannot set iogpu.wired_limit_mb")
+        return False
     try:
         proc = subprocess.run(
-            [sysctl, "-w", f"iogpu.wired_limit_mb={vram_limit_mb}"],
+            [sudo, sysctl, "-w", f"iogpu.wired_limit_mb={vram_limit_mb}"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -145,7 +149,7 @@ def set_iogpu_wired_limit(vram_limit_mb: int) -> bool:
     if proc.returncode != 0:
         log.warning(
             f"could not set iogpu.wired_limit_mb={vram_limit_mb} "
-            f"(requires root): {proc.stderr.strip()}"
+            f"(sudo denied or requires a password): {proc.stderr.strip()}"
         )
         return False
     log.info(f"set iogpu.wired_limit_mb={vram_limit_mb}")

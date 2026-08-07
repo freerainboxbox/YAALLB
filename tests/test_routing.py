@@ -563,12 +563,19 @@ def test_set_iogpu_wired_limit_success(monkeypatch):
 
         return Write()
 
-    monkeypatch.setattr("main.shutil.which", lambda _: "/usr/sbin/sysctl")
+    monkeypatch.setattr(
+        "main.shutil.which", lambda name: "/usr/sbin/sysctl" if name == "sysctl" else "/usr/sbin/sudo"
+    )
     monkeypatch.setattr("main.subprocess.run", fake_run)
 
     assert main.set_iogpu_wired_limit(112640) is True
     write_argv, write_kw = calls[1]
-    assert write_argv == ["/usr/sbin/sysctl", "-w", "iogpu.wired_limit_mb=112640"]
+    assert write_argv == [
+        "/usr/sbin/sudo",
+        "/usr/sbin/sysctl",
+        "-w",
+        "iogpu.wired_limit_mb=112640",
+    ]
     assert write_kw["timeout"] == 10
 
 
@@ -584,7 +591,9 @@ def test_set_iogpu_wired_limit_already_set(monkeypatch):
 
         return Read()
 
-    monkeypatch.setattr("main.shutil.which", lambda _: "/usr/sbin/sysctl")
+    monkeypatch.setattr(
+        "main.shutil.which", lambda name: "/usr/sbin/sysctl" if name == "sysctl" else "/usr/sbin/sudo"
+    )
     monkeypatch.setattr("main.subprocess.run", fake_run)
 
     assert main.set_iogpu_wired_limit(112640) is True
@@ -608,7 +617,9 @@ def test_set_iogpu_wired_limit_not_permitted(monkeypatch):
 
         return Write()
 
-    monkeypatch.setattr("main.shutil.which", lambda _: "/usr/sbin/sysctl")
+    monkeypatch.setattr(
+        "main.shutil.which", lambda name: "/usr/sbin/sysctl" if name == "sysctl" else "/usr/sbin/sudo"
+    )
     monkeypatch.setattr("main.subprocess.run", fake_run)
 
     assert main.set_iogpu_wired_limit(112640) is False
@@ -633,16 +644,40 @@ def test_set_iogpu_wired_limit_unreadable_still_writes(monkeypatch):
 
         return Write()
 
-    monkeypatch.setattr("main.shutil.which", lambda _: "/usr/sbin/sysctl")
+    monkeypatch.setattr(
+        "main.shutil.which", lambda name: "/usr/sbin/sysctl" if name == "sysctl" else "/usr/sbin/sudo"
+    )
     monkeypatch.setattr("main.subprocess.run", fake_run)
 
     assert main.set_iogpu_wired_limit(112640) is True
     assert calls == [
         ["/usr/sbin/sysctl", "-n", "iogpu.wired_limit_mb"],
-        ["/usr/sbin/sysctl", "-w", "iogpu.wired_limit_mb=112640"],
+        [
+            "/usr/sbin/sudo",
+            "/usr/sbin/sysctl",
+            "-w",
+            "iogpu.wired_limit_mb=112640",
+        ],
     ]
 
 
 def test_set_iogpu_wired_limit_no_sysctl(monkeypatch):
     monkeypatch.setattr("main.shutil.which", lambda _: None)
+    assert main.set_iogpu_wired_limit(112640) is False
+
+
+def test_set_iogpu_wired_limit_no_sudo(monkeypatch):
+    def fake_run(argv, **kw):
+        class Read:
+            returncode = 0
+            stdout = "107520"
+            stderr = ""
+
+        return Read()
+
+    monkeypatch.setattr(
+        "main.shutil.which", lambda name: "/usr/sbin/sysctl" if name == "sysctl" else None
+    )
+    monkeypatch.setattr("main.subprocess.run", fake_run)
+
     assert main.set_iogpu_wired_limit(112640) is False
