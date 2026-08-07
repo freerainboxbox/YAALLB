@@ -16,6 +16,7 @@ class FakeProvider(Provider):
 
     def __init__(self, endpoint_uri: str, model_ids: list[str]) -> None:
         self._endpoint_uri = endpoint_uri
+        self._model_ids = list(model_ids)
         self._descriptors = [ModelDescriptor(m, self) for m in model_ids]
 
     @property
@@ -24,6 +25,12 @@ class FakeProvider(Provider):
 
     def getModelsDescriptors(self) -> list[ModelDescriptor]:
         return list(self._descriptors)
+
+    def getOAIModels(self) -> list[dict]:
+        return [
+            {"id": m, "object": "model", "created": 1, "owned_by": "fake"}
+            for m in self._model_ids
+        ]
 
     def createModel(self, descriptor, loadOptions) -> BaseModel:
         return self.Model(descriptor, loadOptions)
@@ -76,33 +83,10 @@ def test_chat_completions_not_found():
     assert "does-not-exist" in body["message"]
 
 
-def test_list_models_concatenates(monkeypatch):
+def test_list_models_concatenates():
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     prov_b = FakeProvider("http://b.example/v1", ["model-b"])
     main.PROVIDERS = [prov_a, prov_b]
-
-    def fake_get(url: str):
-        class Resp:
-            def __init__(self, data):
-                self._data = data
-
-            def raise_for_status(self):
-                pass
-
-            def json(self):
-                return self._data
-
-        if url == "http://a.example/v1/models":
-            return Resp({"object": "list", "data": [
-                {"id": "model-a", "created": 1, "object": "model", "owned_by": "a"},
-            ]})
-        if url == "http://b.example/v1/models":
-            return Resp({"object": "list", "data": [
-                {"id": "model-b", "created": 2, "object": "model", "owned_by": "b"},
-            ]})
-        raise AssertionError(f"unexpected url: {url}")
-
-    monkeypatch.setattr("httpx.get", fake_get)
 
     resp = TestClient(main.app).get("/v1/models")
 
@@ -110,3 +94,66 @@ def test_list_models_concatenates(monkeypatch):
     data = resp.json()["data"]
     assert [m["id"] for m in data] == ["model-a", "model-b"]
     assert all(m["object"] == "model" for m in data)
+
+
+def test_getoaimodels_default_queries_endpoint(monkeypatch):
+    from providers.lmstudio import LMStudioProvider
+
+    provider = LMStudioProvider()
+    captured = {}
+
+    def fake_get(url: str):
+        captured["url"] = url
+        class Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"object": "list", "data": [
+                    {"id": "x", "object": "model", "created": 1, "owned_by": "o"},
+                ]}
+
+        return Resp()
+
+    monkeypatch.setattr("httpx.get", fake_get)
+
+    data = provider.getOAIModels()
+    assert data == [{"id": "x", "object": "model", "created": 1, "owned_by": "o"}]
+    assert captured["url"] == "http://127.0.0.1:1234/v1/models"
+
+
+def test_dwarfstar_getoaimodels_hardcoded(monkeypatch):
+    from providers.dwarfstar import DwarfStarProvider
+
+    def no_network(url):
+        raise AssertionError("should not hit the network")
+
+    monkeypatch.setattr("httpx.get", no_network)
+
+    provider = DwarfStarProvider()
+    data = provider.getOAIModels()
+    assert [m["id"] for m in data] == ["deepseek-v4-flash", "deepseek-v4-pro"]
+    assert all(m["object"] == "model" for m in data)
+
+
+def test_dwarfstar_resident_model_and_context(monkeypatch):
+    from providers.dwarfstar import DwarfStarProvider
+
+    def no_network(url):
+        raise AssertionError("should not hit the network")
+
+    monkeypatch.setattr("httpx.get", no_network)
+
+    provider = DwarfStarProvider()
+    assert [m["context_length"] for m in provider.getOAIModels()] == [1000000, 1000000]
+
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    )
+    provider.loadModel(model)
+    assert provider.resident_model is model
+    assert [m["context_length"] for m in provider.getOAIModels()] == [8192, 8192]
+
+    provider.unloadModel(model)
+    assert getattr(provider, "resident_model", None) is None
+    assert [m["context_length"] for m in provider.getOAIModels()] == [1000000, 1000000]

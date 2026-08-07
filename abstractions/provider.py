@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+import httpx
+
 if TYPE_CHECKING:
     from .descriptor import ModelDescriptor
     from .load_options import LoadOptions
@@ -21,6 +23,17 @@ class Provider(ABC):
     @abstractmethod
     def getModelsDescriptors(self) -> list["ModelDescriptor"]:
         """List the descriptors of models this provider can serve."""
+
+    def getOAIModels(self) -> list[dict]:
+        """List the models this provider presents over its /v1/models.
+
+        Default implementation queries the downstream endpoint. Override for
+        providers that cannot answer that endpoint natively (e.g. ds4, which
+        is spawned/terminated by Python rather than serving its own API).
+        """
+        resp = httpx.get(self.endpoint_uri + "/models")
+        resp.raise_for_status()
+        return resp.json().get("data", [])
 
     @abstractmethod
     def createModel(

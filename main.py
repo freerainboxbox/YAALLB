@@ -7,7 +7,6 @@ lists of every provider. Reverse proxy forwarding is not wired yet.
 
 import argparse
 
-import httpx
 from fastapi import FastAPI, Response
 
 from abstractions.provider import Provider
@@ -49,9 +48,7 @@ def chat_completions(body: dict, response: Response) -> dict:
 def list_models() -> dict:
     data = []
     for provider in PROVIDERS:
-        resp = httpx.get(provider.endpoint_uri + "/models")
-        resp.raise_for_status()
-        data.extend(resp.json().get("data", []))
+        data.extend(provider.getOAIModels())
     return {"object": "list", "data": data}
 
 

@@ -70,4 +70,15 @@ def test_providers_concrete_memory():
 
 def test_providers_list_descriptors():
     assert LMStudioProvider().getModelsDescriptors() == []
-    assert DwarfStarProvider().getModelsDescriptors() == []
+    provider = DwarfStarProvider()
+    descs = provider.getModelsDescriptors()
+    assert [d.modelId for d in descs] == ["deepseek-v4-flash", "deepseek-v4-pro"]
+    assert all(d.provider is provider for d in descs)
+
+
+def test_dwarfstar_memory_piecewise():
+    p = DwarfStarProvider()
+    small = p.createModel(ModelDescriptor("b", p), LoadOptions(ctx_length=4096))
+    assert small.memory() == pytest.approx(83065.32 + 0.015655 * 4096)
+    big = p.createModel(ModelDescriptor("b", p), LoadOptions(ctx_length=8192))
+    assert big.memory() == pytest.approx(83065.32 + 16416 * 8192 / (2**20))
