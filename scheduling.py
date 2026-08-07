@@ -74,6 +74,10 @@ class Scheduler:
     async def stop(self) -> None:
         if self._task is None:
             return
+        # Graceful shutdown: flush queued requests and wait for in-flight ones
+        # to finish before tearing down the coordinator.
+        while self.pending or any(self.in_flight.values()):
+            await asyncio.sleep(0)
         self._wake.set()
         self._task.cancel()
         try:

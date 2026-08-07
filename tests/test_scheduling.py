@@ -221,3 +221,36 @@ def test_scheduler_model_not_found():
             await s.stop()
 
     run(scenario())
+
+
+def test_scheduler_stop_flushes_pending_requests():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 100})
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        # Enqueue a request; stop() must serve it while flushing.
+        task = asyncio.create_task(s.submit("m1", LoadOptions()))
+        stopping = asyncio.create_task(s.stop())
+        await asyncio.sleep(0)  # coordinator serves the pending request
+        model = await task  # served during stop
+        assert model.descriptor.modelId == "m1"
+        assert model in s.resident
+        s.release(model)  # drain in-flight so stop() can finish
+        await stopping
+
+    run(scenario())
+
+
+def test_scheduler_stop_waits_for_in_flight():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 100})
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        m1 = await s.submit("m1", LoadOptions())  # stays in-flight
+        stopping = asyncio.create_task(s.stop())
+        await asyncio.sleep(0)
+        assert not stopping.done()  # blocked on the in-flight request
+        s.release(m1)  # drain proceeds
+        await stopping
+
+    run(scenario())

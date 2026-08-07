@@ -48,7 +48,16 @@ def test_create_model_returns_provider_model():
     assert model.loadOptions is not None
 
 
-def test_load_and_unload_alias_to_provider():
+def test_load_and_unload_alias_to_provider(monkeypatch):
+    def fake_post(url, json, headers):
+        class Resp:
+            status_code = 200
+            text = "ok"
+
+        return Resp()
+
+    monkeypatch.setattr("providers.lmstudio.httpx.post", fake_post)
+
     provider = LMStudioProvider()
     desc = ModelDescriptor("m", provider)
     model = provider.createModel(desc, LoadOptions())
@@ -80,7 +89,18 @@ def test_providers_concrete_memory(monkeypatch):
     assert isinstance(m2.memory(), float)
 
 
-def test_providers_list_descriptors():
+def test_providers_list_descriptors(monkeypatch):
+    def fake_get(url, headers):
+        class Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"models": []}
+
+        return Resp()
+
+    monkeypatch.setattr("providers.lmstudio.httpx.get", fake_get)
     assert LMStudioProvider().getModelsDescriptors() == []
     provider = DwarfStarProvider()
     descs = provider.getModelsDescriptors()
@@ -171,6 +191,116 @@ def test_lmstudio_memory_raises_on_nonzero_exit(monkeypatch):
     m = p.createModel(ModelDescriptor("nope", p), LoadOptions())
     with pytest.raises(RuntimeError):
         m.memory()
+
+
+def test_lmstudio_get_models_descriptors_filters_llm(monkeypatch):
+    from providers.lmstudio import LMStudioProvider
+
+    captured = {}
+
+    def fake_get(url, headers):
+        captured["url"] = url
+        captured["headers"] = headers
+        class Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "models": [
+                        {"key": "a/llm", "type": "llm"},
+                        {"key": "b/emb", "type": "embedding"},
+                        {"key": "c/llm", "type": "llm"},
+                    ]
+                }
+
+        return Resp()
+
+    monkeypatch.setattr("providers.lmstudio.httpx.get", fake_get)
+
+    p = LMStudioProvider(config={"api_key": "sk"})
+    descs = p.getModelsDescriptors()
+    assert [d.modelId for d in descs] == ["a/llm", "c/llm"]
+    assert all(d.provider is p for d in descs)
+    assert captured["url"] == "http://127.0.0.1:1234/api/v1/models"
+    assert captured["headers"] == {"Authorization": "Bearer sk"}
+
+
+def test_lmstudio_load_calls_rest_api(monkeypatch):
+    from providers.lmstudio import LMStudioProvider
+
+    calls = []
+
+    def fake_post(url, json, headers):
+        calls.append((url, json, headers))
+        class Resp:
+            status_code = 200
+            text = "ok"
+
+        return Resp()
+
+    monkeypatch.setattr("providers.lmstudio.httpx.post", fake_post)
+
+    p = LMStudioProvider(config={"api_key": "sk"})
+    m = p.createModel(
+        ModelDescriptor("qwen3-0.6b-mlx", p), LoadOptions(ctx_length=8192)
+    )
+    p.loadModel(m)
+
+    assert m.loaded
+    assert calls[0][0] == "http://127.0.0.1:1234/api/v1/models/load"
+    assert calls[0][1] == {
+        "model": "qwen3-0.6b-mlx",
+        "context_length": 8192,
+    }
+    assert calls[0][2] == {"Authorization": "Bearer sk"}
+
+
+def test_lmstudio_unload_calls_rest_api(monkeypatch):
+    from providers.lmstudio import LMStudioProvider
+
+    calls = []
+
+    def fake_post(url, json, headers):
+        calls.append((url, json, headers))
+        class Resp:
+            status_code = 200
+            text = "ok"
+
+        return Resp()
+
+    monkeypatch.setattr("providers.lmstudio.httpx.post", fake_post)
+
+    p = LMStudioProvider(config={"api_key": "sk"})
+    m = p.createModel(
+        ModelDescriptor("qwen3-0.6b-mlx", p), LoadOptions(ctx_length=8192)
+    )
+    p.loadModel(m)
+    p.unloadModel(m)
+
+    assert not m.loaded
+    assert calls[1][0] == "http://127.0.0.1:1234/api/v1/models/unload"
+    assert calls[1][1] == {"instance_id": "qwen3-0.6b-mlx"}
+    assert calls[1][2] == {"Authorization": "Bearer sk"}
+
+
+def test_lmstudio_load_raises_on_error_status(monkeypatch):
+    from providers.lmstudio import LMStudioProvider
+
+    def fake_post(url, json, headers):
+        class Resp:
+            status_code = 500
+            text = "boom"
+
+        return Resp()
+
+    monkeypatch.setattr("providers.lmstudio.httpx.post", fake_post)
+
+    p = LMStudioProvider()
+    m = p.createModel(ModelDescriptor("x", p), LoadOptions())
+    with pytest.raises(RuntimeError):
+        p.loadModel(m)
+    assert not m.loaded
 
 
 def test_lmstudio_memory_raises_on_unparseable(monkeypatch):

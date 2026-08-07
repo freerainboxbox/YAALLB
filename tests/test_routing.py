@@ -193,6 +193,30 @@ def test_chat_completions_streams_sse(monkeypatch):
     assert fake.calls[0][1] == "http://a.example/v1/chat/completions"
 
 
+def test_graceful_shutdown_unloads_resident_models(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a._unloaded = []
+
+    def recording_unload(model):
+        prov_a._unloaded.append(model.descriptor.modelId)
+        model._loaded = False
+
+    prov_a.unloadModel = recording_unload
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(nonstream=FakeResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        client.post("/v1/chat/completions", json={"model": "model-a", "messages": []})
+        assert main.SCHEDULER.resident  # model loaded during request
+
+    # Exiting the TestClient runs lifespan shutdown: flush + unload residents.
+    assert prov_a._unloaded == ["model-a"]
+    assert not main.SCHEDULER.resident[0].loaded
+
+
 def test_chat_completions_not_found():
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     main.PROVIDERS = [prov_a]

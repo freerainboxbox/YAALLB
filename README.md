@@ -159,4 +159,17 @@ is configured as:
 ### lms
 
 LM Studio serves its own API natively; instances only need `host` and
-`port` (defaults `127.0.0.1` and `1234`).
+`port` (defaults `127.0.0.1` and `1234`), plus `api_key` when server
+authentication is enabled.
+
+YAALLB drives LM Studio through its management REST API (`/api/v1`):
+`getModelsDescriptors` lists LLMs from `GET /api/v1/models`, `loadModel`
+posts to `POST /api/v1/models/load` (with `context_length`), and `unloadModel`
+posts to `POST /api/v1/models/unload`. VRAM estimates still come from the
+`lms` CLI (`--estimate-only`).
+
+## Graceful shutdown
+
+On exit (Ctrl-C/SIGTERM), YAALLB flushes queued and in-flight requests, then
+unloads every resident model: LM Studio instances get the unload API route
+called, and ds4 instances simply terminate their spawned server process.

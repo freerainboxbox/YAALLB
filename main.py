@@ -39,6 +39,19 @@ async def lifespan(app: FastAPI):
     yield
     if SCHEDULER is not None:
         await SCHEDULER.stop()
+        for model in SCHEDULER.resident:
+            try:
+                model.unloadModel()
+                log.info(
+                    f"shutdown unloaded model={model.descriptor.modelId} "
+                    f"provider={model.descriptor.provider._type_id}"
+                    f"#{getattr(model.descriptor.provider, '_instance_id', 0)}"
+                )
+            except Exception as e:
+                log.error(
+                    f"shutdown failed to unload "
+                    f"model={model.descriptor.modelId}: {e}"
+                )
 
 
 app = FastAPI(lifespan=lifespan)
