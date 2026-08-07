@@ -239,9 +239,7 @@ async def chat_completions(body: dict):
     provider = lookup_model(PROVIDERS, model_id)
     overrides = model_overrides_for(provider, model_id) if provider else {}
     default_ctx = overrides.get("ctx_length") or DEFAULT_CTX_LENGTH
-    ctx_length = (
-        body.get("context_length") or body.get("max_tokens") or default_ctx
-    )
+    ctx_length = body.get("context_length") or default_ctx
 
     async def event_stream():
         # Prelim event so the client sees a 200 and knows YAALLB is awake

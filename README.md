@@ -59,9 +59,11 @@ list of instance config objects:
 
 The `yaallb` object holds server-level settings: `address` and `port` are the
 bind address/port, and `ctx_length` is the default context length used when a
-request specifies neither `context_length` nor `max_tokens`. The CLI flags
-`--address` and `--port` override these only when explicitly passed; otherwise
-config.json is the source of truth.
+request specifies no `context_length`. `max_tokens` is a client-side constraint
+on the number of tokens emitted and is **not** used for context sizing — only
+`context_length` (or the default) drives the model's context window. The CLI
+flags `--address` and `--port` override these only when explicitly passed;
+otherwise config.json is the source of truth.
 
 The position in each list is that instance's `_instance_id`. Types that are
 absent are simply disabled. Each instance object is applied on top of the

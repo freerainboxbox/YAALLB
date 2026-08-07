@@ -5,7 +5,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 import main
-from main import STARTUP_ATTEMPTS
+from main import DEFAULT_CTX_LENGTH, STARTUP_ATTEMPTS
 from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model as BaseModel
@@ -108,6 +108,28 @@ class FakeAsyncClient:
     async def send(self, req, stream=False):
         self.calls.append(("send", req["url"], req["json"], req["headers"]))
         return self.stream
+
+
+def test_chat_completions_max_tokens_does_not_drive_ctx(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "max_tokens": 512, "stream": True},
+        )
+
+    assert resp.status_code == 200
+    # max_tokens bounds the number of tokens emitted, not the model's context
+    # window; it must not drive context sizing.
+    assert main.SCHEDULER.resident[0].loadOptions.ctx_length == DEFAULT_CTX_LENGTH
+    method, url, json, headers = fake.calls[0]
+    assert json["max_tokens"] == 512
 
 
 def test_chat_completions_forwards_to_provider(monkeypatch):
