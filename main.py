@@ -260,6 +260,17 @@ async def chat_completions(body: dict):
                 "access to it.",
             )
             return
+        except Exception as e:
+            # Any other scheduler-side failure (VRAM exhaustion, memory
+            # estimate, load error) must become an SSE error event too — the
+            # prelim 200 is already committed, so an uncaught exception would
+            # abort the stream with no error event.
+            log.error(f"model load failed: {e}")
+            yield _sse_error(
+                "model_load_failed",
+                f"failed to load model `{model_id}`: {e}",
+            )
+            return
 
         # Apply non-ctx model overrides (temperature, top_p, ...) as defaults
         # when the client didn't specify them; they ride along in the body.

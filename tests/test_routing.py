@@ -309,6 +309,28 @@ def test_graceful_shutdown_unloads_resident_models(monkeypatch):
     assert not main.SCHEDULER.resident[0].loaded
 
 
+def test_chat_completions_scheduler_failure_sse_error(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+
+    def failing_load(model):
+        raise RuntimeError("boom load")
+
+    prov_a.loadModel = failing_load
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": True},
+        )
+
+    # A scheduler-side load failure becomes an SSE error event, not an abrupt
+    # stream abort after the prelim 200 was already committed.
+    assert resp.status_code == 200
+    assert b'"code": "model_load_failed"' in resp.content
+
+
 def test_chat_completions_not_found():
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     main.PROVIDERS = [prov_a]
