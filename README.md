@@ -119,11 +119,23 @@ body to `{endpoint_uri}/chat/completions` and relays the upstream response
 back. `stream: true` requests are proxied as an SSE stream. The model stays
 in-flight (so it isn't evicted) until the upstream reply completes.
 
-When a provider isn't ready yet (e.g. ds4-server is still starting up),
-YAALLB answers `503` with `Retry-After: 2` so the client can retry, instead
-of surfacing a 4XX/connection error. Each failure bumps a per-provider
-startup counter; after `STARTUP_ATTEMPTS` (10) failures it escalates to
-`500`. The counter resets once the provider serves a request successfully.
+`/v1/chat/completions` is **streaming-only**:
+
+- Requests that don't set `stream: true` are refused with a `400` error
+  (`code: stream_required`) rather than silently downgraded.
+- Every streaming request gets an immediate **prelim SSE event**
+  (`{"status": "processing", "model": ..., "choices": []}`) so the client sees
+  a `200` and knows YAALLB is awake before the scheduler finishes a
+  potentially long model load. A `200` here is **not** confirmation that a
+  full reply will come: if the downstream provider fails, the failure is
+  delivered as an **SSE error event** within the same `200` stream — never as
+  a `503`/`500`/4XX body, which the client would just reject.
+
+When a provider isn't ready yet (e.g. ds4-server is still starting up), the
+forward is **retried internally** up to `STARTUP_ATTEMPTS` (10) times, then an
+SSE error event (`code: provider_start_failed`) is emitted. Each failure bumps
+a per-provider startup counter, and the counter resets once the provider
+serves a request successfully.
 
 ### ds4
 
@@ -225,6 +237,14 @@ YAALLB drives LM Studio through its management REST API (`/api/v1`):
 posts to `POST /api/v1/models/load` (with `context_length`), and `unloadModel`
 posts to `POST /api/v1/models/unload`. VRAM estimates still come from the
 `lms` CLI (`--estimate-only`).
+
+LM Studio blocks on `POST /api/v1/models/load` until the model finishes
+loading, so YAALLB gives that call a long timeout (`LMS_LOAD_TIMEOUT`, 300s)
+and then **polls** `GET /api/v1/models` until the model key appears as a
+loaded LLM (`LMS_LOAD_MAX_WAIT`, 600s). A load timeout or LM Studio's
+"still loading" 4XX is treated as still-in-progress and never forwarded to
+the client as an error; only a true failure (auth `401`, 5XX, or the model
+never becoming ready within the deadline) raises.
 
 ## Graceful shutdown
 

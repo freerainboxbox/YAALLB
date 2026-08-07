@@ -115,19 +115,21 @@ def test_chat_completions_forwards_to_provider(monkeypatch):
     main.PROVIDERS = [prov_a]
     main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
 
-    fake = FakeAsyncClient(nonstream=FakeResponse())
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
     monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
 
     with TestClient(main.app) as client:
         resp = client.post(
             "/v1/chat/completions",
-            json={"model": "model-a", "messages": [], "max_tokens": 512},
+            json={"model": "model-a", "messages": [], "max_tokens": 512, "stream": True},
         )
 
     assert resp.status_code == 200
-    assert resp.json() == {"choices": [{"index": 0}], "usage": {}}
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert resp.content.startswith(b'data: {"status": "processing"')
+    assert resp.content.endswith(b'data: {"x":1}\n\ndata: [DONE]\n\n')
     method, url, json, headers = fake.calls[0]
-    assert method == "post"
+    assert method == "send"
     assert url == "http://a.example/v1/chat/completions"
     assert json["model"] == "model-a"
     assert json["max_tokens"] == 512
@@ -144,39 +146,48 @@ def test_chat_completions_sends_api_key_header(monkeypatch):
     main.PROVIDERS = [prov_a]
     main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
 
-    fake = FakeAsyncClient(nonstream=FakeResponse())
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
     monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
 
     with TestClient(main.app) as client:
-        client.post("/v1/chat/completions", json={"model": "model-a", "messages": []})
+        client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": True},
+        )
 
     method, url, json, headers = fake.calls[0]
     assert headers == {"Authorization": "Bearer sk-test"}
 
 
-def test_chat_completions_upstream_not_ready_returns_503(monkeypatch):
+def test_chat_completions_upstream_not_ready_sse_error(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     main.PROVIDERS = [prov_a]
     main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
 
-    fake = FakeAsyncClient(
-        nonstream=FakeResponse(b'{"error":{"message":"boom"}}', status_code=503)
-    )
+    class NonReadyStream:
+        status_code = 503
+        headers = {"content-type": "text/event-stream"}
+
+    fake = FakeAsyncClient(stream=NonReadyStream())
     monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    async def no_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("main.asyncio.sleep", no_sleep)
 
     with TestClient(main.app) as client:
         resp = client.post(
-            "/v1/chat/completions", json={"model": "model-a", "messages": []}
+            "/v1/chat/completions", json={"model": "model-a", "messages": [], "stream": True}
         )
 
-    # A non-200 upstream during startup becomes 503 + Retry-After: 2.
-    assert resp.status_code == 503
-    assert resp.headers["retry-after"] == "2"
-    assert resp.json()["error"]["code"] == "provider_starting"
-    assert prov_a.startup_failures == 1
+    # A non-200 upstream during startup becomes an SSE error event, not a 503.
+    assert resp.status_code == 200
+    assert b'"code": "provider_start_failed"' in resp.content
+    assert prov_a.startup_failures == STARTUP_ATTEMPTS
 
 
-def test_chat_completions_connection_error_retries_then_500(monkeypatch):
+def test_chat_completions_connection_error_retries_then_sse_error(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     main.PROVIDERS = [prov_a]
     main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
@@ -191,9 +202,6 @@ def test_chat_completions_connection_error_retries_then_500(monkeypatch):
         async def aclose(self):
             pass
 
-        async def post(self, url, json, headers):
-            raise httpx.ConnectError("ds4-server not up")
-
         def build_request(self, method, url, json, headers):
             return {"url": url, "json": json, "headers": headers}
 
@@ -202,19 +210,20 @@ def test_chat_completions_connection_error_retries_then_500(monkeypatch):
 
     monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: RaisingClient())
 
+    async def no_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("main.asyncio.sleep", no_sleep)
+
     with TestClient(main.app) as client:
-        for _ in range(STARTUP_ATTEMPTS - 1):
-            resp = client.post(
-                "/v1/chat/completions", json={"model": "model-a", "messages": []}
-            )
-            assert resp.status_code == 503
-            assert resp.headers["retry-after"] == "2"
-        # The 10th failure escalates to 500.
         resp = client.post(
-            "/v1/chat/completions", json={"model": "model-a", "messages": []}
+            "/v1/chat/completions", json={"model": "model-a", "messages": [], "stream": True}
         )
-        assert resp.status_code == 500
-        assert resp.json()["error"]["code"] == "provider_start_failed"
+
+    # Connection failures retry internally, then surface as an SSE error event.
+    assert resp.status_code == 200
+    assert b'"code": "provider_start_failed"' in resp.content
+    assert prov_a.startup_failures == STARTUP_ATTEMPTS
 
 
 def test_chat_completions_success_resets_startup_failures(monkeypatch):
@@ -223,11 +232,13 @@ def test_chat_completions_success_resets_startup_failures(monkeypatch):
     main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
 
     prov_a.startup_failures = 9
-    fake = FakeAsyncClient(nonstream=FakeResponse())
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
     monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
 
     with TestClient(main.app) as client:
-        client.post("/v1/chat/completions", json={"model": "model-a", "messages": []})
+        client.post(
+            "/v1/chat/completions", json={"model": "model-a", "messages": [], "stream": True}
+        )
 
     assert prov_a.startup_failures == 0
 
@@ -248,9 +259,28 @@ def test_chat_completions_streams_sse(monkeypatch):
 
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
-    assert resp.content == b'data: {"x":1}\n\ndata: [DONE]\n\n'
+    # Prelim event comes first, then the relayed upstream chunks.
+    assert resp.content == b'data: {"status": "processing", "model": "model-a", "choices": []}\n\ndata: {"x":1}\n\ndata: [DONE]\n\n'
     assert fake.calls[0][0] == "send"
     assert fake.calls[0][1] == "http://a.example/v1/chat/completions"
+
+
+def test_chat_completions_rejects_stream_false():
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": []},
+        )
+
+    assert resp.status_code == 400
+    body = resp.json()["error"]
+    assert body["code"] == "stream_required"
+    assert body["param"] == "stream"
+    assert "stream" in body["message"]
 
 
 def test_graceful_shutdown_unloads_resident_models(monkeypatch):
@@ -265,11 +295,13 @@ def test_graceful_shutdown_unloads_resident_models(monkeypatch):
     main.PROVIDERS = [prov_a]
     main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
 
-    fake = FakeAsyncClient(nonstream=FakeResponse())
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
     monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
 
     with TestClient(main.app) as client:
-        client.post("/v1/chat/completions", json={"model": "model-a", "messages": []})
+        client.post(
+            "/v1/chat/completions", json={"model": "model-a", "messages": [], "stream": True}
+        )
         assert main.SCHEDULER.resident  # model loaded during request
 
     # Exiting the TestClient runs lifespan shutdown: flush + unload residents.
@@ -285,15 +317,15 @@ def test_chat_completions_not_found():
     with TestClient(main.app) as client:
         resp = client.post(
             "/v1/chat/completions",
-            json={"model": "does-not-exist"},
+            json={"model": "does-not-exist", "stream": True},
         )
 
-    assert resp.status_code == 404
-    body = resp.json()["error"]
-    assert body["type"] == "invalid_request_error"
-    assert body["param"] == "model"
-    assert body["code"] == "model_not_found"
-    assert "does-not-exist" in body["message"]
+    # Model-not-found surfaces as an SSE error event (still 200) so the
+    # client doesn't reject the response outright.
+    assert resp.status_code == 200
+    body = resp.content
+    assert b'"code": "model_not_found"' in body
+    assert "does-not-exist" in resp.text
 
 
 def test_list_models_concatenates():
@@ -843,13 +875,13 @@ def test_chat_completions_applies_ctx_and_override(monkeypatch):
     main.PROVIDERS = [prov_a]
     main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
 
-    fake = FakeAsyncClient(nonstream=FakeResponse())
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
     monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
 
     with TestClient(main.app) as client:
         resp = client.post(
             "/v1/chat/completions",
-            json={"model": "model-a", "messages": []},
+            json={"model": "model-a", "messages": [], "stream": True},
         )
 
     assert resp.status_code == 200
@@ -868,13 +900,13 @@ def test_chat_completions_client_ctx_wins_over_override(monkeypatch):
     main.PROVIDERS = [prov_a]
     main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
 
-    fake = FakeAsyncClient(nonstream=FakeResponse())
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
     monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
 
     with TestClient(main.app) as client:
         client.post(
             "/v1/chat/completions",
-            json={"model": "model-a", "context_length": 4096, "messages": []},
+            json={"model": "model-a", "context_length": 4096, "messages": [], "stream": True},
         )
 
     assert main.SCHEDULER.resident[0].loadOptions.ctx_length == 4096

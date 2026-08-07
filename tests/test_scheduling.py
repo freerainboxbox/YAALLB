@@ -254,3 +254,30 @@ def test_scheduler_stop_waits_for_in_flight():
         await stopping
 
     run(scenario())
+
+
+def test_scheduler_load_runs_off_thread():
+    import threading
+
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 100})
+        seen = {}
+        orig = p.loadModel
+
+        def record(model):
+            seen["thread"] = threading.get_ident()
+            orig(model)
+
+        p.loadModel = record
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        try:
+            m = await s.submit("m1", LoadOptions())
+            assert m in s.resident
+            # loadModel ran on a worker thread, not the event-loop thread.
+            assert seen["thread"] != threading.get_ident()
+            s.release(m)
+        finally:
+            await s.stop()
+
+    run(scenario())

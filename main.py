@@ -7,6 +7,7 @@ every provider.
 """
 
 import argparse
+import asyncio
 import json
 import shutil
 import subprocess
@@ -14,8 +15,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Response
-from starlette.responses import StreamingResponse
+from fastapi import FastAPI
+from starlette.responses import JSONResponse, StreamingResponse
 
 import log
 from abstractions.load_options import LoadOptions
@@ -184,154 +185,152 @@ def set_iogpu_wired_limit(vram_limit_mb: int) -> bool:
     return True
 
 
-def model_not_found_error(model_id: str) -> dict:
-    return {
-        "error": {
-            "message": (
-                f"The model `{model_id}` does not exist or you do not have "
-                "access to it."
-            ),
-            "type": "invalid_request_error",
-            "param": "model",
-            "code": "model_not_found",
-        }
-    }
+def _sse(data: dict) -> bytes:
+    return f"data: {json.dumps(data)}\n\n".encode()
 
 
-def startup_failure(provider: Provider, response: Response, detail: str):
-    """Handle a provider that isn't ready yet (e.g. ds4-server still starting).
-
-    Each failed startup attempt bumps a per-provider counter. While it is
-    below STARTUP_ATTEMPTS the request is answered 503 with Retry-After: 2 so
-    the client can retry; once the counter reaches STARTUP_ATTEMPTS, answer 500
-    instead. The counter resets when the provider eventually serves a request.
-    """
-    failures = getattr(provider, "startup_failures", 0) + 1
-    provider.startup_failures = failures
-    if failures < STARTUP_ATTEMPTS:
-        log.warning(
-            f"provider {provider.endpoint_uri} not ready "
-            f"({failures}/{STARTUP_ATTEMPTS}): {detail}"
-        )
-        response.status_code = 503
-        response.headers["Retry-After"] = "2"
-        return {
+def _sse_error(code: str, message: str) -> bytes:
+    return _sse(
+        {
             "error": {
-                "message": f"provider {provider.endpoint_uri} starting",
-                "type": "temporarily_unavailable",
+                "message": message,
+                "type": "invalid_request_error",
                 "param": None,
-                "code": "provider_starting",
+                "code": code,
             }
         }
-    log.error(
-        f"provider {provider.endpoint_uri} failed to start "
-        f"after {STARTUP_ATTEMPTS} attempts: {detail}"
     )
-    response.status_code = 500
-    return {
-        "error": {
-            "message": f"provider {provider.endpoint_uri} failed to start",
-            "type": "server_error",
-            "param": None,
-            "code": "provider_start_failed",
-        }
-    }
 
 
-async def _forward_chat(provider: Provider, body: dict, stream: bool):
-    """Proxy /v1/chat/completions to the provider.
-
-    Returns (response_or_generator, is_stream). On transport failure raises
-    httpx.HTTPError so the caller can 502.
-    """
-    url = provider.endpoint_uri + "/chat/completions"
-    headers = provider._auth_headers()
-    client = httpx.AsyncClient(timeout=None)
-    if stream:
-        req = client.build_request("POST", url, json=body, headers=headers)
-        upstream = await client.send(req, stream=True)
-        return client, upstream
-    try:
-        return await client.post(url, json=body, headers=headers)
-    finally:
-        await client.aclose()
+def _bump_startup_failures(provider: Provider, detail: str) -> int:
+    failures = getattr(provider, "startup_failures", 0) + 1
+    provider.startup_failures = failures
+    log.warning(
+        f"provider {provider.endpoint_uri} not ready "
+        f"({failures}/{STARTUP_ATTEMPTS}): {detail}; retrying"
+    )
+    return failures
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(body: dict, response: Response):
+async def chat_completions(body: dict):
     model_id = body.get("model")
+
+    # The endpoint is streaming-only: a non-200 body would be rejected by the
+    # client, so refuse non-streaming requests up front instead of silently
+    # downgrading them.
+    if not body.get("stream", False):
+        log.warning(f"chat request model={model_id} rejected: stream required")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": (
+                        "streaming must be enabled (stream=true) for this "
+                        "endpoint to work"
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "stream",
+                    "code": "stream_required",
+                }
+            },
+        )
+
     provider = lookup_model(PROVIDERS, model_id)
     overrides = model_overrides_for(provider, model_id) if provider else {}
     default_ctx = overrides.get("ctx_length") or DEFAULT_CTX_LENGTH
     ctx_length = (
         body.get("context_length") or body.get("max_tokens") or default_ctx
     )
-    try:
-        model = await SCHEDULER.submit(model_id, LoadOptions(ctx_length=ctx_length))
-    except ModelNotFound:
-        log.error(f"model not found: {model_id}")
-        response.status_code = 404
-        return model_not_found_error(model_id)
 
-    # Apply non-ctx model overrides (temperature, top_p, ...) as defaults when
-    # the client didn't specify them; they ride along in the forwarded body.
-    forward_body = dict(body)
-    for key, value in overrides.items():
-        if key == "ctx_length":
-            continue
-        forward_body.setdefault(key, value)
+    async def event_stream():
+        # Prelim event so the client sees a 200 and knows YAALLB is awake
+        # before the scheduler finishes a potentially long model load.
+        yield _sse({"status": "processing", "model": model_id, "choices": []})
 
-    provider = model.descriptor.provider
-    stream = body.get("stream", False)
-    log.info(
-        f"chat request model={model_id} "
-        f"provider={provider._type_id}#{getattr(provider, '_instance_id', 0)} "
-        f"stream={stream} ctx={ctx_length}"
-    )
-    try:
-        result = await _forward_chat(provider, forward_body, stream)
-    except httpx.HTTPError as e:
-        SCHEDULER.release(model)
-        return startup_failure(
-            provider, response, f"connection error: {e}"
-        )
-
-    if stream:
-        client, upstream = result
-        if upstream.status_code != 200:
-            SCHEDULER.release(model)
-            await client.aclose()
-            return startup_failure(
-                provider, response, f"upstream status {upstream.status_code}"
+        try:
+            model = await SCHEDULER.submit(
+                model_id, LoadOptions(ctx_length=ctx_length)
             )
+        except ModelNotFound:
+            log.error(f"model not found: {model_id}")
+            yield _sse_error(
+                "model_not_found",
+                f"The model `{model_id}` does not exist or you do not have "
+                "access to it.",
+            )
+            return
 
-        provider.startup_failures = 0
-        async def event_stream():
+        # Apply non-ctx model overrides (temperature, top_p, ...) as defaults
+        # when the client didn't specify them; they ride along in the body.
+        forward_body = dict(body)
+        for key, value in overrides.items():
+            if key == "ctx_length":
+                continue
+            forward_body.setdefault(key, value)
+        forward_body["stream"] = True
+
+        provider = model.descriptor.provider
+        log.info(
+            f"chat request model={model_id} "
+            f"provider={provider._type_id}#{getattr(provider, '_instance_id', 0)} "
+            f"stream=true ctx={ctx_length}"
+        )
+
+        url = provider.endpoint_uri + "/chat/completions"
+        headers = provider._auth_headers()
+
+        # Forward as an SSE stream, retrying transient failures internally
+        # (bounded by STARTUP_ATTEMPTS) instead of surfacing a 503/500 or an
+        # LM Studio "still loading" 4XX. Exhaustion becomes an SSE error event.
+        while True:
+            client = httpx.AsyncClient(timeout=None)
             try:
-                async for chunk in upstream.aiter_raw():
-                    yield chunk
-            finally:
+                upstream = await client.send(
+                    client.build_request(
+                        "POST", url, json=forward_body, headers=headers
+                    ),
+                    stream=True,
+                )
+            except httpx.HTTPError as e:
                 await client.aclose()
-                SCHEDULER.release(model)
+                failures = _bump_startup_failures(provider, f"connection error: {e}")
+            else:
+                if upstream.status_code != 200:
+                    await client.aclose()
+                    failures = _bump_startup_failures(
+                        provider, f"upstream status {upstream.status_code}"
+                    )
+                else:
+                    provider.startup_failures = 0
+                    break
 
-        return StreamingResponse(
-            event_stream(),
-            status_code=upstream.status_code,
-            media_type=upstream.headers.get("content-type", "text/event-stream"),
-        )
+            if failures < STARTUP_ATTEMPTS:
+                await asyncio.sleep(2)
+                continue
+            log.error(
+                f"provider {provider.endpoint_uri} failed to start "
+                f"after {STARTUP_ATTEMPTS} attempts"
+            )
+            SCHEDULER.release(model)
+            yield _sse_error(
+                "provider_start_failed",
+                f"provider {provider.endpoint_uri} failed to start",
+            )
+            return
 
-    upstream = result
-    if upstream.status_code != 200:
-        SCHEDULER.release(model)
-        return startup_failure(
-            provider, response, f"upstream status {upstream.status_code}"
-        )
-    provider.startup_failures = 0
-    SCHEDULER.release(model)
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        media_type=upstream.headers.get("content-type", "application/json"),
+        # Relay the upstream SSE stream chunk-for-chunk.
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await client.aclose()
+            SCHEDULER.release(model)
+
+    return StreamingResponse(
+        event_stream(),
+        status_code=200,
+        media_type="text/event-stream",
     )
 
 

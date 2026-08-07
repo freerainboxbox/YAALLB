@@ -51,6 +51,13 @@ def _estimate_gpu_memory(model_id: str, ctx_length: int) -> float:
 # How long model descriptors stay cached before re-querying the server.
 _DESCRIPTORS_TTL = 30.0
 
+# LM Studio blocks on POST /api/v1/models/load until the model finishes
+# loading, so give that call a long timeout and then poll the management API
+# for readiness instead of surfacing a timeout or the "still loading" 4XX.
+LMS_LOAD_TIMEOUT = 300
+LMS_LOAD_MAX_WAIT = 600
+LMS_LOAD_POLL_INTERVAL = 2.0
+
 
 class LMStudioProvider(Provider):
     _type_id = "lms"
@@ -101,23 +108,66 @@ class LMStudioProvider(Provider):
         return self.Model(descriptor, loadOptions)
 
     def loadModel(self, model: BaseModel) -> None:
-        resp = httpx.post(
-            self._rest_uri() + "/models/load",
-            json={
-                "model": model.descriptor.modelId,
-                "context_length": model.loadOptions.ctx_length,
-            },
-            headers=self._auth_headers(),
-        )
-        if resp.status_code != 200:
-            log.error(
-                f"lms load failed for {model.descriptor.modelId} "
-                f"(status {resp.status_code}): {resp.text}"
+        try:
+            resp = httpx.post(
+                self._rest_uri() + "/models/load",
+                json={
+                    "model": model.descriptor.modelId,
+                    "context_length": model.loadOptions.ctx_length,
+                },
+                headers=self._auth_headers(),
+                timeout=LMS_LOAD_TIMEOUT,
             )
-            raise RuntimeError(
-                f"lms load failed (status {resp.status_code}): {resp.text}"
+        except httpx.ReadTimeout:
+            log.warning(
+                f"lms load for {model.descriptor.modelId} timed out; "
+                f"polling for readiness"
             )
+            resp = None
+        if resp is not None:
+            if resp.status_code == 200:
+                model._loaded = True
+                return
+            if resp.status_code == 401 or resp.status_code >= 500:
+                log.error(
+                    f"lms load failed for {model.descriptor.modelId} "
+                    f"(status {resp.status_code}): {resp.text}"
+                )
+                raise RuntimeError(
+                    f"lms load failed (status {resp.status_code}): {resp.text}"
+                )
+            # Other 4XX: LM Studio reports "still loading"; do not forward that
+            # false error to the client — poll for readiness instead.
+            log.warning(
+                f"lms load for {model.descriptor.modelId} still loading "
+                f"(status {resp.status_code}); polling for readiness"
+            )
+        self._wait_loaded(model)
         model._loaded = True
+
+    def _wait_loaded(self, model: BaseModel) -> None:
+        deadline = time.monotonic() + LMS_LOAD_MAX_WAIT
+        while True:
+            try:
+                resp = httpx.get(
+                    self._rest_uri() + "/models", headers=self._auth_headers()
+                )
+                if resp.status_code == 200:
+                    loaded = resp.json().get("models", [])
+                    for m in loaded:
+                        if (
+                            m.get("key") == model.descriptor.modelId
+                            and m.get("type") == "llm"
+                        ):
+                            return
+            except httpx.HTTPError:
+                pass
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"lms load timed out waiting for "
+                    f"{model.descriptor.modelId} to become ready"
+                )
+            time.sleep(LMS_LOAD_POLL_INTERVAL)
 
     def unloadModel(self, model: BaseModel) -> None:
         resp = httpx.post(

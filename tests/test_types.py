@@ -1,5 +1,7 @@
 import pytest
 
+import httpx
+
 from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model
@@ -49,7 +51,7 @@ def test_create_model_returns_provider_model():
 
 
 def test_load_and_unload_alias_to_provider(monkeypatch):
-    def fake_post(url, json, headers):
+    def fake_post(url, json, headers, timeout=None):
         class Resp:
             status_code = 200
             text = "ok"
@@ -236,7 +238,7 @@ def test_lmstudio_load_calls_rest_api(monkeypatch):
 
     calls = []
 
-    def fake_post(url, json, headers):
+    def fake_post(url, json, headers, timeout=None):
         calls.append((url, json, headers))
         class Resp:
             status_code = 200
@@ -266,7 +268,7 @@ def test_lmstudio_unload_calls_rest_api(monkeypatch):
 
     calls = []
 
-    def fake_post(url, json, headers):
+    def fake_post(url, json, headers, timeout=None):
         calls.append((url, json, headers))
         class Resp:
             status_code = 200
@@ -292,7 +294,7 @@ def test_lmstudio_unload_calls_rest_api(monkeypatch):
 def test_lmstudio_load_raises_on_error_status(monkeypatch):
     from providers.lmstudio import LMStudioProvider
 
-    def fake_post(url, json, headers):
+    def fake_post(url, json, headers, timeout=None):
         class Resp:
             status_code = 500
             text = "boom"
@@ -326,3 +328,90 @@ def test_lmstudio_memory_raises_on_unparseable(monkeypatch):
     m = p.createModel(ModelDescriptor("nope", p), LoadOptions())
     with pytest.raises(RuntimeError):
         m.memory()
+
+
+def test_lmstudio_load_timeout_then_poll_loads(monkeypatch):
+    from providers.lmstudio import LMStudioProvider
+
+    def fake_post(url, json, headers, timeout=None):
+        raise httpx.ReadTimeout("timed out", request=None)
+
+    calls = []
+
+    def fake_get(url, headers=None):
+        calls.append(url)
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return {"models": [{"key": "qwen3-0.6b-mlx", "type": "llm"}]}
+
+        return Resp()
+
+    monkeypatch.setattr("providers.lmstudio.httpx.post", fake_post)
+    monkeypatch.setattr("providers.lmstudio.httpx.get", fake_get)
+
+    p = LMStudioProvider()
+    m = p.createModel(
+        ModelDescriptor("qwen3-0.6b-mlx", p), LoadOptions(ctx_length=8192)
+    )
+    p.loadModel(m)
+
+    assert m.loaded
+    assert calls == ["http://127.0.0.1:1234/api/v1/models"]
+
+
+def test_lmstudio_load_still_loading_4xx_then_poll(monkeypatch):
+    from providers.lmstudio import LMStudioProvider
+
+    def fake_post(url, json, headers, timeout=None):
+        class Resp:
+            status_code = 400
+            text = "still loading"
+
+        return Resp()
+
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return {"models": [{"key": "x", "type": "llm"}]}
+
+        return Resp()
+
+    monkeypatch.setattr("providers.lmstudio.httpx.post", fake_post)
+    monkeypatch.setattr("providers.lmstudio.httpx.get", fake_get)
+
+    p = LMStudioProvider()
+    m = p.createModel(ModelDescriptor("x", p), LoadOptions())
+    p.loadModel(m)
+
+    assert m.loaded
+
+
+def test_lmstudio_load_never_loads_raises(monkeypatch):
+    from providers.lmstudio import LMStudioProvider
+
+    def fake_post(url, json, headers, timeout=None):
+        raise httpx.ReadTimeout("timed out", request=None)
+
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return {"models": []}
+
+        return Resp()
+
+    monkeypatch.setattr("providers.lmstudio.httpx.post", fake_post)
+    monkeypatch.setattr("providers.lmstudio.httpx.get", fake_get)
+    monkeypatch.setattr("providers.lmstudio.time.sleep", lambda *a: None)
+    monkeypatch.setattr("providers.lmstudio.LMS_LOAD_MAX_WAIT", 0.01)
+
+    p = LMStudioProvider()
+    m = p.createModel(ModelDescriptor("nope", p), LoadOptions())
+    with pytest.raises(RuntimeError):
+        p.loadModel(m)
+    assert not m.loaded

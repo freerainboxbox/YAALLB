@@ -141,33 +141,39 @@ class Scheduler:
 
         descriptor = self._descriptor_for(provider, model_id)
         model = provider.createModel(descriptor, load_options)
-        mem = model.memory()
-        if mem > 0:
-            shortfall = mem - self.current_free()
-            if shortfall > 0:
-                to_evict = select_evictions(self.resident, shortfall)
-                log.warning(
-                    f"reallocate: new model={model_id} "
-                    f"provider={_provider_label(provider)} "
-                    f"evicting=[{', '.join(m.descriptor.modelId for m in to_evict)}]"
-                )
-                await self._quiesce(to_evict)
-                for m in to_evict:
-                    log.warning(
-                        f"unload model={m.descriptor.modelId} "
-                        f"provider={_provider_label(m.descriptor.provider)}"
-                    )
-                    m.descriptor.provider.unloadModel(m)
-                self.resident = [m for m in self.resident if m not in to_evict]
-        log.warning(
-            f"load model={model_id} "
-            f"provider={_provider_label(provider)} "
-            f"ctx={load_options.ctx_length}"
-        )
-        provider.loadModel(model)
-        self.resident.append(model)
+        # Mark in-flight before the slow load so stop() won't see a served-but-
+        # unloaded request as quiescent and tear down the coordinator early.
         self.in_flight[model] += 1
-        return model
+        try:
+            mem = await asyncio.to_thread(model.memory)
+            if mem > 0:
+                shortfall = mem - self.current_free()
+                if shortfall > 0:
+                    to_evict = select_evictions(self.resident, shortfall)
+                    log.warning(
+                        f"reallocate: new model={model_id} "
+                        f"provider={_provider_label(provider)} "
+                        f"evicting=[{', '.join(m.descriptor.modelId for m in to_evict)}]"
+                    )
+                    await self._quiesce(to_evict)
+                    for m in to_evict:
+                        log.warning(
+                            f"unload model={m.descriptor.modelId} "
+                            f"provider={_provider_label(m.descriptor.provider)}"
+                        )
+                        m.descriptor.provider.unloadModel(m)
+                    self.resident = [m for m in self.resident if m not in to_evict]
+            log.warning(
+                f"load model={model_id} "
+                f"provider={_provider_label(provider)} "
+                f"ctx={load_options.ctx_length}"
+            )
+            await asyncio.to_thread(provider.loadModel, model)
+            self.resident.append(model)
+            return model
+        except Exception:
+            self.in_flight[model] -= 1
+            raise
 
     def _targets(self, model_id: str, eviction_models: list[Model]) -> bool:
         for m in eviction_models:
