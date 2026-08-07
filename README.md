@@ -34,3 +34,112 @@ uv run python main.py --address 0.0.0.0 --port 8000
 
 Run `uv run python main.py --help` (or pass an invalid command) for the
 full CLI documentation.
+
+## Config
+
+Provider instances are configured in `config.json` at the top of the repo
+(override the path with `--config`). The format maps a provider `type` to a
+list of instance config objects:
+
+```json
+{
+  "ds4": [ {config for instance 0}, {config for instance 1}, ... ],
+  "lms":  [ ... ],
+  ... (other provider types, defined later)
+}
+```
+
+The position in each list is that instance's `_instance_id`. Types that are
+absent are simply disabled. Each instance object is applied on top of the
+provider's built-in defaults, so you only need to write the fields you want
+to override.
+
+### ds4
+
+`ds4` is spawned and terminated by YAALLB (it has no native load/unload), so
+each instance needs to know how to launch `ds4-server` from a working
+directory.
+
+| key | default | required |
+|-----|---------|----------|
+| `ds4_dir` | — | yes — path to your ds4 build; the working directory the server runs from |
+| `gguf_path` | — | yes — path to the GGUF model loaded by ds4 (relative to `ds4_dir`) |
+| `host` | `127.0.0.1` | no — ds4 bind address, also the reverse-proxy target |
+| `port` | `8000` | no — ds4 bind port, also the reverse-proxy target |
+| `binary` | `./ds4-server` | no — program to run, relative to `ds4_dir` |
+| `options` | `{}` | no — overrides for ds4-server flags (see below) |
+
+`ctx_length` is **not** part of `options`: it is already carried by
+`LoadOptions`, and at load time YAALLB appends `--ctx {ctx_length}` to the
+command from the model being loaded.
+
+`options` keys are the ds4-server flag names with dashes turned into
+underscores. A flag is only emitted when its value differs from the default
+shown below (booleans only when `true`), so `ds4-server` applies its own
+defaults for everything you don't set.
+
+| options key | flag | kind | default |
+|---|---|---|---|
+| `backend` | `--backend` | value | — |
+| `metal` | `--metal` | flag | false |
+| `cuda` | `--cuda` | flag | false |
+| `cpu` | `--cpu` | flag | false |
+| `gpu_vram` | `--gpu-vram` | value | — |
+| `gpu_devices` | `--gpu-devices` | value | — |
+| `cuda_tensor_parallel` | `--cuda-tensor-parallel` | flag | false |
+| `tokens` | `-n` | value | — |
+| `threads` | `-t` | value | — |
+| `power` | `--power` | value | 100 |
+| `ssd_streaming` | `--ssd-streaming` | flag | false |
+| `ssd_streaming_cold` | `--ssd-streaming-cold` | flag | false |
+| `ssd_streaming_cache_experts` | `--ssd-streaming-cache-experts` | value | — |
+| `ssd_streaming_full_layers` | `--ssd-streaming-full-layers` | value | — |
+| `ssd_streaming_preload_experts` | `--ssd-streaming-preload-experts` | value | — |
+| `simulate_used_memory` | `--simulate-used-memory` | value | — |
+| `prefill_chunk` | `--prefill-chunk` | value | — |
+| `cors` | `--cors` | flag | false |
+| `trace` | `--trace` | value | — |
+| `batched_session` | `--batched-session` | value | — |
+| `kv_disk_dir` | `--kv-disk-dir` | value | — |
+| `kv_disk_space_mb` | `--kv-disk-space-mb` | value | 4096 |
+| `kv_cache_min_tokens` | `--kv-cache-min-tokens` | value | 512 |
+| `kv_cache_cold_max_tokens` | `--kv-cache-cold-max-tokens` | value | 30000 |
+| `kv_cache_continued_interval_tokens` | `--kv-cache-continued-interval-tokens` | value | 10000 |
+| `kv_cache_boundary_trim_tokens` | `--kv-cache-boundary-trim-tokens` | value | 32 |
+| `kv_cache_boundary_align_tokens` | `--kv-cache-boundary-align-tokens` | value | 2048 |
+| `kv_cache_reject_different_quant` | `--kv-cache-reject-different-quant` | flag | false |
+| `disable_exact_dsml_tool_replay` | `--disable-exact-dsml-tool-replay` | flag | false |
+| `tool_memory_max_ids` | `--tool-memory-max-ids` | value | 100000 |
+
+For example, the manual command
+
+```sh
+./ds4-server -m ./ds4flash-0731.gguf --kv-disk-dir /tmp/ds4-0731-kv \
+  --kv-disk-space-mb 262144 --ctx 1000000
+```
+
+is configured as:
+
+```json
+{
+  "ds4": [
+    {
+      "ds4_dir": "/path/to/ds4",
+      "gguf_path": "./ds4flash-0731.gguf",
+      "host": "127.0.0.1",
+      "port": 8000,
+      "options": {
+        "kv_disk_dir": "/tmp/ds4-0731-kv",
+        "kv_disk_space_mb": 262144
+      }
+    }
+  ]
+}
+```
+
+`--ctx 1000000` is supplied at load time via `LoadOptions(ctx_length=1000000)`.
+
+### lms
+
+LM Studio serves its own API natively; instances only need `host` and
+`port` (defaults `127.0.0.1` and `1234`).

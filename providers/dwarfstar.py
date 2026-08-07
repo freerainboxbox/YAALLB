@@ -1,3 +1,6 @@
+import shlex
+import subprocess
+
 from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model as BaseModel
@@ -8,6 +11,52 @@ from abstractions.provider import Provider
 # underlying model; the presented context_length is 1000000 (DeepSeek v4's
 # maximum) unless a model is resident with a different ctx_length.
 DS4_CONTEXT_LENGTH = 1000000
+
+DS4_DEFAULT_HOST = "127.0.0.1"
+DS4_DEFAULT_PORT = 8000
+DS4_DEFAULT_BINARY = "./ds4-server"
+
+# Flag registry: config key -> (flag, kind, default). Defaults grabbed from
+# `./ds4-server --help`. `--ctx` is deliberately absent: it comes from
+# LoadOptions.ctx_length at load time.
+DS4_OPTIONS = {
+    "backend": ("--backend", "value", None),
+    "metal": ("--metal", "flag", False),
+    "cuda": ("--cuda", "flag", False),
+    "cpu": ("--cpu", "flag", False),
+    "gpu_vram": ("--gpu-vram", "value", None),
+    "gpu_devices": ("--gpu-devices", "value", None),
+    "cuda_tensor_parallel": ("--cuda-tensor-parallel", "flag", False),
+    "tokens": ("-n", "value", None),
+    "threads": ("-t", "value", None),
+    "power": ("--power", "value", 100),
+    "ssd_streaming": ("--ssd-streaming", "flag", False),
+    "ssd_streaming_cold": ("--ssd-streaming-cold", "flag", False),
+    "ssd_streaming_cache_experts": ("--ssd-streaming-cache-experts", "value", None),
+    "ssd_streaming_full_layers": ("--ssd-streaming-full-layers", "value", None),
+    "ssd_streaming_preload_experts": ("--ssd-streaming-preload-experts", "value", None),
+    "simulate_used_memory": ("--simulate-used-memory", "value", None),
+    "prefill_chunk": ("--prefill-chunk", "value", None),
+    "cors": ("--cors", "flag", False),
+    "trace": ("--trace", "value", None),
+    "batched_session": ("--batched-session", "value", None),
+    "kv_disk_dir": ("--kv-disk-dir", "value", None),
+    "kv_disk_space_mb": ("--kv-disk-space-mb", "value", 4096),
+    "kv_cache_min_tokens": ("--kv-cache-min-tokens", "value", 512),
+    "kv_cache_cold_max_tokens": ("--kv-cache-cold-max-tokens", "value", 30000),
+    "kv_cache_continued_interval_tokens": (
+        "--kv-cache-continued-interval-tokens",
+        "value",
+        10000,
+    ),
+    "kv_cache_boundary_trim_tokens": ("--kv-cache-boundary-trim-tokens", "value", 32),
+    "kv_cache_boundary_align_tokens": ("--kv-cache-boundary-align-tokens", "value", 2048),
+    "kv_cache_reject_different_quant": ("--kv-cache-reject-different-quant", "flag", False),
+    "disable_exact_dsml_tool_replay": ("--disable-exact-dsml-tool-replay", "flag", False),
+    "tool_memory_max_ids": ("--tool-memory-max-ids", "value", 100000),
+}
+
+DS4_COMMAND_TEMPLATE = "{binary} -m {gguf_path} {host_port} {options} --ctx {ctx_length}"
 
 
 class DwarfStarProvider(Provider):
@@ -21,9 +70,14 @@ class DwarfStarProvider(Provider):
             return 83065.32 + 0.015655 * ctx
 
     def __init__(self, _instance_id: int = 0, config: dict | None = None) -> None:
-        self.host = "127.0.0.1"
-        self.port = 8000
+        self.host = DS4_DEFAULT_HOST
+        self.port = DS4_DEFAULT_PORT
+        self.ds4_dir: str | None = None
+        self.gguf_path: str | None = None
+        self.binary: str = DS4_DEFAULT_BINARY
+        self.options: dict = {}
         self.resident_model: BaseModel | None = None
+        self._process: subprocess.Popen | None = None
         super().__init__(_instance_id, config)
 
     @property
@@ -76,10 +130,53 @@ class DwarfStarProvider(Provider):
     ) -> BaseModel:
         return self.Model(descriptor, loadOptions)
 
+    def _build_command(self, model: BaseModel) -> list[str]:
+        ctx_length = model.loadOptions.ctx_length
+
+        host_port = []
+        if self.host != DS4_DEFAULT_HOST:
+            host_port += ["--host", self.host]
+        if self.port != DS4_DEFAULT_PORT:
+            host_port += ["--port", str(self.port)]
+
+        options = []
+        for key, (flag, kind, default) in DS4_OPTIONS.items():
+            if key not in self.options:
+                continue
+            value = self.options[key]
+            if kind == "flag":
+                if value is True:
+                    options.append(flag)
+            elif value != default:
+                options += [flag, str(value)]
+
+        command = DS4_COMMAND_TEMPLATE.format(
+            binary=self.binary,
+            gguf_path=self.gguf_path,
+            host_port=" ".join(host_port),
+            options=" ".join(options),
+            ctx_length=ctx_length,
+        )
+        return shlex.split(command)
+
     def loadModel(self, model: BaseModel) -> None:
+        if self.ds4_dir is None:
+            raise ValueError("ds4_dir must be set in config before loading")
+        if self.gguf_path is None:
+            raise ValueError("gguf_path must be set in config before loading")
+
+        command = self._build_command(model)
+        self._process = subprocess.Popen(command, cwd=self.ds4_dir)
         self.resident_model = model
         model._loaded = True
 
     def unloadModel(self, model: BaseModel) -> None:
+        process = self._process
+        if process is not None:
+            process.terminate()
+            process.wait(timeout=10)
+            if process.poll() is None:
+                process.kill()
+            self._process = None
         self.resident_model = None
         model._loaded = False

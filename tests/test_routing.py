@@ -148,7 +148,26 @@ def test_dwarfstar_resident_model_and_context(monkeypatch):
 
     monkeypatch.setattr("httpx.get", no_network)
 
-    provider = DwarfStarProvider()
+    class FakeProcess:
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=0):
+            pass
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(
+        "providers.dwarfstar.subprocess.Popen", lambda *a, **kw: FakeProcess()
+    )
+
+    provider = DwarfStarProvider(
+        config={"ds4_dir": "/tmp/ds4", "gguf_path": "model.gguf"}
+    )
     assert [m["context_length"] for m in provider.getOAIModels()] == [1000000, 1000000]
 
     model = provider.createModel(
@@ -161,6 +180,146 @@ def test_dwarfstar_resident_model_and_context(monkeypatch):
     provider.unloadModel(model)
     assert getattr(provider, "resident_model", None) is None
     assert [m["context_length"] for m in provider.getOAIModels()] == [1000000, 1000000]
+
+
+def test_dwarfstar_build_command():
+    from providers.dwarfstar import DwarfStarProvider
+
+    provider = DwarfStarProvider(
+        config={
+            "ds4_dir": "/path/to/ds4",
+            "gguf_path": "./ds4flash-0731.gguf",
+            "options": {"kv_disk_dir": "/tmp/ds4-0731-kv", "kv_disk_space_mb": 262144},
+        }
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=1000000)
+    )
+
+    assert provider._build_command(model) == [
+        "./ds4-server",
+        "-m",
+        "./ds4flash-0731.gguf",
+        "--kv-disk-dir",
+        "/tmp/ds4-0731-kv",
+        "--kv-disk-space-mb",
+        "262144",
+        "--ctx",
+        "1000000",
+    ]
+
+
+def test_dwarfstar_build_command_omits_defaults():
+    from providers.dwarfstar import DwarfStarProvider
+
+    provider = DwarfStarProvider(config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf"})
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=4096)
+    )
+
+    assert provider._build_command(model) == [
+        "./ds4-server",
+        "-m",
+        "m.gguf",
+        "--ctx",
+        "4096",
+    ]
+
+
+def test_dwarfstar_build_command_overrides():
+    from providers.dwarfstar import DwarfStarProvider
+
+    provider = DwarfStarProvider(
+        config={
+            "ds4_dir": "/tmp/ds4",
+            "gguf_path": "m.gguf",
+            "host": "0.0.0.0",
+            "port": 9000,
+            "options": {"power": 50, "cors": True, "tokens": 2048},
+        }
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=4096)
+    )
+
+    assert provider._build_command(model) == [
+        "./ds4-server",
+        "-m",
+        "m.gguf",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "9000",
+        "-n",
+        "2048",
+        "--power",
+        "50",
+        "--cors",
+        "--ctx",
+        "4096",
+    ]
+
+
+def test_dwarfstar_load_spawns_process(monkeypatch):
+    import subprocess
+    from providers.dwarfstar import DwarfStarProvider
+
+    spawned = {}
+
+    class FakeProcess:
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=0):
+            pass
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    def fake_popen(argv, **kwargs):
+        spawned["argv"] = argv
+        spawned["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    provider = DwarfStarProvider(
+        config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf"}
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=4096)
+    )
+    provider.loadModel(model)
+
+    assert spawned["kwargs"]["cwd"] == "/tmp/ds4"
+    assert spawned["argv"] == [
+        "./ds4-server",
+        "-m",
+        "m.gguf",
+        "--ctx",
+        "4096",
+    ]
+    assert provider.resident_model is model
+    assert provider._process is not None
+
+    provider.unloadModel(model)
+    assert provider._process is None
+    assert provider.resident_model is None
+
+
+def test_dwarfstar_load_requires_ds4_dir_and_gguf_path():
+    import pytest
+    from providers.dwarfstar import DwarfStarProvider
+
+    provider = DwarfStarProvider()
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions()
+    )
+    with pytest.raises(ValueError):
+        provider.loadModel(model)
 
 
 def test_provider_type_ids():
