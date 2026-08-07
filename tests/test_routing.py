@@ -696,6 +696,52 @@ def test_dwarfstar_load_spawns_process(monkeypatch):
     assert provider.resident_model is None
 
 
+def test_dwarfstar_unload_kills_on_terminate_timeout(monkeypatch):
+    import subprocess
+    from providers.dwarfstar import DwarfStarProvider
+
+    class FakeProcess:
+        def __init__(self):
+            self.killed = False
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            # A ds4 stuck past the terminate timeout raises TimeoutExpired;
+            # after kill() the reaped wait returns normally.
+            if timeout is not None and not self.killed:
+                raise subprocess.TimeoutExpired("ds4-server", timeout)
+            return 0
+
+        def poll(self):
+            return 0 if self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+    proc = FakeProcess()
+    monkeypatch.setattr(
+        "providers.dwarfstar.subprocess.Popen", lambda *a, **kw: proc
+    )
+
+    provider = DwarfStarProvider(
+        config={"ds4_dir": "/tmp/ds4", "gguf_path": "model.gguf"}
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    )
+    provider.loadModel(model)
+
+    # Must escalate to kill() instead of propagating TimeoutExpired, so the
+    # scheduler's eviction path still tears down state.
+    provider.unloadModel(model)
+    assert proc.killed
+    assert provider._process is None
+    assert provider.resident_model is None
+    assert not model.loaded
+
+
 def test_dwarfstar_load_requires_ds4_dir_and_gguf_path():
     import pytest
     from providers.dwarfstar import DwarfStarProvider

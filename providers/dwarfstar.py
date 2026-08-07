@@ -179,9 +179,15 @@ class DwarfStarProvider(Provider):
         process = self._process
         if process is not None:
             process.terminate()
-            process.wait(timeout=10)
-            if process.poll() is None:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                # wait(timeout) raises instead of returning, so a ds4 that
+                # ignores SIGTERM (stuck in a Metal kernel or KV disk I/O)
+                # must be escalated to SIGKILL here; letting the exception
+                # escape would wedge the scheduler's eviction path.
                 process.kill()
+                process.wait()
             self._process = None
         self.resident_model = None
         model._loaded = False
