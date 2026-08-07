@@ -147,7 +147,10 @@ class Scheduler:
             self._wake.clear()
 
     async def _serve(self, model_id: str, load_options) -> Model:
-        provider = lookup_model(self.providers, model_id)
+        # Descriptor lookups can block on provider HTTP (LM Studio TTL
+        # miss), so run them off the event loop like memory()/loadModel
+        # below; otherwise one slow provider stalls every in-flight relay.
+        provider = await asyncio.to_thread(lookup_model, self.providers, model_id)
         if provider is None:
             raise ModelNotFound(model_id)
         resident = self._resident_for(provider, model_id)
@@ -155,7 +158,7 @@ class Scheduler:
             self.in_flight[resident] += 1
             return resident
 
-        descriptor = self._descriptor_for(provider, model_id)
+        descriptor = await asyncio.to_thread(self._descriptor_for, provider, model_id)
         model = provider.createModel(descriptor, load_options)
         # Mark in-flight before the slow load so stop() won't see a served-but-
         # unloaded request as quiescent and tear down the coordinator early.

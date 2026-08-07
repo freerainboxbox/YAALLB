@@ -236,7 +236,9 @@ async def chat_completions(body: dict):
             },
         )
 
-    provider = lookup_model(PROVIDERS, model_id)
+    # lookup_model hits provider HTTP on a descriptor-cache miss (LM Studio),
+    # so keep it off the event loop.
+    provider = await asyncio.to_thread(lookup_model, PROVIDERS, model_id)
     overrides = model_overrides_for(provider, model_id) if provider else {}
     default_ctx = overrides.get("ctx_length") or DEFAULT_CTX_LENGTH
     ctx_length = body.get("context_length") or default_ctx

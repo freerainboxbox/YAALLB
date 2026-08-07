@@ -132,6 +132,43 @@ def test_chat_completions_max_tokens_does_not_drive_ctx(monkeypatch):
     assert json["max_tokens"] == 512
 
 
+def test_chat_completions_descriptor_lookup_runs_off_thread(monkeypatch):
+    import asyncio as aio
+
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    on_loop = []
+    orig = prov_a.getModelsDescriptors
+
+    def record():
+        try:
+            aio.get_running_loop()
+            on_loop.append(True)
+        except RuntimeError:
+            on_loop.append(False)
+        return orig()
+
+    prov_a.getModelsDescriptors = record
+
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": True},
+        )
+
+    assert resp.status_code == 200
+    # A provider's descriptor lookup can block on HTTP (LM Studio TTL miss);
+    # it must never run on the event-loop thread, from either the route's
+    # lookup_model or the scheduler's _serve path.
+    assert on_loop
+    assert not any(on_loop)
+
+
 def test_chat_completions_forwards_to_provider(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     main.PROVIDERS = [prov_a]
