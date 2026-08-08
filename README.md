@@ -4,7 +4,7 @@
 
 A VRAM-aware LLM load balancer, quick and dirty, to point to your existing LLM runners.
 
-Currently targets LM Studio and antirez/ds4. More may be supported later.
+Currently targets LM Studio, antirez/ds4, and llama.cpp. More may be supported later.
 
 You can specify a VRAM limit on your Apple Silicon Mac in MB, and YAALLB will set `iogpu.wired_limit_mb` to that limit and respect your memory by evicting the least-impact resident models when a new load would exceed the budget.
 
@@ -15,8 +15,8 @@ main.py            FastAPI app, OpenAI-compatible routes, CLI launcher
 scheduling.py      VRAM-aware model scheduler and eviction
 log.py             Colored, ISO-timestamped logging to stderr
 abstractions/      Base types: Provider, Model, ModelDescriptor, LoadOptions; routing
-providers/         Concrete providers: LMStudioProvider, DwarfStarProvider
-config.json        Provider instances per type ("lms", "ds4", ...)
+providers/         Concrete providers: LMStudioProvider, DwarfStarProvider, LlamaCppProvider
+config.json        Provider instances per type ("lms", "ds4", "llama_cpp", ...)
 tests/             pytest suite
 pyproject.toml     Project metadata and dependencies (uv-managed)
 ```
@@ -51,7 +51,7 @@ list of instance config objects:
   "yaallb": {
     "address": "127.0.0.1",
     "port": 4343,
-    "ctx_length": 4096
+    "ctx_length": 4096,
   },
   "ds4": [
     {
@@ -59,8 +59,8 @@ list of instance config objects:
     },
     {
       // config for instance 1
-    }, 
-    // ... 
+    },
+    // ...
   ],
   "lms": [
     // ...
@@ -262,12 +262,155 @@ loaded LLM (`LMS_LOAD_MAX_WAIT`, 600s). A load timeout or LM Studio's
 the client as an error; only a true failure (auth `401`, 5XX, or the model
 never becoming ready within the deadline) raises.
 
+#### llama_cpp
+
+`llama_cpp` is spawned and terminated by YAALLB (it has no native load/unload),
+so each instance needs to know how to launch `llama-server` from the directory
+holding the llama.cpp binaries.
+
+| key             | default     | required                                                                         |
+| --------------- | ----------- | -------------------------------------------------------------------------------- |
+| `llama_cpp_dir` | —           | yes — path to your llama.cpp build (binaries live here)                          |
+| `gguf_path`     | —           | yes — path to the GGUF model loaded by llama-server, relative to `llama_cpp_dir` |
+| `host`          | `127.0.0.1` | no — llama-server bind address, also the reverse-proxy target                    |
+| `port`          | `8080`      | no — llama-server bind port, also the reverse-proxy target                       |
+| `ctx_length`    | —           | no — provider-level context length, overrides the per-model one                  |
+| `alias`         | —           | yes — the OAI model ID this provider presents                                    |
+| `options`       | `{}`        | no — core option overrides for llama-server/llama-fit-params flags (see below)   |
+| `extra_options` | —           | no — extra `llama-server` flags, inserted verbatim into the launch command       |
+
+Unlike `lms`, `llama_cpp` is a **single-model** provider: one instance serves
+one `gguf_path` (plus its `alias`) and holds at most one resident model, which
+serves every request routed to that alias.
+
+YAALLB drives it by spawning `llama-server` from `llama_cpp_dir`:
+
+```sh
+{llama_cpp_dir}/llama-server -m {gguf_path} -c {ctx_length} -a {alias} \
+  --host {host} --port {port}
+```
+
+The relevant `llama-server` flags YAALLB emits:
+
+| flag             | meaning                                                                                                       |
+| ---------------- | ------------------------------------------------------------------------------------------------------------- |
+| `-m, --model`    | model path to load (`gguf_path`)                                                                              |
+| `-c, --ctx-size` | prompt context size; comes from `_effective_ctx` (provider `ctx_length`, else the request's `context_length`) |
+| `-a, --alias`    | model name alias presented over the server's API (`alias`)                                                    |
+| `--host`         | bind address (`host`, emitted only when it differs from default)                                              |
+| `--port`         | bind port (`port`, emitted only when it differs from default)                                                 |
+
+`host`/`port` are emitted only when they differ from llama-server's defaults
+(`127.0.0.1` and `8080`), so llama-server applies its own defaults otherwise.
+`-a` is always emitted when `alias` is configured, so `/v1/models` presents the
+OAI model ID YAALLB routes on. VRAM estimates come from `llama-fit-params`
+(the same build) via `-m <gguf>` `--ctx-size <n>` `--fit-print on`, summing the
+`<model> <context> <compute>` columns across every non-`Host` device.
+
+`llama-fit-params` and `llama-server` share the llama.cpp **common params**
+(threads, batch, KV cache types, `-ngl` GPU layers, LoRA/control vectors, RoPE
+and YaRN scaling, device/split options, etc.). These are the options that can
+change the memory footprint, so YAALLB exposes them as **core options** in an
+`options` map that is passed to **both** binaries — the server on launch and
+llama-fit-params for the VRAM estimate, keeping the estimate in sync with the
+actual configuration.
+
+`options` keys are the flag names with dashes turned into underscores. A flag
+is only emitted when its value differs from the default shown below (booleans
+only when `true`), so llama-server/llama-fit-params apply their own defaults
+for everything you don't set. `-c/--ctx-size` is deliberately absent — it comes
+from `ctx_length` at load time.
+
+| options key             | flag                      | kind  | default |
+| ----------------------- | ------------------------- | ----- | ------- |
+| `ngl`                   | `--gpu-layers`            | value | —       |
+| `cache_type_k`          | `--cache-type-k`          | value | —       |
+| `cache_type_v`          | `--cache-type-v`          | value | —       |
+| `flash_attn`            | `--flash-attn`            | value | —       |
+| `swa_full`              | `--swa-full`              | flag  | false   |
+| `parallel`              | `--parallel`              | value | —       |
+| `batch_size`            | `-b`                      | value | —       |
+| `ubatch_size`           | `-ub`                     | value | —       |
+| `split_mode`            | `--split-mode`            | value | —       |
+| `tensor_split`          | `--tensor-split`          | value | —       |
+| `main_gpu`              | `--main-gpu`              | value | —       |
+| `device`                | `--device`                | value | —       |
+| `override_tensor`       | `--override-tensor`       | value | —       |
+| `cpu_moe`               | `--cpu-moe`               | flag  | false   |
+| `n_cpu_moe`             | `--n-cpu-moe`             | value | —       |
+| `load_mode`             | `--load-mode`             | value | —       |
+| `no_host`               | `--no-host`               | flag  | false   |
+| `lora`                  | `--lora`                  | value | —       |
+| `lora_scaled`           | `--lora-scaled`           | value | —       |
+| `control_vector`        | `--control-vector`        | value | —       |
+| `control_vector_scaled` | `--control-vector-scaled` | value | —       |
+| `threads`               | `-t`                      | value | —       |
+| `threads_batch`         | `-tb`                     | value | —       |
+| `mlock`                 | `--mlock`                 | flag  | false   |
+| `rope_scaling`          | `--rope-scaling`          | value | —       |
+| `rope_scale`            | `--rope-scale`            | value | —       |
+| `rope_freq_base`        | `--rope-freq-base`        | value | —       |
+| `rope_freq_scale`       | `--rope-freq-scale`       | value | —       |
+| `yarn_orig_ctx`         | `--yarn-orig-ctx`         | value | —       |
+| `yarn_ext_factor`       | `--yarn-ext-factor`       | value | —       |
+| `yarn_attn_factor`      | `--yarn-attn-factor`      | value | —       |
+| `yarn_beta_slow`        | `--yarn-beta-slow`        | value | —       |
+| `yarn_beta_fast`        | `--yarn-beta-fast`        | value | —       |
+| `cache_type_k_draft`    | `--cache-type-k-draft`    | value | —       |
+| `cache_type_v_draft`    | `--cache-type-v-draft`    | value | —       |
+| `rpc`                   | `--rpc`                   | value | —       |
+
+Options that are **not** in this overlap — `llama-server`-only flags (`--host`,
+`--port`, `--alias`, `--api-key`, speculative/MTP heads, sampling, CORS, UI,
+etc.) and on-by-default negatable flags (`--no-kv-offload`, `--no-repack`,
+`--no-mmap`) — go in `extra_options`.
+
+`extra_options` is a raw string of any additional `llama-server` flags that
+YAALLB inserts **verbatim** into the launch command after its own flags and
+core options — so it can override them (e.g. a different `--port`). It is
+tokenized like a shell would (no shell is invoked), so quotes and paths with
+spaces survive. Paths inside `extra_options` are treated as absolute, or
+relative to `llama_cpp_dir` (the working directory the server runs from). It
+is appended last, so any flag it sets wins over YAALLB's defaults. `extra_options`
+is **not** passed to llama-fit-params (it may contain server-only flags).
+
+For example, the manual command
+
+```sh
+cd /path/to/llama-cpp && ./llama-server -m ./model.gguf -c 32768 -a qwen3 \
+  --port 8081 --lora ./lora.bin -ngl 24 --cache-type-k q8_0 --api-key sk-...
+```
+
+is configured as:
+
+```json
+{
+  "llama_cpp": [
+    {
+      "llama_cpp_dir": "/path/to/llama-cpp",
+      "gguf_path": "./model.gguf",
+      "host": "127.0.0.1",
+      "port": 8081,
+      "ctx_length": 32768,
+      "alias": "qwen3",
+      "options": {
+        "lora": "./lora.bin",
+        "ngl": 24,
+        "cache_type_k": "q8_0"
+      },
+      "extra_options": "--api-key sk-..."
+    }
+  ]
+}
+```
+
 ## Graceful shutdown
 
 On exit (Ctrl-C/SIGTERM), YAALLB flushes queued and in-flight requests, then
 unloads every resident model: LM Studio instances get the unload API route
-called, and ds4 instances simply terminate their spawned server process.
+called, and ds4/llama_cpp instances simply terminate their spawned server
+process.
 
 ## Roadmap
 
-llama.cpp, mlx-lm, mlx-vlm, oMLX, and cloud API providers should be supported eventually.
+mlx-lm, mlx-vlm, oMLX, and cloud API providers should be supported eventually.

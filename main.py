@@ -23,6 +23,7 @@ from abstractions.load_options import LoadOptions
 from abstractions.provider import Provider
 from abstractions.routing import lookup_model
 from providers.dwarfstar import DwarfStarProvider
+from providers.llama_cpp import LlamaCppProvider
 from providers.lmstudio import LMStudioProvider
 from scheduling import ModelNotFound, Scheduler
 import uvicorn
@@ -40,6 +41,7 @@ DEFAULT_YAALLB_CONFIG = {
 PROVIDER_TYPES = {
     "lms": LMStudioProvider,
     "ds4": DwarfStarProvider,
+    "llama_cpp": LlamaCppProvider,
 }
 
 
