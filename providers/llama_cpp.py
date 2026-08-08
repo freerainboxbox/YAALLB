@@ -119,7 +119,16 @@ def _fit_memory_mib(
         parts = line.split()
         if len(parts) < 4 or parts[0] == "Host":
             continue
-        total += sum(float(x) for x in parts[1:4])
+        try:
+            total += sum(float(x) for x in parts[1:4])
+        except ValueError:
+            # A header/annotation line whose <model>/<context>/<compute>
+            # columns are non-numeric must fail loudly as a RuntimeError, not
+            # escape as a raw ValueError that bypasses the fail-fast contract.
+            raise RuntimeError(
+                f"unexpected non-numeric llama-fit-params column for {gguf_path}: "
+                f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+            ) from None
     if total <= 0:
         raise RuntimeError(
             f"unexpected llama-fit-params output for {gguf_path}: "
@@ -174,10 +183,39 @@ class LlamaCppProvider(Provider):
         )
 
     def getModelsDescriptors(self) -> list[ModelDescriptor]:
-        raise NotImplementedError
+        # llama_cpp serves exactly one model (the mandatory `alias`), so its
+        # descriptor list is a single entry keyed on the alias.
+        return [ModelDescriptor(self.alias, self)]
 
     def getOAIModels(self) -> list[dict]:
-        raise NotImplementedError
+        ctx_length = self._effective_ctx(self.resident_model)
+        return [
+            {
+                "id": self.alias,
+                "object": "model",
+                "created": 1767225600,
+                "owned_by": "llama.cpp",
+                "name": self.alias,
+                "context_length": ctx_length,
+                "top_provider": {
+                    "context_length": ctx_length,
+                    "max_completion_tokens": ctx_length,
+                    "is_moderated": False,
+                },
+                "supported_parameters": [
+                    "tools",
+                    "tool_choice",
+                    "max_tokens",
+                    "temperature",
+                    "top_p",
+                    "top_k",
+                    "min_p",
+                    "stop",
+                    "seed",
+                    "stream",
+                ],
+            }
+        ]
 
     def createModel(
         self, descriptor: ModelDescriptor, loadOptions: LoadOptions
@@ -198,14 +236,16 @@ class LlamaCppProvider(Provider):
 
         command += _options_flags(self.options)
 
+        command += ["-c", str(ctx_length)]
+
         if self.extra_options:
-            # Inserted verbatim after YAALLB's own flags, so extra_options can
-            # override the defaults above. Tokenized with shlex (no shell), so
-            # quoted values and paths with spaces survive; paths are resolved
-            # by llama-server against cwd=llama_cpp_dir.
+            # Inserted verbatim last, after YAALLB's own flags AND its -c, so
+            # extra_options can override every YAALLB default (including a
+            # different -c). Tokenized with shlex (no shell), so quoted values
+            # and paths with spaces survive; paths are resolved by llama-server
+            # against cwd=llama_cpp_dir.
             command += shlex.split(self.extra_options)
 
-        command += ["-c", str(ctx_length)]
         return command
 
     def loadModel(self, model: BaseModel) -> None:

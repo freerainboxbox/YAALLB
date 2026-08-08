@@ -605,6 +605,75 @@ def test_llama_cpp_memory_requires_dir_and_gguf():
         m.memory()
 
 
+def test_llama_cpp_memory_raises_runtime_error_on_non_numeric(monkeypatch):
+    import subprocess
+    from providers.llama_cpp import LlamaCppProvider
+
+    def fake_run(argv, **kw):
+        class Proc:
+            returncode = 0
+            stdout = "MTL0 abc def ghi \nHost 515 0 24 \n"
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    p = LlamaCppProvider(
+        config={"llama_cpp_dir": "/path", "gguf_path": "m.gguf"}
+    )
+    m = p.createModel(ModelDescriptor("alias", p), LoadOptions(ctx_length=4096))
+    # A non-numeric fit-params column must fail loudly as a RuntimeError, not
+    # escape as a raw ValueError.
+    with pytest.raises(RuntimeError):
+        m.memory()
+
+
+# ---- llama_cpp descriptor / OAI listing ----
+
+
+def test_llama_cpp_get_models_descriptors():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider(config={"alias": "qwen3"})
+    descs = p.getModelsDescriptors()
+    assert [d.modelId for d in descs] == ["qwen3"]
+    assert all(d.provider is p for d in descs)
+
+
+def test_llama_cpp_get_oai_models_provider_ctx():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider(config={"alias": "qwen3", "ctx_length": 8192})
+    data = p.getOAIModels()
+    assert len(data) == 1
+    assert data[0]["id"] == "qwen3"
+    assert data[0]["context_length"] == 8192
+    assert data[0]["object"] == "model"
+
+
+def test_llama_cpp_get_oai_models_resident_ctx():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider(config={"alias": "qwen3"})
+    m = p.createModel(ModelDescriptor("qwen3", p), LoadOptions(ctx_length=16384))
+    p.resident_model = m
+    data = p.getOAIModels()
+    assert data[0]["id"] == "qwen3"
+    assert data[0]["context_length"] == 16384
+
+
+def test_llama_cpp_get_oai_models_raises_without_ctx():
+    from providers.llama_cpp import LlamaCppProvider
+
+    # No provider ctx_length and no resident model: the context length is
+    # genuinely unknown, so listing must fail loudly (ValueError) rather than
+    # invent a default.
+    p = LlamaCppProvider(config={"alias": "qwen3"})
+    with pytest.raises(ValueError):
+        p.getOAIModels()
+
+
 # ---- llama_cpp load / unload ----
 
 
@@ -698,14 +767,17 @@ def test_llama_cpp_build_command_extra_options():
     )
     m = p.createModel(ModelDescriptor("qwen3", p), LoadOptions(ctx_length=4096))
     command = p._build_command(m)
-    # extra_options is inserted verbatim (tokenized), before YAALLB's own -c so
-    # it can override flags like --port even when YAALLB emitted a default one.
+    # extra_options is inserted verbatim (tokenized) last, after YAALLB's own
+    # -c, so it can override every YAALLB default (including -c and flags like
+    # --port even when YAALLB emitted a default one).
     assert command == [
         "/tmp/llama/llama-server",
         "-m",
         "m.gguf",
         "-a",
         "qwen3",
+        "-c",
+        "4096",
         "--lora",
         "./lora.bin",
         "-ngl",
@@ -714,8 +786,6 @@ def test_llama_cpp_build_command_extra_options():
         "q8_0",
         "--port",
         "9091",
-        "-c",
-        "4096",
     ]
 
 
