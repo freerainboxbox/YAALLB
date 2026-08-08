@@ -1,5 +1,7 @@
 ## Yet Another Apple LLM Load Balancer
 
+[![Tests](https://github.com/freerainboxbox/YAALLB/actions/workflows/ci.yml/badge.svg)](https://github.com/freerainboxbox/YAALLB/actions/workflows/ci.yml)
+
 A VRAM-aware LLM load balancer, quick and dirty, to point to your existing LLM runners.
 
 Currently targets LM Studio and antirez/ds4. More may be supported later.
