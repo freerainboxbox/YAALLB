@@ -45,7 +45,7 @@ Provider instances are configured in `config.json` at the top of the repo
 (override the path with `--config`). The format maps a provider `type` to a
 list of instance config objects:
 
-```json
+```jsonc
 {
   "vram_limit_mb": 24576,
   "yaallb": {
@@ -53,9 +53,19 @@ list of instance config objects:
     "port": 4343,
     "ctx_length": 4096
   },
-  "ds4": [ {config for instance 0}, {config for instance 1}, ... ],
-  "lms":  [ ... ],
-  ... (other provider types, defined later)
+  "ds4": [
+    {
+      // config for instance 0
+    },
+    {
+      // config for instance 1
+    }, 
+    // ... 
+  ],
+  "lms": [
+    // ...
+  ],
+  // ... (other provider types, defined later)
 }
 ```
 
