@@ -49,6 +49,7 @@ PROVIDER_TYPES = {
 async def lifespan(app: FastAPI):
     if SCHEDULER is not None:
         await SCHEDULER.start()
+        await _preload_on_start()
     yield
     if SCHEDULER is not None:
         await SCHEDULER.stop()
@@ -115,6 +116,47 @@ def model_overrides_for(provider: Provider, model_id: str) -> dict:
     """Per-model overrides configured on a provider, or {} if none."""
     overrides = getattr(provider, "model_overrides", None) or {}
     return overrides.get(model_id, {}) or {}
+
+
+def collect_on_start_targets() -> list[tuple]:
+    """Deterministic on_start preload plan.
+
+    Iterates providers in config order and each provider's model_overrides in
+    insertion order. Returns [(model_id, ctx_length, protected)] for models
+    whose on_start is 'always' or 'once'. 'always' models are protected from
+    eviction; 'once' models are preloaded but evicted like normal.
+    """
+    targets = []
+    for provider in PROVIDERS:
+        overrides = getattr(provider, "model_overrides", None) or {}
+        for model_id, ov in overrides.items():
+            on_start = ov.get("on_start")
+            if on_start not in ("always", "once"):
+                continue
+            ctx = ov.get("ctx_length") or DEFAULT_CTX_LENGTH
+            targets.append((model_id, ctx, on_start == "always"))
+    return targets
+
+
+async def _preload_on_start() -> None:
+    targets = collect_on_start_targets()
+    if not targets:
+        return
+    log.info(f"preloading on_start models: {[t[0] for t in targets]}")
+    try:
+        await SCHEDULER.preload_on_start(targets)
+    except Exception as e:
+        # A singular on_start model that cannot fit the VRAM budget (or any
+        # other load error) fails startup: red log.error + non-zero exit
+        # (uvicorn exits STARTUP_FAILURE when lifespan startup raises).
+        log.error(f"on_start preload failed: {e}")
+        # Unload whatever was preloaded so far so spawned providers don't orphan.
+        for model in list(SCHEDULER.resident):
+            try:
+                model.unloadModel()
+            except Exception as ue:
+                log.error(f"failed to unload {model.descriptor.modelId}: {ue}")
+        raise
 
 
 def read_iogpu_wired_limit() -> int | None:

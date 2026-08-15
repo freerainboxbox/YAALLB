@@ -532,6 +532,29 @@ def test_chat_completions_non_streaming_model_with_allow_forwards(monkeypatch):
     assert fake.calls[0][0] == "post"
 
 
+def test_chat_completions_non_streaming_load_failure_json():
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"allow_non_streaming": True}}
+
+    def failing_load(model):
+        raise RuntimeError("boom load")
+
+    prov_a.loadModel = failing_load
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": False},
+        )
+
+    # A non-streaming direct forward that cannot load the model returns a JSON
+    # error (503) instead of killing the YAALLB process.
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "model_load_failed"
+
+
 def test_graceful_shutdown_unloads_resident_models(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     prov_a._unloaded = []
@@ -1338,6 +1361,40 @@ def test_model_overrides_for():
     }
     assert main.model_overrides_for(prov_a, "model-b") == {}
     assert main.model_overrides_for(FakeProvider("http://b/v1", ["x"]), "x") == {}
+
+
+def test_collect_on_start_targets():
+    prov_a = FakeProvider("http://a.example/v1", ["a", "b", "c"])
+    prov_a.model_overrides = {
+        "a": {"on_start": "always", "ctx_length": 4096},
+        "b": {"on_start": "once", "ctx_length": 8192},
+        "c": {"temperature": 0.5},  # no on_start -> skipped
+    }
+    main.PROVIDERS = [prov_a]
+
+    targets = main.collect_on_start_targets()
+    # Deterministic: provider order, then model_overrides insertion order.
+    assert targets == [("a", 4096, True), ("b", 8192, False)]
+
+
+def test_lifespan_preloads_on_start_models():
+    prov_a = FakeProvider("http://a.example/v1", ["model-a", "model-b"])
+    prov_a.model_overrides = {
+        "model-a": {"on_start": "always"},
+        "model-b": {"on_start": "once"},
+    }
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    with TestClient(main.app) as client:
+        # lifespan startup preloads on_start models in order, released (not
+        # in-flight), and marks "always" models protected.
+        ids = [m.descriptor.modelId for m in main.SCHEDULER.resident]
+        assert ids == ["model-a", "model-b"]
+        assert main.SCHEDULER.protected == {"model-a"}
+        assert all(
+            main.SCHEDULER.in_flight[m] == 0 for m in main.SCHEDULER.resident
+        )
 
 
 def test_chat_completions_applies_ctx_and_override(monkeypatch):
