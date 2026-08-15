@@ -206,7 +206,14 @@ class DwarfStarProvider(Provider):
         # requests; only then is it marked loaded (ready).
         model._loaded = False
         model._load_state = "loading"
-        _wait_server_ready(self.endpoint_uri, self._process, "ds4-server")
+        try:
+            _wait_server_ready(self.endpoint_uri, self._process, "ds4-server")
+        except Exception:
+            # A readiness timeout (or server exit) must not orphan the spawned
+            # ds4-server: terminate it and clear provider state before the
+            # load fails, so a VRAM-holding child isn't leaked.
+            self.unloadModel(model)
+            raise
         model._loaded = True
         model._load_state = "ready"
 

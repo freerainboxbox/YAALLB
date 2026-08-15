@@ -555,6 +555,89 @@ def test_chat_completions_non_streaming_load_failure_json():
     assert resp.json()["error"]["code"] == "model_load_failed"
 
 
+def test_chat_completions_non_streaming_upstream_error_releases_model(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"allow_non_streaming": True}}
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    class RaisingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def aclose(self):
+            pass
+
+        async def post(self, url, json, headers):
+            raise httpx.ConnectError("upstream not up")
+
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: RaisingClient())
+
+    with pytest.raises(Exception):
+        with TestClient(main.app) as client:
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "model-a", "messages": [], "stream": False},
+            )
+
+    # An upstream post raising must still release the scheduled model: it must
+    # not stay resident with in_flight=1 forever (eviction wedged, stop() drain
+    # hangs).
+    assert len(main.SCHEDULER.resident) == 1
+    assert main.SCHEDULER.in_flight[main.SCHEDULER.resident[0]] == 0
+
+
+def test_chat_completions_spawned_provider_ready_resets_load_state(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a._type_id = "llama_cpp"
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    class FlakyClient:
+        def __init__(self):
+            self.calls = []
+            self.responses = [503, 200]
+
+        async def aclose(self):
+            pass
+
+        def build_request(self, method, url, json, headers):
+            return {"url": url, "json": json, "headers": headers}
+
+        async def send(self, req, stream=False):
+            self.calls.append(("send", req["url"], req["json"], req["headers"]))
+            status = self.responses.pop(0)
+            if status == 503:
+                class R:
+                    status_code = 503
+                    headers = {"content-type": "text/event-stream"}
+
+                return R()
+            return FakeStreamResponse()
+
+    fake = FlakyClient()
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    async def no_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("main.asyncio.sleep", no_sleep)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions", json={"model": "model-a", "messages": [], "stream": True}
+        )
+
+    # A spawned provider that transiently 4XX'd is marked "loading"; a
+    # successful retry must reset it back to "ready".
+    assert resp.status_code == 200
+    assert main.SCHEDULER.resident[0].load_state == "ready"
+    assert len(fake.calls) == 2
+
+
 def test_graceful_shutdown_unloads_resident_models(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     prov_a._unloaded = []
@@ -1074,8 +1157,11 @@ def test_dwarfstar_load_ready_timeout_raises(monkeypatch):
     from providers.dwarfstar import DwarfStarProvider
 
     class FakeProcess:
+        def __init__(self):
+            self.terminated = False
+
         def terminate(self):
-            pass
+            self.terminated = True
 
         def wait(self, timeout=0):
             pass
@@ -1086,7 +1172,8 @@ def test_dwarfstar_load_ready_timeout_raises(monkeypatch):
         def poll(self):
             return None
 
-    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: FakeProcess())
+    proc = FakeProcess()
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: proc)
 
     def fake_get(url, headers=None):
         class Resp:
@@ -1107,6 +1194,8 @@ def test_dwarfstar_load_ready_timeout_raises(monkeypatch):
     with pytest.raises(RuntimeError):
         provider.loadModel(model)
 
+    # A readiness timeout must terminate the spawned server, not orphan it.
+    assert proc.terminated
     assert not model.loaded
     assert model.load_state == "loading"
 

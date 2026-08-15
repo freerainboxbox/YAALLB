@@ -258,7 +258,6 @@ def _bump_startup_failures(provider: Provider, detail: str) -> int:
 
 async def _forward_non_streaming(
     model_id: str,
-    provider: Provider,
     overrides: dict,
     ctx_length: int,
     body: dict,
@@ -324,10 +323,14 @@ async def _forward_non_streaming(
     url = provider.endpoint_uri + "/chat/completions"
     headers = provider._auth_headers()
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        upstream = await client.post(url, json=forward_body, headers=headers)
-
-    SCHEDULER.release(model)
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            upstream = await client.post(url, json=forward_body, headers=headers)
+    finally:
+        # Always release the scheduled model, even if the upstream post raises
+        # (network error, upstream reset): otherwise it stays resident with
+        # in_flight=1 forever, wedging eviction and hanging stop()'s drain.
+        SCHEDULER.release(model)
     return Response(
         upstream.content,
         status_code=upstream.status_code,
@@ -376,7 +379,7 @@ async def chat_completions(body: dict):
                 },
             )
         return await _forward_non_streaming(
-            model_id, provider, overrides, ctx_length, body
+            model_id, overrides, ctx_length, body
         )
 
     # Streaming request: refuse if the model is known not to support streaming.
@@ -478,6 +481,10 @@ async def chat_completions(body: dict):
             else:
                 if upstream.status_code == 200:
                     provider.startup_failures = 0
+                    # A spawned provider that transiently 4XX'd/errored was
+                    # marked "loading"; a successful forward means it is ready.
+                    if provider._type_id in ("llama_cpp", "ds4"):
+                        model._load_state = "ready"
                     break
                 await client.aclose()
                 # LM Studio still-loading 4XX (except auth): wait on the model's

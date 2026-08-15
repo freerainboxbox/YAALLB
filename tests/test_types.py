@@ -1042,8 +1042,11 @@ def test_llama_cpp_load_ready_timeout_raises(monkeypatch):
     from providers.llama_cpp import LlamaCppProvider
 
     class FakeProcess:
+        def __init__(self):
+            self.terminated = False
+
         def terminate(self):
-            pass
+            self.terminated = True
 
         def wait(self, timeout=0):
             pass
@@ -1054,7 +1057,8 @@ def test_llama_cpp_load_ready_timeout_raises(monkeypatch):
         def poll(self):
             return None
 
-    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: FakeProcess())
+    proc = FakeProcess()
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: proc)
 
     def fake_get(url, headers=None):
         class Resp:
@@ -1073,5 +1077,7 @@ def test_llama_cpp_load_ready_timeout_raises(monkeypatch):
     with pytest.raises(RuntimeError):
         p.loadModel(m)
 
+    # A readiness timeout must terminate the spawned server, not orphan it.
+    assert proc.terminated
     assert not m.loaded
     assert m.load_state == "loading"
