@@ -16,7 +16,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 import log
 from abstractions.load_options import LoadOptions
@@ -214,29 +214,88 @@ def _bump_startup_failures(provider: Provider, detail: str) -> int:
     return failures
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(body: dict):
-    model_id = body.get("model")
+async def _forward_non_streaming(
+    model_id: str,
+    provider: Provider,
+    overrides: dict,
+    ctx_length: int,
+    body: dict,
+):
+    """Best-effort direct forward for models that allow non-streaming.
 
-    # The endpoint is streaming-only: a non-200 body would be rejected by the
-    # client, so refuse non-streaming requests up front instead of silently
-    # downgrading them.
-    if not body.get("stream", False):
-        log.warning(f"chat request model={model_id} rejected: stream required")
+    Schedules/loads the model, forwards the request once to the downstream
+    API, and returns the upstream status/body as-is. There is no prelim SSE,
+    no startup-failure retry loop, and no success-code guarantee: a non-200
+    upstream is passed through unchanged.
+    """
+    try:
+        model = await SCHEDULER.submit(
+            model_id, LoadOptions(ctx_length=ctx_length)
+        )
+    except ModelNotFound:
+        log.error(f"model not found: {model_id}")
         return JSONResponse(
-            status_code=400,
+            status_code=404,
             content={
                 "error": {
                     "message": (
-                        "streaming must be enabled (stream=true) for this "
-                        "endpoint to work"
+                        f"The model `{model_id}` does not exist or you do not "
+                        "have access to it."
                     ),
                     "type": "invalid_request_error",
-                    "param": "stream",
-                    "code": "stream_required",
+                    "param": None,
+                    "code": "model_not_found",
                 }
             },
         )
+    except Exception as e:
+        # A load failure (VRAM exhaustion, impossible-to-load model, ...) is
+        # refused with an error; it never kills the YAALLB process.
+        log.error(f"model load failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": f"failed to load model `{model_id}`: {e}",
+                    "type": "server_error",
+                    "param": None,
+                    "code": "model_load_failed",
+                }
+            },
+        )
+
+    # Apply non-ctx model overrides as defaults; force non-streaming upstream.
+    forward_body = dict(body)
+    for key, value in overrides.items():
+        if key == "ctx_length":
+            continue
+        forward_body.setdefault(key, value)
+    forward_body["stream"] = False
+
+    provider = model.descriptor.provider
+    log.info(
+        f"chat request model={model_id} "
+        f"provider={provider._type_id}#{getattr(provider, '_instance_id', 0)} "
+        f"stream=false ctx={ctx_length}"
+    )
+
+    url = provider.endpoint_uri + "/chat/completions"
+    headers = provider._auth_headers()
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        upstream = await client.post(url, json=forward_body, headers=headers)
+
+    SCHEDULER.release(model)
+    return Response(
+        upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(body: dict):
+    model_id = body.get("model")
 
     # lookup_model hits provider HTTP on a descriptor-cache miss (LM Studio),
     # so keep it off the event loop.
@@ -244,6 +303,59 @@ async def chat_completions(body: dict):
     overrides = model_overrides_for(provider, model_id) if provider else {}
     default_ctx = overrides.get("ctx_length") or DEFAULT_CTX_LENGTH
     ctx_length = body.get("context_length") or default_ctx
+
+    # Streaming-mode decision. By default the endpoint is streaming-only. A
+    # model may opt out via per-model overrides:
+    #   - allow_non_streaming=true permits serving stream=false requests by
+    #     forwarding them directly (best-effort, no success guarantee).
+    #   - supports_streaming=false marks a model that physically cannot stream
+    #     (e.g. diffusion LLMs); such a model must reject stream=true.
+    client_stream = bool(body.get("stream", False))
+    supports_streaming = overrides.get("supports_streaming")  # None -> assume True
+    allow_non_streaming = overrides.get("allow_non_streaming")  # None -> False
+
+    if not client_stream:
+        # Non-streaming request: serve directly only if the model explicitly
+        # allows it; otherwise refuse (streaming-only by default).
+        if allow_non_streaming is not True:
+            log.warning(f"chat request model={model_id} rejected: stream required")
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": (
+                            "streaming must be enabled (stream=true) for this "
+                            "endpoint to work"
+                        ),
+                        "type": "invalid_request_error",
+                        "param": "stream",
+                        "code": "stream_required",
+                    }
+                },
+            )
+        return await _forward_non_streaming(
+            model_id, provider, overrides, ctx_length, body
+        )
+
+    # Streaming request: refuse if the model is known not to support streaming.
+    if supports_streaming is False:
+        log.warning(
+            f"chat request model={model_id} rejected: model does not stream"
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": (
+                        f"model `{model_id}` does not support streaming; "
+                        "send stream=false"
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "stream",
+                    "code": "model_does_not_support_streaming",
+                }
+            },
+        )
 
     async def event_stream():
         # Prelim event so the client sees a 200 and knows YAALLB is awake

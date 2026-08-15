@@ -420,6 +420,118 @@ def test_chat_completions_rejects_stream_false():
     assert "stream" in body["message"]
 
 
+def test_chat_completions_non_streaming_direct_forward_passthrough(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"allow_non_streaming": True}}
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    resp404 = FakeResponse(
+        content=b'{"error":"boom"}', status_code=404, content_type="application/json"
+    )
+    fake = FakeAsyncClient(nonstream=resp404, stream=FakeStreamResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": False},
+        )
+
+    # Direct forward returns the upstream status/body as-is (no success
+    # guarantee, no SSE, no retry loop).
+    assert resp.status_code == 404
+    assert resp.content == b'{"error":"boom"}'
+    method, url, json, headers = fake.calls[0]
+    assert method == "post"
+    assert url == "http://a.example/v1/chat/completions"
+    assert json["stream"] is False
+    # Model is released once the direct forward completes.
+    assert main.SCHEDULER.in_flight[main.SCHEDULER.resident[0]] == 0
+
+
+def test_chat_completions_allow_non_streaming_keeps_streaming(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"allow_non_streaming": True}}
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": True},
+        )
+
+    # allow_non_streaming does NOT downgrade an explicit stream=true request.
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert fake.calls[0][0] == "send"
+
+
+def test_chat_completions_non_streaming_model_rejects_stream(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"supports_streaming": False}}
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": True},
+        )
+
+    # A model that cannot stream must error out on a stream=true request.
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "model_does_not_support_streaming"
+
+
+def test_chat_completions_non_streaming_model_requires_allow_non_streaming(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"supports_streaming": False}}
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": False},
+        )
+
+    # A non-streaming model needs allow_non_streaming=true to serve stream=false.
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "stream_required"
+
+
+def test_chat_completions_non_streaming_model_with_allow_forwards(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {
+        "model-a": {"supports_streaming": False, "allow_non_streaming": True}
+    }
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    resp404 = FakeResponse(
+        content=b'{"error":"boom"}', status_code=404, content_type="application/json"
+    )
+    fake = FakeAsyncClient(nonstream=resp404, stream=FakeStreamResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": False},
+        )
+
+    # A non-streaming model with allow_non_streaming=true serves stream=false
+    # via the direct-forward path (upstream status passed through as-is).
+    assert resp.status_code == 404
+    assert resp.content == b'{"error":"boom"}'
+    assert fake.calls[0][0] == "post"
+
+
 def test_graceful_shutdown_unloads_resident_models(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     prov_a._unloaded = []
