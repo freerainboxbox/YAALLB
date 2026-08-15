@@ -7,6 +7,7 @@ from abstractions.load_options import LoadOptions
 from abstractions.model import Model
 from abstractions.provider import Provider
 from providers.dwarfstar import DS4_CONTEXT_LENGTH, DwarfStarProvider
+from providers.llama_cpp import LlamaCppProvider
 from providers.lmstudio import LMStudioProvider
 
 
@@ -23,6 +24,7 @@ def test_model_is_abstract():
 def test_provider_model_is_mandatory_subclass():
     assert issubclass(LMStudioProvider.Model, Model)
     assert issubclass(DwarfStarProvider.Model, Model)
+    assert issubclass(LlamaCppProvider.Model, Model)
 
 
 def test_descriptor_holds_model_id_and_provider():
@@ -415,3 +417,555 @@ def test_lmstudio_load_never_loads_raises(monkeypatch):
     with pytest.raises(RuntimeError):
         p.loadModel(m)
     assert not m.loaded
+
+
+# ---- llama_cpp memory estimation ----
+
+
+def test_llama_cpp_provider_type_id_and_single_resident():
+    assert LlamaCppProvider()._type_id == "llama_cpp"
+    assert LlamaCppProvider().single_resident
+
+
+def test_llama_cpp_defaults():
+    p = LlamaCppProvider()
+    assert p.host == "127.0.0.1"
+    assert p.port == 8080
+    assert p.endpoint_uri == "http://127.0.0.1:8080/v1"
+    assert p.llama_cpp_dir is None
+    assert p.gguf_path is None
+    assert p.ctx_length is None
+    assert p.alias is None
+
+
+def test_llama_cpp_memory_parses_fit_params(monkeypatch):
+    import subprocess
+    from providers.llama_cpp import LlamaCppProvider
+
+    calls = {}
+
+    def fake_run(argv, **kw):
+        calls["argv"] = argv
+        calls["kwargs"] = kw
+        class Proc:
+            returncode = 0
+            stdout = "MTL0 35905 142 493 \nHost 515 0 24 \n"
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    p = LlamaCppProvider(
+        config={
+            "llama_cpp_dir": "/path/to/llama-cpp",
+            "gguf_path": "model.gguf",
+        }
+    )
+    m = p.createModel(ModelDescriptor("alias", p), LoadOptions(ctx_length=4096))
+    # VRAM footprint is the GPU (non-Host) device total: 35905+142+493.
+    assert m.memory() == pytest.approx(36540.0)
+    assert calls["kwargs"]["cwd"] == "/path/to/llama-cpp"
+    assert calls["argv"] == [
+        "/path/to/llama-cpp/llama-fit-params",
+        "-m",
+        "model.gguf",
+        "--ctx-size",
+        "4096",
+        "--fit-print",
+        "on",
+    ]
+
+
+def test_llama_cpp_memory_forwards_core_options(monkeypatch):
+    import subprocess
+    from providers.llama_cpp import LlamaCppProvider
+
+    argv = {}
+
+    def fake_run(argv_actual, **kw):
+        argv["actual"] = argv_actual
+        class Proc:
+            returncode = 0
+            stdout = "MTL0 100 200 300 \n"
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    p = LlamaCppProvider(
+        config={
+            "llama_cpp_dir": "/path",
+            "gguf_path": "m.gguf",
+            "ctx_length": 8192,
+            "options": {"ngl": 24, "cache_type_k": "q8_0", "lora": "lora.bin"},
+        }
+    )
+    m = p.createModel(ModelDescriptor("alias", p), LoadOptions(ctx_length=4096))
+    assert m.memory() == pytest.approx(600.0)
+    # Core options ride into the llama-fit-params estimate so VRAM reflects them.
+    assert argv["actual"] == [
+        "/path/llama-fit-params",
+        "-m",
+        "m.gguf",
+        "--ctx-size",
+        "8192",
+        "--fit-print",
+        "on",
+        "--gpu-layers",
+        "24",
+        "--cache-type-k",
+        "q8_0",
+        "--lora",
+        "lora.bin",
+    ]
+
+
+def test_llama_cpp_memory_provider_ctx_overrides_model(monkeypatch):
+    import subprocess
+    from providers.llama_cpp import LlamaCppProvider
+
+    argv = {}
+
+    def fake_run(argv_actual, **kw):
+        argv["actual"] = argv_actual
+        class Proc:
+            returncode = 0
+            stdout = "MTL0 100 200 300 \n"
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    p = LlamaCppProvider(
+        config={
+            "llama_cpp_dir": "/path",
+            "gguf_path": "m.gguf",
+            "ctx_length": 8192,
+        }
+    )
+    m = p.createModel(ModelDescriptor("alias", p), LoadOptions(ctx_length=4096))
+    # Provider-level ctx_length wins over the model's load options.
+    assert m.memory() == pytest.approx(600.0)
+    assert argv["actual"][-4:] == ["--ctx-size", "8192", "--fit-print", "on"]
+
+
+def test_llama_cpp_memory_raises_on_nonzero_exit(monkeypatch):
+    import subprocess
+    from providers.llama_cpp import LlamaCppProvider
+
+    def fake_run(argv, **kw):
+        class Proc:
+            returncode = 1
+            stdout = ""
+            stderr = "boom"
+
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    p = LlamaCppProvider(
+        config={"llama_cpp_dir": "/path", "gguf_path": "m.gguf"}
+    )
+    m = p.createModel(ModelDescriptor("alias", p), LoadOptions())
+    with pytest.raises(RuntimeError):
+        m.memory()
+
+
+def test_llama_cpp_memory_raises_on_unparseable(monkeypatch):
+    import subprocess
+    from providers.llama_cpp import LlamaCppProvider
+
+    def fake_run(argv, **kw):
+        class Proc:
+            returncode = 0
+            stdout = "unexpected output"
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    p = LlamaCppProvider(
+        config={"llama_cpp_dir": "/path", "gguf_path": "m.gguf"}
+    )
+    m = p.createModel(ModelDescriptor("alias", p), LoadOptions())
+    with pytest.raises(RuntimeError):
+        m.memory()
+
+
+def test_llama_cpp_memory_requires_dir_and_gguf():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider()
+    m = p.createModel(ModelDescriptor("alias", p), LoadOptions())
+    with pytest.raises(ValueError):
+        m.memory()
+
+
+def test_llama_cpp_memory_raises_runtime_error_on_non_numeric(monkeypatch):
+    import subprocess
+    from providers.llama_cpp import LlamaCppProvider
+
+    def fake_run(argv, **kw):
+        class Proc:
+            returncode = 0
+            stdout = "MTL0 abc def ghi \nHost 515 0 24 \n"
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    p = LlamaCppProvider(
+        config={"llama_cpp_dir": "/path", "gguf_path": "m.gguf"}
+    )
+    m = p.createModel(ModelDescriptor("alias", p), LoadOptions(ctx_length=4096))
+    # A non-numeric fit-params column must fail loudly as a RuntimeError, not
+    # escape as a raw ValueError.
+    with pytest.raises(RuntimeError):
+        m.memory()
+
+
+# ---- llama_cpp descriptor / OAI listing ----
+
+
+def test_llama_cpp_get_models_descriptors():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider(config={"alias": "qwen3"})
+    descs = p.getModelsDescriptors()
+    assert [d.modelId for d in descs] == ["qwen3"]
+    assert all(d.provider is p for d in descs)
+
+
+def test_llama_cpp_get_oai_models_provider_ctx():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider(config={"alias": "qwen3", "ctx_length": 8192})
+    data = p.getOAIModels()
+    assert len(data) == 1
+    assert data[0]["id"] == "qwen3"
+    assert data[0]["context_length"] == 8192
+    assert data[0]["object"] == "model"
+
+
+def test_llama_cpp_get_oai_models_resident_ctx():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider(config={"alias": "qwen3"})
+    m = p.createModel(ModelDescriptor("qwen3", p), LoadOptions(ctx_length=16384))
+    p.resident_model = m
+    data = p.getOAIModels()
+    assert data[0]["id"] == "qwen3"
+    assert data[0]["context_length"] == 16384
+
+
+def test_llama_cpp_get_oai_models_raises_without_ctx():
+    from providers.llama_cpp import LlamaCppProvider
+
+    # No provider ctx_length and no resident model: the context length is
+    # genuinely unknown, so listing must fail loudly (ValueError) rather than
+    # invent a default.
+    p = LlamaCppProvider(config={"alias": "qwen3"})
+    with pytest.raises(ValueError):
+        p.getOAIModels()
+
+
+# ---- llama_cpp load / unload ----
+
+
+def test_llama_cpp_build_command():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider(
+        config={
+            "llama_cpp_dir": "/path/to/llama-cpp",
+            "gguf_path": "model.gguf",
+            "host": "0.0.0.0",
+            "port": 9000,
+            "ctx_length": 8192,
+            "alias": "qwen3",
+        }
+    )
+    m = p.createModel(ModelDescriptor("qwen3", p), LoadOptions(ctx_length=4096))
+    assert p._build_command(m) == [
+        "/path/to/llama-cpp/llama-server",
+        "-m",
+        "model.gguf",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "9000",
+        "-a",
+        "qwen3",
+        "-c",
+        "8192",
+    ]
+
+
+def test_llama_cpp_build_command_omits_defaults():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider(
+        config={
+            "llama_cpp_dir": "/path",
+            "gguf_path": "m.gguf",
+            "alias": "a",
+            "ctx_length": 4096,
+        }
+    )
+    m = p.createModel(ModelDescriptor("a", p), LoadOptions(ctx_length=4096))
+    # Default host/port are omitted so llama-server applies its own defaults.
+    assert p._build_command(m) == [
+        "/path/llama-server",
+        "-m",
+        "m.gguf",
+        "-a",
+        "a",
+        "-c",
+        "4096",
+    ]
+
+
+def test_llama_cpp_build_command_preserves_spaces():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider(
+        config={
+            "llama_cpp_dir": "/tmp/llama",
+            "gguf_path": "model with space.gguf",
+            "alias": "qwen3",
+            "ctx_length": 4096,
+        }
+    )
+    m = p.createModel(ModelDescriptor("qwen3", p), LoadOptions(ctx_length=4096))
+    assert p._build_command(m) == [
+        "/tmp/llama/llama-server",
+        "-m",
+        "model with space.gguf",
+        "-a",
+        "qwen3",
+        "-c",
+        "4096",
+    ]
+
+
+def test_llama_cpp_build_command_extra_options():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider(
+        config={
+            "llama_cpp_dir": "/tmp/llama",
+            "gguf_path": "m.gguf",
+            "alias": "qwen3",
+            "ctx_length": 4096,
+            "extra_options": "--lora ./lora.bin -ngl 24 --cache-type-k q8_0 --port 9091",
+        }
+    )
+    m = p.createModel(ModelDescriptor("qwen3", p), LoadOptions(ctx_length=4096))
+    command = p._build_command(m)
+    # extra_options is inserted verbatim (tokenized) last, after YAALLB's own
+    # -c, so it can override every YAALLB default (including -c and flags like
+    # --port even when YAALLB emitted a default one).
+    assert command == [
+        "/tmp/llama/llama-server",
+        "-m",
+        "m.gguf",
+        "-a",
+        "qwen3",
+        "-c",
+        "4096",
+        "--lora",
+        "./lora.bin",
+        "-ngl",
+        "24",
+        "--cache-type-k",
+        "q8_0",
+        "--port",
+        "9091",
+    ]
+
+
+def test_llama_cpp_build_command_extra_options_with_spaces(monkeypatch):
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider(
+        config={
+            "llama_cpp_dir": "/tmp/llama",
+            "gguf_path": "m.gguf",
+            "alias": "qwen3",
+            "ctx_length": 4096,
+            "extra_options": '--lora "lora with space.bin" --tags "tag a,b"',
+        }
+    )
+    m = p.createModel(ModelDescriptor("qwen3", p), LoadOptions(ctx_length=4096))
+    command = p._build_command(m)
+    # Quoted values with spaces survive tokenization.
+    assert "--lora" in command
+    assert "lora with space.bin" in command
+    assert "--tags" in command
+    assert "tag a,b" in command
+
+
+def test_llama_cpp_build_command_core_options():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider(
+        config={
+            "llama_cpp_dir": "/tmp/llama",
+            "gguf_path": "m.gguf",
+            "alias": "qwen3",
+            "ctx_length": 4096,
+            "options": {"ngl": 24, "cache_type_k": "q8_0", "lora": "lora.bin"},
+        }
+    )
+    m = p.createModel(ModelDescriptor("qwen3", p), LoadOptions(ctx_length=4096))
+    assert p._build_command(m) == [
+        "/tmp/llama/llama-server",
+        "-m",
+        "m.gguf",
+        "-a",
+        "qwen3",
+        "--gpu-layers",
+        "24",
+        "--cache-type-k",
+        "q8_0",
+        "--lora",
+        "lora.bin",
+        "-c",
+        "4096",
+    ]
+
+
+def test_llama_cpp_build_command_core_options_booleans():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider(
+        config={
+            "llama_cpp_dir": "/tmp/llama",
+            "gguf_path": "m.gguf",
+            "alias": "qwen3",
+            "ctx_length": 4096,
+            "options": {"swa_full": True, "cpu_moe": True, "mlock": True, "no_host": False},
+        }
+    )
+    m = p.createModel(ModelDescriptor("qwen3", p), LoadOptions(ctx_length=4096))
+    # Flags emitted only when true; false flags are omitted.
+    assert p._build_command(m) == [
+        "/tmp/llama/llama-server",
+        "-m",
+        "m.gguf",
+        "-a",
+        "qwen3",
+        "--swa-full",
+        "--cpu-moe",
+        "--mlock",
+        "-c",
+        "4096",
+    ]
+
+
+def test_llama_cpp_load_spawns_process(monkeypatch):
+    import subprocess
+    from providers.llama_cpp import LlamaCppProvider
+
+    spawned = {}
+
+    class FakeProcess:
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=0):
+            pass
+
+        def kill(self):
+            pass
+
+    def fake_popen(argv, **kwargs):
+        spawned["argv"] = argv
+        spawned["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    p = LlamaCppProvider(
+        config={
+            "llama_cpp_dir": "/tmp/llama",
+            "gguf_path": "m.gguf",
+            "alias": "qwen3",
+            "ctx_length": 4096,
+        }
+    )
+    m = p.createModel(ModelDescriptor("qwen3", p), LoadOptions(ctx_length=4096))
+    p.loadModel(m)
+
+    assert spawned["kwargs"]["cwd"] == "/tmp/llama"
+    assert spawned["argv"] == [
+        "/tmp/llama/llama-server",
+        "-m",
+        "m.gguf",
+        "-a",
+        "qwen3",
+        "-c",
+        "4096",
+    ]
+    assert p.resident_model is m
+    assert p._process is not None
+
+    p.unloadModel(m)
+    assert p._process is None
+    assert p.resident_model is None
+    assert not m.loaded
+
+
+def test_llama_cpp_unload_kills_on_terminate_timeout(monkeypatch):
+    import subprocess
+    from providers.llama_cpp import LlamaCppProvider
+
+    class FakeProcess:
+        def __init__(self):
+            self.killed = False
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            if timeout is not None and not self.killed:
+                raise subprocess.TimeoutExpired("llama-server", timeout)
+            return 0
+
+        def kill(self):
+            self.killed = True
+
+    proc = FakeProcess()
+    monkeypatch.setattr(
+        "providers.llama_cpp.subprocess.Popen", lambda *a, **kw: proc
+    )
+
+    p = LlamaCppProvider(
+        config={
+            "llama_cpp_dir": "/tmp/llama",
+            "gguf_path": "m.gguf",
+            "alias": "qwen3",
+        }
+    )
+    m = p.createModel(ModelDescriptor("qwen3", p), LoadOptions(ctx_length=8192))
+    p.loadModel(m)
+
+    p.unloadModel(m)
+    assert proc.killed
+    assert p._process is None
+    assert p.resident_model is None
+    assert not m.loaded
+
+
+def test_llama_cpp_load_requires_dir_and_gguf():
+    from providers.llama_cpp import LlamaCppProvider
+
+    p = LlamaCppProvider()
+    m = p.createModel(ModelDescriptor("alias", p), LoadOptions())
+    with pytest.raises(ValueError):
+        p.loadModel(m)
