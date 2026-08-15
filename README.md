@@ -264,6 +264,8 @@ never becoming ready within the deadline) raises.
 
 #### llama_cpp
 
+** Currently Untested **
+
 `llama_cpp` is spawned and terminated by YAALLB (it has no native load/unload),
 so each instance needs to know how to launch `llama-server` from the directory
 holding the llama.cpp binaries.
