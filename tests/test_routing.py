@@ -302,6 +302,84 @@ def test_chat_completions_success_resets_startup_failures(monkeypatch):
     assert prov_a.startup_failures == 0
 
 
+def test_chat_completions_lmstudio_404_waits_ready_then_succeeds(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a._type_id = "lms"
+    waited = []
+    prov_a.wait_loaded = lambda model_id: waited.append(model_id)
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    class FlakyClient:
+        def __init__(self):
+            self.calls = []
+            self.responses = [404, 200]
+
+        async def aclose(self):
+            pass
+
+        def build_request(self, method, url, json, headers):
+            return {"url": url, "json": json, "headers": headers}
+
+        async def send(self, req, stream=False):
+            self.calls.append(("send", req["url"], req["json"], req["headers"]))
+            status = self.responses.pop(0)
+            if status == 404:
+                class R:
+                    status_code = 404
+                    headers = {"content-type": "text/event-stream"}
+
+                return R()
+            return FakeStreamResponse()
+
+    fake = FlakyClient()
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions", json={"model": "model-a", "messages": [], "stream": True}
+        )
+
+    # An LM Studio "still loading" 404 must NOT be treated as a startup
+    # failure: YAALLB blocks on the model's real readiness signal, then
+    # retries and succeeds. startup_failures is never bumped.
+    assert resp.status_code == 200
+    assert resp.content.endswith(b'data: {"x":1}\n\ndata: [DONE]\n\n')
+    assert waited == ["model-a"]
+    assert len(fake.calls) == 2
+    assert getattr(prov_a, "startup_failures", 0) == 0
+
+
+def test_chat_completions_lmstudio_404_never_ready_sse_error(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a._type_id = "lms"
+
+    def failing_wait(model_id):
+        raise RuntimeError("never ready")
+
+    prov_a.wait_loaded = failing_wait
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    class Always404:
+        status_code = 404
+        headers = {"content-type": "text/event-stream"}
+
+    fake = FakeAsyncClient(stream=Always404())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions", json={"model": "model-a", "messages": [], "stream": True}
+        )
+
+    # A 404 that never becomes ready surfaces a distinct SSE error, NOT the
+    # generic provider_start_failed (which conflates it with provider startup).
+    assert resp.status_code == 200
+    assert b'"code": "model_not_ready"' in resp.content
+    assert getattr(prov_a, "startup_failures", 0) == 0
+
+
 def test_chat_completions_streams_sse(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     main.PROVIDERS = [prov_a]

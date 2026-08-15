@@ -296,6 +296,15 @@ async def chat_completions(body: dict):
         # Forward as an SSE stream, retrying transient failures internally
         # (bounded by STARTUP_ATTEMPTS) instead of surfacing a 503/500 or an
         # LM Studio "still loading" 4XX. Exhaustion becomes an SSE error event.
+        #
+        # LM Studio's 404/4XX on an unloaded model is NOT a provider startup
+        # problem: the model is loading in the background. Resolve it against
+        # the model's real readiness signal (wait_loaded) rather than a blind
+        # retry budget, so a slow background load doesn't exhaust the retry
+        # budget and SSE-error while LM Studio later completes the request
+        # "into the void".
+        failures = 0
+        ready_retries = 0
         while True:
             client = httpx.AsyncClient(timeout=None)
             try:
@@ -309,14 +318,50 @@ async def chat_completions(body: dict):
                 await client.aclose()
                 failures = _bump_startup_failures(provider, f"connection error: {e}")
             else:
-                if upstream.status_code != 200:
-                    await client.aclose()
-                    failures = _bump_startup_failures(
-                        provider, f"upstream status {upstream.status_code}"
-                    )
-                else:
+                if upstream.status_code == 200:
                     provider.startup_failures = 0
                     break
+                await client.aclose()
+                # LM Studio still-loading 4XX (except auth): wait on the model's
+                # real readiness, then retry. Do not count it as a startup failure.
+                if (
+                    provider._type_id == "lms"
+                    and upstream.status_code != 401
+                    and upstream.status_code < 500
+                ):
+                    try:
+                        await asyncio.to_thread(
+                            provider.wait_loaded, model.descriptor.modelId
+                        )
+                    except Exception as e:
+                        log.error(
+                            f"model {model_id} never became ready on "
+                            f"{provider.endpoint_uri}: {e}"
+                        )
+                        SCHEDULER.release(model)
+                        yield _sse_error(
+                            "model_not_ready",
+                            f"model `{model_id}` never became ready: {e}",
+                        )
+                        return
+                    ready_retries += 1
+                    if ready_retries >= STARTUP_ATTEMPTS:
+                        log.error(
+                            f"model {model_id} kept returning "
+                            f"{upstream.status_code} on {provider.endpoint_uri} "
+                            f"after {STARTUP_ATTEMPTS} readiness waits"
+                        )
+                        SCHEDULER.release(model)
+                        yield _sse_error(
+                            "model_not_ready",
+                            f"model `{model_id}` is not ready on "
+                            f"{provider.endpoint_uri}",
+                        )
+                        return
+                    continue
+                failures = _bump_startup_failures(
+                    provider, f"upstream status {upstream.status_code}"
+                )
 
             if failures < STARTUP_ATTEMPTS:
                 await asyncio.sleep(2)
