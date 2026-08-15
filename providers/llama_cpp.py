@@ -1,7 +1,9 @@
 import os
 import shlex
 import subprocess
+import time
 
+import httpx
 import log
 from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
@@ -23,6 +25,35 @@ SERVER_BINARY = "llama-server"
 
 # llama-server terminate grace period before escalating to SIGKILL on unload.
 UNLOAD_TERMINATE_TIMEOUT = 10.0
+
+# How long loadModel waits for the spawned llama-server to start accepting
+# requests before failing the load. llama-server loads the model at launch, so
+# a 200 from /v1/models means the model is resident and ready.
+LLAMA_CPP_READY_TIMEOUT = 120
+READY_POLL_INTERVAL = 0.5
+
+
+# Wait for a spawned server to start accepting requests on its endpoint.
+# Blocks (off the event loop; loadModel runs in a worker thread) until GET
+# {endpoint}/models returns 200, the process exits, or the timeout elapses.
+# Used so `model.loaded` reflects the downstream being actually ready, not
+# just the process having been spawned.
+def _wait_server_ready(endpoint_uri: str, process, label: str) -> None:
+    deadline = time.monotonic() + LLAMA_CPP_READY_TIMEOUT
+    while True:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(f"{label} exited before becoming ready")
+        try:
+            resp = httpx.get(endpoint_uri + "/models")
+            if resp.status_code == 200:
+                return
+        except httpx.HTTPError:
+            pass
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"{label} not ready within {LLAMA_CPP_READY_TIMEOUT}s"
+            )
+        time.sleep(READY_POLL_INTERVAL)
 
 # Flag registry: config key -> (flag, kind, default). These are the "core
 # options" — the memory-affecting flags that BOTH llama-server and
@@ -257,7 +288,13 @@ class LlamaCppProvider(Provider):
         command = self._build_command(model)
         self._process = subprocess.Popen(command, cwd=self.llama_cpp_dir)
         self.resident_model = model
+        # The model is loading until the spawned server actually accepts
+        # requests; only then is it marked loaded (ready).
+        model._loaded = False
+        model._load_state = "loading"
+        _wait_server_ready(self.endpoint_uri, self._process, "llama-server")
         model._loaded = True
+        model._load_state = "ready"
 
     def unloadModel(self, model: BaseModel) -> None:
         process = self._process

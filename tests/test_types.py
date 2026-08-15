@@ -884,12 +884,22 @@ def test_llama_cpp_load_spawns_process(monkeypatch):
         def kill(self):
             pass
 
+        def poll(self):
+            return None
+
     def fake_popen(argv, **kwargs):
         spawned["argv"] = argv
         spawned["kwargs"] = kwargs
         return FakeProcess()
 
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 200
+
+        return Resp()
+
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr("providers.llama_cpp.httpx.get", fake_get)
 
     p = LlamaCppProvider(
         config={
@@ -937,13 +947,23 @@ def test_llama_cpp_unload_kills_on_terminate_timeout(monkeypatch):
                 raise subprocess.TimeoutExpired("llama-server", timeout)
             return 0
 
+        def poll(self):
+            return 0 if self.killed else None
+
         def kill(self):
             self.killed = True
+
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 200
+
+        return Resp()
 
     proc = FakeProcess()
     monkeypatch.setattr(
         "providers.llama_cpp.subprocess.Popen", lambda *a, **kw: proc
     )
+    monkeypatch.setattr("providers.llama_cpp.httpx.get", fake_get)
 
     p = LlamaCppProvider(
         config={
@@ -969,3 +989,89 @@ def test_llama_cpp_load_requires_dir_and_gguf():
     m = p.createModel(ModelDescriptor("alias", p), LoadOptions())
     with pytest.raises(ValueError):
         p.loadModel(m)
+
+
+def test_llama_cpp_load_waits_for_server_ready(monkeypatch):
+    import subprocess
+    from providers.llama_cpp import LlamaCppProvider
+
+    class FakeProcess:
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=0):
+            pass
+
+        def kill(self):
+            pass
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: FakeProcess())
+
+    calls = []
+    statuses = iter([503, 503, 200])
+
+    def fake_get(url, headers=None):
+        calls.append(url)
+        class Resp:
+            status_code = next(statuses)
+
+        return Resp()
+
+    monkeypatch.setattr("providers.llama_cpp.httpx.get", fake_get)
+    monkeypatch.setattr("providers.llama_cpp.time.sleep", lambda *a: None)
+
+    p = LlamaCppProvider(
+        config={"llama_cpp_dir": "/tmp/llama", "gguf_path": "m.gguf", "alias": "qwen3"}
+    )
+    m = p.createModel(ModelDescriptor("qwen3", p), LoadOptions(ctx_length=4096))
+    p.loadModel(m)
+
+    # loadModel blocks until the spawned server actually accepts requests;
+    # only then is the model marked loaded (ready), not immediately on spawn.
+    assert m.loaded
+    assert m.load_state == "ready"
+    assert all(c.endswith("/v1/models") for c in calls)
+    assert len(calls) == 3
+
+
+def test_llama_cpp_load_ready_timeout_raises(monkeypatch):
+    import subprocess
+    from providers.llama_cpp import LlamaCppProvider
+
+    class FakeProcess:
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=0):
+            pass
+
+        def kill(self):
+            pass
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: FakeProcess())
+
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 503
+
+        return Resp()
+
+    monkeypatch.setattr("providers.llama_cpp.httpx.get", fake_get)
+    monkeypatch.setattr("providers.llama_cpp.time.sleep", lambda *a: None)
+    monkeypatch.setattr("providers.llama_cpp.LLAMA_CPP_READY_TIMEOUT", 0.01)
+
+    p = LlamaCppProvider(
+        config={"llama_cpp_dir": "/tmp/llama", "gguf_path": "m.gguf", "alias": "qwen3"}
+    )
+    m = p.createModel(ModelDescriptor("qwen3", p), LoadOptions(ctx_length=4096))
+    with pytest.raises(RuntimeError):
+        p.loadModel(m)
+
+    assert not m.loaded
+    assert m.load_state == "loading"

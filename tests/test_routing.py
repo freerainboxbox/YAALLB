@@ -568,10 +568,13 @@ def test_dwarfstar_getoaimodels_hardcoded(monkeypatch):
 def test_dwarfstar_resident_model_and_context(monkeypatch):
     from providers.dwarfstar import DwarfStarProvider
 
-    def no_network(url):
-        raise AssertionError("should not hit the network")
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 200
 
-    monkeypatch.setattr("httpx.get", no_network)
+        return Resp()
+
+    monkeypatch.setattr("httpx.get", fake_get)
 
     class FakeProcess:
         def terminate(self):
@@ -581,7 +584,7 @@ def test_dwarfstar_resident_model_and_context(monkeypatch):
             pass
 
         def poll(self):
-            return 0
+            return None
 
         def kill(self):
             pass
@@ -775,7 +778,7 @@ def test_dwarfstar_load_spawns_process(monkeypatch):
             pass
 
         def poll(self):
-            return 0
+            return None
 
         def kill(self):
             pass
@@ -785,7 +788,14 @@ def test_dwarfstar_load_spawns_process(monkeypatch):
         spawned["kwargs"] = kwargs
         return FakeProcess()
 
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 200
+
+        return Resp()
+
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr("providers.dwarfstar.httpx.get", fake_get)
 
     provider = DwarfStarProvider(
         config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf", "ctx_length": 4096}
@@ -835,10 +845,17 @@ def test_dwarfstar_unload_kills_on_terminate_timeout(monkeypatch):
         def kill(self):
             self.killed = True
 
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 200
+
+        return Resp()
+
     proc = FakeProcess()
     monkeypatch.setattr(
         "providers.dwarfstar.subprocess.Popen", lambda *a, **kw: proc
     )
+    monkeypatch.setattr("providers.dwarfstar.httpx.get", fake_get)
 
     provider = DwarfStarProvider(
         config={"ds4_dir": "/tmp/ds4", "gguf_path": "model.gguf"}
@@ -867,6 +884,96 @@ def test_dwarfstar_load_requires_ds4_dir_and_gguf_path():
     )
     with pytest.raises(ValueError):
         provider.loadModel(model)
+
+
+def test_dwarfstar_load_waits_for_server_ready(monkeypatch):
+    import subprocess
+    from providers.dwarfstar import DwarfStarProvider
+
+    class FakeProcess:
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=0):
+            pass
+
+        def kill(self):
+            pass
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: FakeProcess())
+
+    calls = []
+    statuses = iter([503, 503, 200])
+
+    def fake_get(url, headers=None):
+        calls.append(url)
+        class Resp:
+            status_code = next(statuses)
+
+        return Resp()
+
+    monkeypatch.setattr("providers.dwarfstar.httpx.get", fake_get)
+    monkeypatch.setattr("providers.dwarfstar.time.sleep", lambda *a: None)
+
+    provider = DwarfStarProvider(
+        config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf"}
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    )
+    provider.loadModel(model)
+
+    # loadModel blocks until the spawned ds4-server actually accepts requests;
+    # only then is the model marked loaded (ready), not immediately on spawn.
+    assert model.loaded
+    assert model.load_state == "ready"
+    assert all(c.endswith("/v1/models") for c in calls)
+    assert len(calls) == 3
+
+
+def test_dwarfstar_load_ready_timeout_raises(monkeypatch):
+    import subprocess
+    from providers.dwarfstar import DwarfStarProvider
+
+    class FakeProcess:
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=0):
+            pass
+
+        def kill(self):
+            pass
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: FakeProcess())
+
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 503
+
+        return Resp()
+
+    monkeypatch.setattr("providers.dwarfstar.httpx.get", fake_get)
+    monkeypatch.setattr("providers.dwarfstar.time.sleep", lambda *a: None)
+    monkeypatch.setattr("providers.dwarfstar.DS4_READY_TIMEOUT", 0.01)
+
+    provider = DwarfStarProvider(
+        config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf"}
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    )
+    with pytest.raises(RuntimeError):
+        provider.loadModel(model)
+
+    assert not model.loaded
+    assert model.load_state == "loading"
 
 
 def test_provider_type_ids():

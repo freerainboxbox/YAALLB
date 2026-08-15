@@ -316,6 +316,10 @@ async def chat_completions(body: dict):
                 )
             except httpx.HTTPError as e:
                 await client.aclose()
+                # A spawned provider (llama_cpp/ds4) not answering means its
+                # model isn't actually ready yet; track that load state.
+                if provider._type_id in ("llama_cpp", "ds4"):
+                    model._load_state = "loading"
                 failures = _bump_startup_failures(provider, f"connection error: {e}")
             else:
                 if upstream.status_code == 200:
@@ -359,10 +363,13 @@ async def chat_completions(body: dict):
                         )
                         return
                     continue
+                # A spawned provider (llama_cpp/ds4) returning non-200 means
+                # its model isn't actually ready yet; track that load state.
+                if provider._type_id in ("llama_cpp", "ds4"):
+                    model._load_state = "loading"
                 failures = _bump_startup_failures(
                     provider, f"upstream status {upstream.status_code}"
                 )
-
             if failures < STARTUP_ATTEMPTS:
                 await asyncio.sleep(2)
                 continue
