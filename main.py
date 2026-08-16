@@ -44,6 +44,13 @@ PROVIDER_TYPES = {
     "llama_cpp": LlamaCppProvider,
 }
 
+# YAALLB-internal per-model override keys: they configure YAALLB behavior
+# (ctx_length, on_start preload, streaming policy) and must never be forwarded
+# to the upstream chat-completions API.
+INTERNAL_OVERRIDE_KEYS = frozenset(
+    {"ctx_length", "on_start", "allow_non_streaming", "supports_streaming"}
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -305,10 +312,12 @@ async def _forward_non_streaming(
             },
         )
 
-    # Apply non-ctx model overrides as defaults; force non-streaming upstream.
+    # Apply generation-param model overrides as defaults; force non-streaming
+    # upstream. YAALLB-internal keys (ctx_length, on_start, streaming policy)
+    # are filtered out so they never leak onto the wire.
     forward_body = dict(body)
     for key, value in overrides.items():
-        if key == "ctx_length":
+        if key in INTERNAL_OVERRIDE_KEYS:
             continue
         forward_body.setdefault(key, value)
     forward_body["stream"] = False
@@ -431,11 +440,13 @@ async def chat_completions(body: dict):
             )
             return
 
-        # Apply non-ctx model overrides (temperature, top_p, ...) as defaults
-        # when the client didn't specify them; they ride along in the body.
+        # Apply generation-param model overrides (temperature, top_p, ...) as
+        # defaults when the client didn't specify them; they ride along in the
+        # body. YAALLB-internal keys (ctx_length, on_start, streaming policy)
+        # are filtered out so they never leak onto the wire.
         forward_body = dict(body)
         for key, value in overrides.items():
-            if key == "ctx_length":
+            if key in INTERNAL_OVERRIDE_KEYS:
                 continue
             forward_body.setdefault(key, value)
         forward_body["stream"] = True
@@ -486,46 +497,73 @@ async def chat_completions(body: dict):
                     if provider._type_id in ("llama_cpp", "ds4"):
                         model._load_state = "ready"
                     break
-                await client.aclose()
-                # LM Studio still-loading 4XX (except auth): wait on the model's
-                # real readiness, then retry. Do not count it as a startup failure.
-                if (
-                    provider._type_id == "lms"
-                    and upstream.status_code != 401
-                    and upstream.status_code < 500
-                ):
+
+                if provider._type_id == "lms":
+                    # LM Studio's "still loading" signal is a 404 on
+                    # /chat/completions; anything else is a genuine upstream
+                    # error. Distinguish them so a slow background load doesn't
+                    # exhaust the retry budget (404) while a malformed request
+                    # or over-long prompt doesn't fire a hot loop of duplicate
+                    # retries and misreport as "model not ready" (other 4XX).
+                    if upstream.status_code == 404:
+                        await client.aclose()
+                        try:
+                            await asyncio.to_thread(
+                                provider.wait_loaded, model.descriptor.modelId
+                            )
+                        except Exception as e:
+                            log.error(
+                                f"model {model_id} never became ready on "
+                                f"{provider.endpoint_uri}: {e}"
+                            )
+                            SCHEDULER.release(model)
+                            yield _sse_error(
+                                "model_not_ready",
+                                f"model `{model_id}` never became ready: {e}",
+                            )
+                            return
+                        ready_retries += 1
+                        if ready_retries >= STARTUP_ATTEMPTS:
+                            log.error(
+                                f"model {model_id} kept returning "
+                                f"{upstream.status_code} on "
+                                f"{provider.endpoint_uri} after "
+                                f"{STARTUP_ATTEMPTS} readiness waits"
+                            )
+                            SCHEDULER.release(model)
+                            yield _sse_error(
+                                "model_not_ready",
+                                f"model `{model_id}` is not ready on "
+                                f"{provider.endpoint_uri}",
+                            )
+                            return
+                        continue
+                    # Any other non-200 (400 malformed request, 422 context
+                    # overflow, 401 auth, 5XX) is a genuine upstream error, not
+                    # a readiness signal: relay the upstream error body as an
+                    # SSE error instead of retrying in a hot loop. (Named
+                    # err_body — NOT `body`, which shadows the request-body
+                    # parameter and would trip UnboundLocalError in this scope.)
+                    err_body = b""
                     try:
-                        await asyncio.to_thread(
-                            provider.wait_loaded, model.descriptor.modelId
-                        )
-                    except Exception as e:
-                        log.error(
-                            f"model {model_id} never became ready on "
-                            f"{provider.endpoint_uri}: {e}"
-                        )
-                        SCHEDULER.release(model)
-                        yield _sse_error(
-                            "model_not_ready",
-                            f"model `{model_id}` never became ready: {e}",
-                        )
-                        return
-                    ready_retries += 1
-                    if ready_retries >= STARTUP_ATTEMPTS:
-                        log.error(
-                            f"model {model_id} kept returning "
-                            f"{upstream.status_code} on {provider.endpoint_uri} "
-                            f"after {STARTUP_ATTEMPTS} readiness waits"
-                        )
-                        SCHEDULER.release(model)
-                        yield _sse_error(
-                            "model_not_ready",
-                            f"model `{model_id}` is not ready on "
-                            f"{provider.endpoint_uri}",
-                        )
-                        return
-                    continue
+                        async for chunk in upstream.aiter_raw():
+                            err_body += chunk
+                    except httpx.HTTPError:
+                        err_body = b""
+                    await client.aclose()
+                    SCHEDULER.release(model)
+                    yield _sse_error(
+                        "upstream_error",
+                        f"upstream {provider.endpoint_uri} returned "
+                        f"{upstream.status_code}: "
+                        f"{err_body.decode(errors='replace')[:512]}",
+                    )
+                    return
+
+                await client.aclose()
                 # A spawned provider (llama_cpp/ds4) returning non-200 means
-                # its model isn't actually ready yet; track that load state.
+                # its model isn't actually ready yet; track that load state so
+                # the retry below continues until the readiness gate says ready.
                 if provider._type_id in ("llama_cpp", "ds4"):
                     model._load_state = "loading"
                 failures = _bump_startup_failures(
@@ -539,10 +577,21 @@ async def chat_completions(body: dict):
                 f"after {STARTUP_ATTEMPTS} attempts"
             )
             SCHEDULER.release(model)
-            yield _sse_error(
-                "provider_start_failed",
-                f"provider {provider.endpoint_uri} failed to start",
-            )
+            # Read the tracked load state to classify the exhaustion: a spawned
+            # provider whose model never became ready (load_state still
+            # "loading") is a readiness failure (model_not_ready), not a
+            # generic provider-start failure.
+            if provider._type_id in ("llama_cpp", "ds4") and model.load_state != "ready":
+                yield _sse_error(
+                    "model_not_ready",
+                    f"model `{model_id}` is not ready on "
+                    f"{provider.endpoint_uri}",
+                )
+            else:
+                yield _sse_error(
+                    "provider_start_failed",
+                    f"provider {provider.endpoint_uri} failed to start",
+                )
             return
 
         # Relay the upstream SSE stream chunk-for-chunk.

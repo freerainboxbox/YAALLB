@@ -380,6 +380,53 @@ def test_chat_completions_lmstudio_404_never_ready_sse_error(monkeypatch):
     assert getattr(prov_a, "startup_failures", 0) == 0
 
 
+def test_chat_completions_lmstudio_400_relayed_not_retried(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a._type_id = "lms"
+    waited = []
+    prov_a.wait_loaded = lambda model_id: waited.append(model_id)
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    calls = []
+
+    class ErrorResp:
+        status_code = 400
+        headers = {"content-type": "application/json"}
+
+        async def aiter_raw(self):
+            yield b'{"error":{"message":"bad request"}}'
+
+    class OneShotClient:
+        async def aclose(self):
+            pass
+
+        def build_request(self, method, url, json, headers):
+            return {"url": url, "json": json, "headers": headers}
+
+        async def send(self, req, stream=False):
+            calls.append(("send", req["url"], req["json"]))
+            return ErrorResp()
+
+    fake = OneShotClient()
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": True},
+        )
+
+    # A genuine LM Studio 400 (malformed request / context overflow) is relayed
+    # as an SSE upstream_error, NOT retried in a hot loop or misreported as
+    # model_not_ready; wait_loaded is never consulted for a non-404.
+    assert resp.status_code == 200
+    assert b'"code": "upstream_error"' in resp.content
+    assert b"bad request" in resp.content
+    assert waited == []
+    assert len(calls) == 1
+
+
 def test_chat_completions_streams_sse(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     main.PROVIDERS = [prov_a]
@@ -1013,7 +1060,7 @@ def test_dwarfstar_load_spawns_process(monkeypatch):
         return Resp()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    monkeypatch.setattr("providers.dwarfstar.httpx.get", fake_get)
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
 
     provider = DwarfStarProvider(
         config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf", "ctx_length": 4096}
@@ -1073,7 +1120,7 @@ def test_dwarfstar_unload_kills_on_terminate_timeout(monkeypatch):
     monkeypatch.setattr(
         "providers.dwarfstar.subprocess.Popen", lambda *a, **kw: proc
     )
-    monkeypatch.setattr("providers.dwarfstar.httpx.get", fake_get)
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
 
     provider = DwarfStarProvider(
         config={"ds4_dir": "/tmp/ds4", "gguf_path": "model.gguf"}
@@ -1133,8 +1180,8 @@ def test_dwarfstar_load_waits_for_server_ready(monkeypatch):
 
         return Resp()
 
-    monkeypatch.setattr("providers.dwarfstar.httpx.get", fake_get)
-    monkeypatch.setattr("providers.dwarfstar.time.sleep", lambda *a: None)
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
+    monkeypatch.setattr("abstractions.ready.time.sleep", lambda *a: None)
 
     provider = DwarfStarProvider(
         config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf"}
@@ -1181,8 +1228,8 @@ def test_dwarfstar_load_ready_timeout_raises(monkeypatch):
 
         return Resp()
 
-    monkeypatch.setattr("providers.dwarfstar.httpx.get", fake_get)
-    monkeypatch.setattr("providers.dwarfstar.time.sleep", lambda *a: None)
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
+    monkeypatch.setattr("abstractions.ready.time.sleep", lambda *a: None)
     monkeypatch.setattr("providers.dwarfstar.DS4_READY_TIMEOUT", 0.01)
 
     provider = DwarfStarProvider(
@@ -1509,6 +1556,69 @@ def test_chat_completions_applies_ctx_and_override(monkeypatch):
     assert json["temperature"] == 0.7
     # ctx_length itself is not forwarded to the upstream.
     assert "ctx_length" not in json
+
+
+def test_chat_completions_filters_internal_override_keys(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {
+        "model-a": {
+            "ctx_length": 8192,
+            "on_start": "always",
+            "allow_non_streaming": True,
+            "supports_streaming": True,
+            "temperature": 0.7,
+        }
+    }
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": True},
+        )
+
+    assert resp.status_code == 200
+    method, url, json, headers = fake.calls[0]
+    # Generation params still ride along as defaults...
+    assert json["temperature"] == 0.7
+    # ...but YAALLB-internal keys must never leak onto the wire.
+    for key in ("ctx_length", "on_start", "allow_non_streaming", "supports_streaming"):
+        assert key not in json
+
+
+def test_chat_completions_non_streaming_filters_internal_override_keys(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {
+        "model-a": {
+            "ctx_length": 8192,
+            "on_start": "always",
+            "allow_non_streaming": True,
+            "supports_streaming": False,
+            "temperature": 0.7,
+        }
+    }
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(nonstream=FakeResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": False},
+        )
+
+    assert resp.status_code == 200
+    method, url, json, headers = fake.calls[0]
+    assert json["temperature"] == 0.7
+    assert json["stream"] is False
+    for key in ("ctx_length", "on_start", "allow_non_streaming", "supports_streaming"):
+        assert key not in json
 
 
 def test_chat_completions_client_ctx_wins_over_override(monkeypatch):

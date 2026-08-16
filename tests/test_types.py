@@ -899,7 +899,7 @@ def test_llama_cpp_load_spawns_process(monkeypatch):
         return Resp()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    monkeypatch.setattr("providers.llama_cpp.httpx.get", fake_get)
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
 
     p = LlamaCppProvider(
         config={
@@ -963,7 +963,7 @@ def test_llama_cpp_unload_kills_on_terminate_timeout(monkeypatch):
     monkeypatch.setattr(
         "providers.llama_cpp.subprocess.Popen", lambda *a, **kw: proc
     )
-    monkeypatch.setattr("providers.llama_cpp.httpx.get", fake_get)
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
 
     p = LlamaCppProvider(
         config={
@@ -1020,8 +1020,8 @@ def test_llama_cpp_load_waits_for_server_ready(monkeypatch):
 
         return Resp()
 
-    monkeypatch.setattr("providers.llama_cpp.httpx.get", fake_get)
-    monkeypatch.setattr("providers.llama_cpp.time.sleep", lambda *a: None)
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
+    monkeypatch.setattr("abstractions.ready.time.sleep", lambda *a: None)
 
     p = LlamaCppProvider(
         config={"llama_cpp_dir": "/tmp/llama", "gguf_path": "m.gguf", "alias": "qwen3"}
@@ -1066,8 +1066,8 @@ def test_llama_cpp_load_ready_timeout_raises(monkeypatch):
 
         return Resp()
 
-    monkeypatch.setattr("providers.llama_cpp.httpx.get", fake_get)
-    monkeypatch.setattr("providers.llama_cpp.time.sleep", lambda *a: None)
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
+    monkeypatch.setattr("abstractions.ready.time.sleep", lambda *a: None)
     monkeypatch.setattr("providers.llama_cpp.LLAMA_CPP_READY_TIMEOUT", 0.01)
 
     p = LlamaCppProvider(

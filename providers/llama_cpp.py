@@ -1,14 +1,13 @@
 import os
 import shlex
 import subprocess
-import time
 
-import httpx
 import log
 from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model as BaseModel
 from abstractions.provider import Provider
+from abstractions.ready import wait_server_ready
 
 # llama_cpp is a single-model provider: it serves one gguf_path, which maps to
 # a single OAI model ID given by the mandatory `alias` config key (unlike lms,
@@ -30,30 +29,6 @@ UNLOAD_TERMINATE_TIMEOUT = 10.0
 # requests before failing the load. llama-server loads the model at launch, so
 # a 200 from /v1/models means the model is resident and ready.
 LLAMA_CPP_READY_TIMEOUT = 120
-READY_POLL_INTERVAL = 0.5
-
-
-# Wait for a spawned server to start accepting requests on its endpoint.
-# Blocks (off the event loop; loadModel runs in a worker thread) until GET
-# {endpoint}/models returns 200, the process exits, or the timeout elapses.
-# Used so `model.loaded` reflects the downstream being actually ready, not
-# just the process having been spawned.
-def _wait_server_ready(endpoint_uri: str, process, label: str) -> None:
-    deadline = time.monotonic() + LLAMA_CPP_READY_TIMEOUT
-    while True:
-        if process is not None and process.poll() is not None:
-            raise RuntimeError(f"{label} exited before becoming ready")
-        try:
-            resp = httpx.get(endpoint_uri + "/models")
-            if resp.status_code == 200:
-                return
-        except httpx.HTTPError:
-            pass
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                f"{label} not ready within {LLAMA_CPP_READY_TIMEOUT}s"
-            )
-        time.sleep(READY_POLL_INTERVAL)
 
 # Flag registry: config key -> (flag, kind, default). These are the "core
 # options" — the memory-affecting flags that BOTH llama-server and
@@ -293,7 +268,9 @@ class LlamaCppProvider(Provider):
         model._loaded = False
         model._load_state = "loading"
         try:
-            _wait_server_ready(self.endpoint_uri, self._process, "llama-server")
+            wait_server_ready(
+                self.endpoint_uri, self._process, "llama-server", LLAMA_CPP_READY_TIMEOUT
+            )
         except Exception:
             # A readiness timeout (or server exit) must not orphan the spawned
             # llama-server: terminate it and clear provider state before the
