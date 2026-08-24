@@ -295,3 +295,96 @@ def test_scheduler_load_runs_off_thread():
             await s.stop()
 
     run(scenario())
+
+
+# ---- on_start preload + protected eviction ----
+
+
+def test_scheduler_protected_model_not_evicted():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80, "m2": 80})
+        s = Scheduler([p], budget_mib=150)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions())
+            s.release(m1)
+            s.protected.add("m1")
+            # m2 would need to evict m1, but m1 is protected -> impossible.
+            with pytest.raises(RuntimeError):
+                await s.submit("m2", LoadOptions())
+            assert [m.descriptor.modelId for m in s.resident] == ["m1"]
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_scheduler_preload_once_model_evictable():
+    async def scenario():
+        p = MemProvider("http://a", {"a": 80, "b": 80})
+        s = Scheduler([p], budget_mib=150)
+        await s.start()
+        try:
+            await s.preload_on_start([("a", 4096, False)])
+            assert [m.descriptor.modelId for m in s.resident] == ["a"]
+            b = await s.submit("b", LoadOptions())
+            s.release(b)
+            # "once" models are preloaded but evictable like normal.
+            assert [m.descriptor.modelId for m in s.resident] == ["b"]
+            assert s.protected == set()
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_scheduler_preload_always_protects_in_order():
+    async def scenario():
+        p = MemProvider("http://a", {"a": 60, "b": 60, "c": 60})
+        s = Scheduler([p], budget_mib=200)
+        await s.start()
+        try:
+            await s.preload_on_start(
+                [("a", 4096, True), ("b", 4096, False), ("c", 4096, True)]
+            )
+            # Deterministic preload order, released (not in-flight), and the
+            # "always" models are protected from eviction.
+            assert [m.descriptor.modelId for m in s.resident] == ["a", "b", "c"]
+            assert s.protected == {"a", "c"}
+            assert all(s.in_flight[m] == 0 for m in s.resident)
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_scheduler_preload_singular_oom_fails():
+    async def scenario():
+        p = MemProvider("http://a", {"big": 300})
+        s = Scheduler([p], budget_mib=200)
+        await s.start()
+        try:
+            # A singular model that cannot fit the budget fails startup.
+            with pytest.raises(RuntimeError):
+                await s.preload_on_start([("big", 4096, False)])
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_scheduler_impossible_load_raises():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 200})
+        s = Scheduler([p], budget_mib=100)
+        await s.start()
+        try:
+            # A runtime request that is impossible to load is refused with an
+            # error and leaves no half-loaded resident model behind.
+            with pytest.raises(RuntimeError):
+                await s.submit("m1", LoadOptions())
+            assert s.resident == []
+        finally:
+            await s.stop()
+
+    run(scenario())

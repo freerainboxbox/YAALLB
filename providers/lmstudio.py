@@ -142,10 +142,18 @@ class LMStudioProvider(Provider):
                 f"lms load for {model.descriptor.modelId} still loading "
                 f"(status {resp.status_code}); polling for readiness"
             )
-        self._wait_loaded(model)
+        self.wait_loaded(model.descriptor.modelId)
         model._loaded = True
 
-    def _wait_loaded(self, model: BaseModel) -> None:
+    def wait_loaded(self, model_id: str) -> None:
+        """Block until LM Studio reports the given model as loaded.
+
+        Polls the management API until the model appears in the loaded list
+        (bounded by LMS_LOAD_MAX_WAIT). Used by loadModel after a load call
+        that timed out or returned a "still loading" 4XX, and reused at
+        forward time so an LM Studio 404 on /chat/completions is resolved
+        against the model's real readiness signal instead of a blind retry.
+        """
         deadline = time.monotonic() + LMS_LOAD_MAX_WAIT
         while True:
             try:
@@ -155,17 +163,13 @@ class LMStudioProvider(Provider):
                 if resp.status_code == 200:
                     loaded = resp.json().get("models", [])
                     for m in loaded:
-                        if (
-                            m.get("key") == model.descriptor.modelId
-                            and m.get("type") == "llm"
-                        ):
+                        if m.get("key") == model_id and m.get("type") == "llm":
                             return
             except httpx.HTTPError:
                 pass
             if time.monotonic() >= deadline:
                 raise RuntimeError(
-                    f"lms load timed out waiting for "
-                    f"{model.descriptor.modelId} to become ready"
+                    f"lms load timed out waiting for {model_id} to become ready"
                 )
             time.sleep(LMS_LOAD_POLL_INTERVAL)
 

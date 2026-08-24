@@ -104,6 +104,20 @@ request body as defaults when the client didn't specify them:
 }
 ```
 
+A few keys are **YAALLB-internal** — they configure YAALLB behavior and are
+consumed locally, never forwarded to the upstream API:
+
+- `on_start` — `"always"` or `"once"` preloads the model at startup, in
+  config order. `"always"` models are also added to the scheduler's protected
+  set (never evicted); `"once"` models are preloaded but evicted like any
+  other. A singular `on_start` model that cannot fit the VRAM budget fails
+  startup (`red` log + non-zero exit) rather than starting degraded.
+- `allow_non_streaming` — `true` permits serving `stream: false` requests by
+  forwarding them directly (best-effort, no success guarantee) instead of
+  refusing them; the endpoint is streaming-only by default.
+- `supports_streaming` — `false` marks a model that physically cannot stream
+  (e.g. a diffusion LLM); such a model rejects `stream: true` requests.
+
 `vram_limit_mb` (top-level, default `24576`) is the global VRAM budget in
 MiB. When a new load would exceed it, YAALLB picks the **least-impact
 eviction set** from the resident models (those reporting `memory() > 0`):
@@ -134,10 +148,16 @@ body to `{endpoint_uri}/chat/completions` and relays the upstream response
 back. `stream: true` requests are proxied as an SSE stream. The model stays
 in-flight (so it isn't evicted) until the upstream reply completes.
 
-`/v1/chat/completions` is **streaming-only**:
+`/v1/chat/completions` is **streaming-only** by default:
 
 - Requests that don't set `stream: true` are refused with a `400` error
-  (`code: stream_required`) rather than silently downgraded.
+  (`code: stream_required`) rather than silently downgraded, unless the model
+  opts in via `allow_non_streaming: true` in its `model_overrides` — then the
+  request is forwarded once directly, and the upstream status/body is passed
+  through unchanged (best-effort, no success-code guarantee).
+- A model configured `supports_streaming: false` rejects `stream: true`
+  requests with a `400` (`code: model_does_not_support_streaming`), since it
+  physically cannot stream.
 - Every streaming request gets an immediate **prelim SSE event**
   (`{"status": "processing", "model": ..., "choices": []}`) so the client sees
   a `200` and knows YAALLB is awake before the scheduler finishes a

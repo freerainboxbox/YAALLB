@@ -2,6 +2,7 @@ import asyncio
 from collections import defaultdict
 
 import log
+from abstractions.load_options import LoadOptions
 from abstractions.model import Model
 from abstractions.provider import Provider
 from abstractions.routing import lookup_model
@@ -75,6 +76,8 @@ class Scheduler:
         self.resident: list[Model] = []
         self.pending: list[tuple] = []  # (model_id, load_options, future)
         self.in_flight: dict[Model, int] = defaultdict(int)
+        # Model ids that must never be evicted (on_start "always" models).
+        self.protected: set[str] = set()
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
 
@@ -168,7 +171,14 @@ class Scheduler:
             if mem > 0:
                 shortfall = mem - self.current_free()
                 if shortfall > 0:
-                    to_evict = select_evictions(self.resident, shortfall)
+                    # Protected (on_start "always") models are never evicted;
+                    # exclude them so select_evictions raises if they alone
+                    # can't free enough VRAM.
+                    evictable = [
+                        m for m in self.resident
+                        if m.descriptor.modelId not in self.protected
+                    ]
+                    to_evict = select_evictions(evictable, shortfall)
                     log.warning(
                         f"reallocate: new model={model_id} "
                         f"provider={_provider_label(provider)} "
@@ -193,6 +203,25 @@ class Scheduler:
         except Exception:
             self.in_flight[model] -= 1
             raise
+
+    async def preload_on_start(self, targets: list[tuple]) -> None:
+        """Preload on_start models in deterministic order.
+
+        targets is a list of (model_id, ctx_length, protected). protected
+        ('always') models are marked non-evictable before loading; 'once'
+        models are evicted like normal. A model that cannot fit the budget
+        even alone raises RuntimeError, which fails startup.
+        """
+        for model_id, ctx_length, protect in targets:
+            if protect:
+                self.protected.add(model_id)
+            try:
+                model = await self.submit(
+                    model_id, LoadOptions(ctx_length=ctx_length)
+                )
+                self.release(model)
+            except Exception:
+                raise
 
     def _targets(self, model_id: str, eviction_models: list[Model]) -> bool:
         for m in eviction_models:

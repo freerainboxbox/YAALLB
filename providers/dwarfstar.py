@@ -4,6 +4,7 @@ from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model as BaseModel
 from abstractions.provider import Provider
+from abstractions.ready import wait_server_ready
 
 # ds4 cannot answer a native /v1/models while it is spawned/terminated by
 # Python, so its model list is built here. Both model IDs point to the same
@@ -14,6 +15,11 @@ DS4_CONTEXT_LENGTH = 1000000
 DS4_DEFAULT_HOST = "127.0.0.1"
 DS4_DEFAULT_PORT = 8000
 DS4_DEFAULT_BINARY = "./ds4-server"
+
+# How long loadModel waits for the spawned ds4-server to start accepting
+# requests before failing the load. ds4 loads the model at launch, so a 200
+# from /v1/models means the model is resident and ready.
+DS4_READY_TIMEOUT = 120
 
 # Flag registry: config key -> (flag, kind, default). Defaults grabbed from
 # `./ds4-server --help`. `--ctx` is deliberately absent: it comes from
@@ -173,7 +179,22 @@ class DwarfStarProvider(Provider):
         command = self._build_command(model)
         self._process = subprocess.Popen(command, cwd=self.ds4_dir)
         self.resident_model = model
+        # The model is loading until the spawned server actually accepts
+        # requests; only then is it marked loaded (ready).
+        model._loaded = False
+        model._load_state = "loading"
+        try:
+            wait_server_ready(
+                self.endpoint_uri, self._process, "ds4-server", DS4_READY_TIMEOUT
+            )
+        except Exception:
+            # A readiness timeout (or server exit) must not orphan the spawned
+            # ds4-server: terminate it and clear provider state before the
+            # load fails, so a VRAM-holding child isn't leaked.
+            self.unloadModel(model)
+            raise
         model._loaded = True
+        model._load_state = "ready"
 
     def unloadModel(self, model: BaseModel) -> None:
         process = self._process

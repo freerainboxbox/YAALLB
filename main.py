@@ -16,7 +16,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 import log
 from abstractions.load_options import LoadOptions
@@ -44,11 +44,19 @@ PROVIDER_TYPES = {
     "llama_cpp": LlamaCppProvider,
 }
 
+# YAALLB-internal per-model override keys: they configure YAALLB behavior
+# (ctx_length, on_start preload, streaming policy) and must never be forwarded
+# to the upstream chat-completions API.
+INTERNAL_OVERRIDE_KEYS = frozenset(
+    {"ctx_length", "on_start", "allow_non_streaming", "supports_streaming"}
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if SCHEDULER is not None:
         await SCHEDULER.start()
+        await _preload_on_start()
     yield
     if SCHEDULER is not None:
         await SCHEDULER.stop()
@@ -115,6 +123,47 @@ def model_overrides_for(provider: Provider, model_id: str) -> dict:
     """Per-model overrides configured on a provider, or {} if none."""
     overrides = getattr(provider, "model_overrides", None) or {}
     return overrides.get(model_id, {}) or {}
+
+
+def collect_on_start_targets() -> list[tuple]:
+    """Deterministic on_start preload plan.
+
+    Iterates providers in config order and each provider's model_overrides in
+    insertion order. Returns [(model_id, ctx_length, protected)] for models
+    whose on_start is 'always' or 'once'. 'always' models are protected from
+    eviction; 'once' models are preloaded but evicted like normal.
+    """
+    targets = []
+    for provider in PROVIDERS:
+        overrides = getattr(provider, "model_overrides", None) or {}
+        for model_id, ov in overrides.items():
+            on_start = ov.get("on_start")
+            if on_start not in ("always", "once"):
+                continue
+            ctx = ov.get("ctx_length") or DEFAULT_CTX_LENGTH
+            targets.append((model_id, ctx, on_start == "always"))
+    return targets
+
+
+async def _preload_on_start() -> None:
+    targets = collect_on_start_targets()
+    if not targets:
+        return
+    log.info(f"preloading on_start models: {[t[0] for t in targets]}")
+    try:
+        await SCHEDULER.preload_on_start(targets)
+    except Exception as e:
+        # A singular on_start model that cannot fit the VRAM budget (or any
+        # other load error) fails startup: red log.error + non-zero exit
+        # (uvicorn exits STARTUP_FAILURE when lifespan startup raises).
+        log.error(f"on_start preload failed: {e}")
+        # Unload whatever was preloaded so far so spawned providers don't orphan.
+        for model in list(SCHEDULER.resident):
+            try:
+                model.unloadModel()
+            except Exception as ue:
+                log.error(f"failed to unload {model.descriptor.modelId}: {ue}")
+        raise
 
 
 def read_iogpu_wired_limit() -> int | None:
@@ -214,29 +263,93 @@ def _bump_startup_failures(provider: Provider, detail: str) -> int:
     return failures
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(body: dict):
-    model_id = body.get("model")
+async def _forward_non_streaming(
+    model_id: str,
+    overrides: dict,
+    ctx_length: int,
+    body: dict,
+):
+    """Best-effort direct forward for models that allow non-streaming.
 
-    # The endpoint is streaming-only: a non-200 body would be rejected by the
-    # client, so refuse non-streaming requests up front instead of silently
-    # downgrading them.
-    if not body.get("stream", False):
-        log.warning(f"chat request model={model_id} rejected: stream required")
+    Schedules/loads the model, forwards the request once to the downstream
+    API, and returns the upstream status/body as-is. There is no prelim SSE,
+    no startup-failure retry loop, and no success-code guarantee: a non-200
+    upstream is passed through unchanged.
+    """
+    try:
+        model = await SCHEDULER.submit(
+            model_id, LoadOptions(ctx_length=ctx_length)
+        )
+    except ModelNotFound:
+        log.error(f"model not found: {model_id}")
         return JSONResponse(
-            status_code=400,
+            status_code=404,
             content={
                 "error": {
                     "message": (
-                        "streaming must be enabled (stream=true) for this "
-                        "endpoint to work"
+                        f"The model `{model_id}` does not exist or you do not "
+                        "have access to it."
                     ),
                     "type": "invalid_request_error",
-                    "param": "stream",
-                    "code": "stream_required",
+                    "param": None,
+                    "code": "model_not_found",
                 }
             },
         )
+    except Exception as e:
+        # A load failure (VRAM exhaustion, impossible-to-load model, ...) is
+        # refused with an error; it never kills the YAALLB process.
+        log.error(f"model load failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": f"failed to load model `{model_id}`: {e}",
+                    "type": "server_error",
+                    "param": None,
+                    "code": "model_load_failed",
+                }
+            },
+        )
+
+    # Apply generation-param model overrides as defaults; force non-streaming
+    # upstream. YAALLB-internal keys (ctx_length, on_start, streaming policy)
+    # are filtered out so they never leak onto the wire.
+    forward_body = dict(body)
+    for key, value in overrides.items():
+        if key in INTERNAL_OVERRIDE_KEYS:
+            continue
+        forward_body.setdefault(key, value)
+    forward_body["stream"] = False
+
+    provider = model.descriptor.provider
+    log.info(
+        f"chat request model={model_id} "
+        f"provider={provider._type_id}#{getattr(provider, '_instance_id', 0)} "
+        f"stream=false ctx={ctx_length}"
+    )
+
+    url = provider.endpoint_uri + "/chat/completions"
+    headers = provider._auth_headers()
+
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            upstream = await client.post(url, json=forward_body, headers=headers)
+    finally:
+        # Always release the scheduled model, even if the upstream post raises
+        # (network error, upstream reset): otherwise it stays resident with
+        # in_flight=1 forever, wedging eviction and hanging stop()'s drain.
+        SCHEDULER.release(model)
+    return Response(
+        upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(body: dict):
+    model_id = body.get("model")
 
     # lookup_model hits provider HTTP on a descriptor-cache miss (LM Studio),
     # so keep it off the event loop.
@@ -244,6 +357,59 @@ async def chat_completions(body: dict):
     overrides = model_overrides_for(provider, model_id) if provider else {}
     default_ctx = overrides.get("ctx_length") or DEFAULT_CTX_LENGTH
     ctx_length = body.get("context_length") or default_ctx
+
+    # Streaming-mode decision. By default the endpoint is streaming-only. A
+    # model may opt out via per-model overrides:
+    #   - allow_non_streaming=true permits serving stream=false requests by
+    #     forwarding them directly (best-effort, no success guarantee).
+    #   - supports_streaming=false marks a model that physically cannot stream
+    #     (e.g. diffusion LLMs); such a model must reject stream=true.
+    client_stream = bool(body.get("stream", False))
+    supports_streaming = overrides.get("supports_streaming")  # None -> assume True
+    allow_non_streaming = overrides.get("allow_non_streaming")  # None -> False
+
+    if not client_stream:
+        # Non-streaming request: serve directly only if the model explicitly
+        # allows it; otherwise refuse (streaming-only by default).
+        if allow_non_streaming is not True:
+            log.warning(f"chat request model={model_id} rejected: stream required")
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": (
+                            "streaming must be enabled (stream=true) for this "
+                            "endpoint to work"
+                        ),
+                        "type": "invalid_request_error",
+                        "param": "stream",
+                        "code": "stream_required",
+                    }
+                },
+            )
+        return await _forward_non_streaming(
+            model_id, overrides, ctx_length, body
+        )
+
+    # Streaming request: refuse if the model is known not to support streaming.
+    if supports_streaming is False:
+        log.warning(
+            f"chat request model={model_id} rejected: model does not stream"
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": (
+                        f"model `{model_id}` does not support streaming; "
+                        "send stream=false"
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "stream",
+                    "code": "model_does_not_support_streaming",
+                }
+            },
+        )
 
     async def event_stream():
         # Prelim event so the client sees a 200 and knows YAALLB is awake
@@ -274,11 +440,13 @@ async def chat_completions(body: dict):
             )
             return
 
-        # Apply non-ctx model overrides (temperature, top_p, ...) as defaults
-        # when the client didn't specify them; they ride along in the body.
+        # Apply generation-param model overrides (temperature, top_p, ...) as
+        # defaults when the client didn't specify them; they ride along in the
+        # body. YAALLB-internal keys (ctx_length, on_start, streaming policy)
+        # are filtered out so they never leak onto the wire.
         forward_body = dict(body)
         for key, value in overrides.items():
-            if key == "ctx_length":
+            if key in INTERNAL_OVERRIDE_KEYS:
                 continue
             forward_body.setdefault(key, value)
         forward_body["stream"] = True
@@ -296,6 +464,15 @@ async def chat_completions(body: dict):
         # Forward as an SSE stream, retrying transient failures internally
         # (bounded by STARTUP_ATTEMPTS) instead of surfacing a 503/500 or an
         # LM Studio "still loading" 4XX. Exhaustion becomes an SSE error event.
+        #
+        # LM Studio's 404/4XX on an unloaded model is NOT a provider startup
+        # problem: the model is loading in the background. Resolve it against
+        # the model's real readiness signal (wait_loaded) rather than a blind
+        # retry budget, so a slow background load doesn't exhaust the retry
+        # budget and SSE-error while LM Studio later completes the request
+        # "into the void".
+        failures = 0
+        ready_retries = 0
         while True:
             client = httpx.AsyncClient(timeout=None)
             try:
@@ -307,17 +484,91 @@ async def chat_completions(body: dict):
                 )
             except httpx.HTTPError as e:
                 await client.aclose()
+                # A spawned provider (llama_cpp/ds4) not answering means its
+                # model isn't actually ready yet; track that load state.
+                if provider._type_id in ("llama_cpp", "ds4"):
+                    model._load_state = "loading"
                 failures = _bump_startup_failures(provider, f"connection error: {e}")
             else:
-                if upstream.status_code != 200:
-                    await client.aclose()
-                    failures = _bump_startup_failures(
-                        provider, f"upstream status {upstream.status_code}"
-                    )
-                else:
+                if upstream.status_code == 200:
                     provider.startup_failures = 0
+                    # A spawned provider that transiently 4XX'd/errored was
+                    # marked "loading"; a successful forward means it is ready.
+                    if provider._type_id in ("llama_cpp", "ds4"):
+                        model._load_state = "ready"
                     break
 
+                if provider._type_id == "lms":
+                    # LM Studio's "still loading" signal is a 404 on
+                    # /chat/completions; anything else is a genuine upstream
+                    # error. Distinguish them so a slow background load doesn't
+                    # exhaust the retry budget (404) while a malformed request
+                    # or over-long prompt doesn't fire a hot loop of duplicate
+                    # retries and misreport as "model not ready" (other 4XX).
+                    if upstream.status_code == 404:
+                        await client.aclose()
+                        try:
+                            await asyncio.to_thread(
+                                provider.wait_loaded, model.descriptor.modelId
+                            )
+                        except Exception as e:
+                            log.error(
+                                f"model {model_id} never became ready on "
+                                f"{provider.endpoint_uri}: {e}"
+                            )
+                            SCHEDULER.release(model)
+                            yield _sse_error(
+                                "model_not_ready",
+                                f"model `{model_id}` never became ready: {e}",
+                            )
+                            return
+                        ready_retries += 1
+                        if ready_retries >= STARTUP_ATTEMPTS:
+                            log.error(
+                                f"model {model_id} kept returning "
+                                f"{upstream.status_code} on "
+                                f"{provider.endpoint_uri} after "
+                                f"{STARTUP_ATTEMPTS} readiness waits"
+                            )
+                            SCHEDULER.release(model)
+                            yield _sse_error(
+                                "model_not_ready",
+                                f"model `{model_id}` is not ready on "
+                                f"{provider.endpoint_uri}",
+                            )
+                            return
+                        continue
+                    # Any other non-200 (400 malformed request, 422 context
+                    # overflow, 401 auth, 5XX) is a genuine upstream error, not
+                    # a readiness signal: relay the upstream error body as an
+                    # SSE error instead of retrying in a hot loop. (Named
+                    # err_body — NOT `body`, which shadows the request-body
+                    # parameter and would trip UnboundLocalError in this scope.)
+                    err_body = b""
+                    try:
+                        async for chunk in upstream.aiter_raw():
+                            err_body += chunk
+                    except httpx.HTTPError:
+                        err_body = b""
+                    await client.aclose()
+                    SCHEDULER.release(model)
+                    yield _sse_error(
+                        "upstream_error",
+                        f"upstream {provider.endpoint_uri} returned "
+                        f"{upstream.status_code}: "
+                        f"{err_body.decode(errors='replace')[:512]}",
+                    )
+                    return
+
+                await client.aclose()
+                # A spawned provider (llama_cpp/ds4) returning non-200 means
+                # its model isn't actually ready yet; track that load state so
+                # the retry below continues until the readiness gate says ready.
+                if provider._type_id in ("llama_cpp", "ds4"):
+                    model._load_state = "loading"
+                failures = _bump_startup_failures(
+                    provider, f"upstream status {upstream.status_code}"
+                )
             if failures < STARTUP_ATTEMPTS:
                 await asyncio.sleep(2)
                 continue
@@ -326,10 +577,21 @@ async def chat_completions(body: dict):
                 f"after {STARTUP_ATTEMPTS} attempts"
             )
             SCHEDULER.release(model)
-            yield _sse_error(
-                "provider_start_failed",
-                f"provider {provider.endpoint_uri} failed to start",
-            )
+            # Read the tracked load state to classify the exhaustion: a spawned
+            # provider whose model never became ready (load_state still
+            # "loading") is a readiness failure (model_not_ready), not a
+            # generic provider-start failure.
+            if provider._type_id in ("llama_cpp", "ds4") and model.load_state != "ready":
+                yield _sse_error(
+                    "model_not_ready",
+                    f"model `{model_id}` is not ready on "
+                    f"{provider.endpoint_uri}",
+                )
+            else:
+                yield _sse_error(
+                    "provider_start_failed",
+                    f"provider {provider.endpoint_uri} failed to start",
+                )
             return
 
         # Relay the upstream SSE stream chunk-for-chunk.

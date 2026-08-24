@@ -302,6 +302,131 @@ def test_chat_completions_success_resets_startup_failures(monkeypatch):
     assert prov_a.startup_failures == 0
 
 
+def test_chat_completions_lmstudio_404_waits_ready_then_succeeds(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a._type_id = "lms"
+    waited = []
+    prov_a.wait_loaded = lambda model_id: waited.append(model_id)
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    class FlakyClient:
+        def __init__(self):
+            self.calls = []
+            self.responses = [404, 200]
+
+        async def aclose(self):
+            pass
+
+        def build_request(self, method, url, json, headers):
+            return {"url": url, "json": json, "headers": headers}
+
+        async def send(self, req, stream=False):
+            self.calls.append(("send", req["url"], req["json"], req["headers"]))
+            status = self.responses.pop(0)
+            if status == 404:
+                class R:
+                    status_code = 404
+                    headers = {"content-type": "text/event-stream"}
+
+                return R()
+            return FakeStreamResponse()
+
+    fake = FlakyClient()
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions", json={"model": "model-a", "messages": [], "stream": True}
+        )
+
+    # An LM Studio "still loading" 404 must NOT be treated as a startup
+    # failure: YAALLB blocks on the model's real readiness signal, then
+    # retries and succeeds. startup_failures is never bumped.
+    assert resp.status_code == 200
+    assert resp.content.endswith(b'data: {"x":1}\n\ndata: [DONE]\n\n')
+    assert waited == ["model-a"]
+    assert len(fake.calls) == 2
+    assert getattr(prov_a, "startup_failures", 0) == 0
+
+
+def test_chat_completions_lmstudio_404_never_ready_sse_error(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a._type_id = "lms"
+
+    def failing_wait(model_id):
+        raise RuntimeError("never ready")
+
+    prov_a.wait_loaded = failing_wait
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    class Always404:
+        status_code = 404
+        headers = {"content-type": "text/event-stream"}
+
+    fake = FakeAsyncClient(stream=Always404())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions", json={"model": "model-a", "messages": [], "stream": True}
+        )
+
+    # A 404 that never becomes ready surfaces a distinct SSE error, NOT the
+    # generic provider_start_failed (which conflates it with provider startup).
+    assert resp.status_code == 200
+    assert b'"code": "model_not_ready"' in resp.content
+    assert getattr(prov_a, "startup_failures", 0) == 0
+
+
+def test_chat_completions_lmstudio_400_relayed_not_retried(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a._type_id = "lms"
+    waited = []
+    prov_a.wait_loaded = lambda model_id: waited.append(model_id)
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    calls = []
+
+    class ErrorResp:
+        status_code = 400
+        headers = {"content-type": "application/json"}
+
+        async def aiter_raw(self):
+            yield b'{"error":{"message":"bad request"}}'
+
+    class OneShotClient:
+        async def aclose(self):
+            pass
+
+        def build_request(self, method, url, json, headers):
+            return {"url": url, "json": json, "headers": headers}
+
+        async def send(self, req, stream=False):
+            calls.append(("send", req["url"], req["json"]))
+            return ErrorResp()
+
+    fake = OneShotClient()
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": True},
+        )
+
+    # A genuine LM Studio 400 (malformed request / context overflow) is relayed
+    # as an SSE upstream_error, NOT retried in a hot loop or misreported as
+    # model_not_ready; wait_loaded is never consulted for a non-404.
+    assert resp.status_code == 200
+    assert b'"code": "upstream_error"' in resp.content
+    assert b"bad request" in resp.content
+    assert waited == []
+    assert len(calls) == 1
+
+
 def test_chat_completions_streams_sse(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     main.PROVIDERS = [prov_a]
@@ -340,6 +465,224 @@ def test_chat_completions_rejects_stream_false():
     assert body["code"] == "stream_required"
     assert body["param"] == "stream"
     assert "stream" in body["message"]
+
+
+def test_chat_completions_non_streaming_direct_forward_passthrough(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"allow_non_streaming": True}}
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    resp404 = FakeResponse(
+        content=b'{"error":"boom"}', status_code=404, content_type="application/json"
+    )
+    fake = FakeAsyncClient(nonstream=resp404, stream=FakeStreamResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": False},
+        )
+
+    # Direct forward returns the upstream status/body as-is (no success
+    # guarantee, no SSE, no retry loop).
+    assert resp.status_code == 404
+    assert resp.content == b'{"error":"boom"}'
+    method, url, json, headers = fake.calls[0]
+    assert method == "post"
+    assert url == "http://a.example/v1/chat/completions"
+    assert json["stream"] is False
+    # Model is released once the direct forward completes.
+    assert main.SCHEDULER.in_flight[main.SCHEDULER.resident[0]] == 0
+
+
+def test_chat_completions_allow_non_streaming_keeps_streaming(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"allow_non_streaming": True}}
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": True},
+        )
+
+    # allow_non_streaming does NOT downgrade an explicit stream=true request.
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert fake.calls[0][0] == "send"
+
+
+def test_chat_completions_non_streaming_model_rejects_stream(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"supports_streaming": False}}
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": True},
+        )
+
+    # A model that cannot stream must error out on a stream=true request.
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "model_does_not_support_streaming"
+
+
+def test_chat_completions_non_streaming_model_requires_allow_non_streaming(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"supports_streaming": False}}
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": False},
+        )
+
+    # A non-streaming model needs allow_non_streaming=true to serve stream=false.
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "stream_required"
+
+
+def test_chat_completions_non_streaming_model_with_allow_forwards(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {
+        "model-a": {"supports_streaming": False, "allow_non_streaming": True}
+    }
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    resp404 = FakeResponse(
+        content=b'{"error":"boom"}', status_code=404, content_type="application/json"
+    )
+    fake = FakeAsyncClient(nonstream=resp404, stream=FakeStreamResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": False},
+        )
+
+    # A non-streaming model with allow_non_streaming=true serves stream=false
+    # via the direct-forward path (upstream status passed through as-is).
+    assert resp.status_code == 404
+    assert resp.content == b'{"error":"boom"}'
+    assert fake.calls[0][0] == "post"
+
+
+def test_chat_completions_non_streaming_load_failure_json():
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"allow_non_streaming": True}}
+
+    def failing_load(model):
+        raise RuntimeError("boom load")
+
+    prov_a.loadModel = failing_load
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": False},
+        )
+
+    # A non-streaming direct forward that cannot load the model returns a JSON
+    # error (503) instead of killing the YAALLB process.
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "model_load_failed"
+
+
+def test_chat_completions_non_streaming_upstream_error_releases_model(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {"model-a": {"allow_non_streaming": True}}
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    class RaisingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def aclose(self):
+            pass
+
+        async def post(self, url, json, headers):
+            raise httpx.ConnectError("upstream not up")
+
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: RaisingClient())
+
+    with pytest.raises(Exception):
+        with TestClient(main.app) as client:
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "model-a", "messages": [], "stream": False},
+            )
+
+    # An upstream post raising must still release the scheduled model: it must
+    # not stay resident with in_flight=1 forever (eviction wedged, stop() drain
+    # hangs).
+    assert len(main.SCHEDULER.resident) == 1
+    assert main.SCHEDULER.in_flight[main.SCHEDULER.resident[0]] == 0
+
+
+def test_chat_completions_spawned_provider_ready_resets_load_state(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a._type_id = "llama_cpp"
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    class FlakyClient:
+        def __init__(self):
+            self.calls = []
+            self.responses = [503, 200]
+
+        async def aclose(self):
+            pass
+
+        def build_request(self, method, url, json, headers):
+            return {"url": url, "json": json, "headers": headers}
+
+        async def send(self, req, stream=False):
+            self.calls.append(("send", req["url"], req["json"], req["headers"]))
+            status = self.responses.pop(0)
+            if status == 503:
+                class R:
+                    status_code = 503
+                    headers = {"content-type": "text/event-stream"}
+
+                return R()
+            return FakeStreamResponse()
+
+    fake = FlakyClient()
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    async def no_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("main.asyncio.sleep", no_sleep)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions", json={"model": "model-a", "messages": [], "stream": True}
+        )
+
+    # A spawned provider that transiently 4XX'd is marked "loading"; a
+    # successful retry must reset it back to "ready".
+    assert resp.status_code == 200
+    assert main.SCHEDULER.resident[0].load_state == "ready"
+    assert len(fake.calls) == 2
 
 
 def test_graceful_shutdown_unloads_resident_models(monkeypatch):
@@ -490,10 +833,13 @@ def test_dwarfstar_getoaimodels_hardcoded(monkeypatch):
 def test_dwarfstar_resident_model_and_context(monkeypatch):
     from providers.dwarfstar import DwarfStarProvider
 
-    def no_network(url):
-        raise AssertionError("should not hit the network")
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 200
 
-    monkeypatch.setattr("httpx.get", no_network)
+        return Resp()
+
+    monkeypatch.setattr("httpx.get", fake_get)
 
     class FakeProcess:
         def terminate(self):
@@ -503,7 +849,7 @@ def test_dwarfstar_resident_model_and_context(monkeypatch):
             pass
 
         def poll(self):
-            return 0
+            return None
 
         def kill(self):
             pass
@@ -697,7 +1043,7 @@ def test_dwarfstar_load_spawns_process(monkeypatch):
             pass
 
         def poll(self):
-            return 0
+            return None
 
         def kill(self):
             pass
@@ -707,7 +1053,14 @@ def test_dwarfstar_load_spawns_process(monkeypatch):
         spawned["kwargs"] = kwargs
         return FakeProcess()
 
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 200
+
+        return Resp()
+
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
 
     provider = DwarfStarProvider(
         config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf", "ctx_length": 4096}
@@ -757,10 +1110,17 @@ def test_dwarfstar_unload_kills_on_terminate_timeout(monkeypatch):
         def kill(self):
             self.killed = True
 
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 200
+
+        return Resp()
+
     proc = FakeProcess()
     monkeypatch.setattr(
         "providers.dwarfstar.subprocess.Popen", lambda *a, **kw: proc
     )
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
 
     provider = DwarfStarProvider(
         config={"ds4_dir": "/tmp/ds4", "gguf_path": "model.gguf"}
@@ -789,6 +1149,102 @@ def test_dwarfstar_load_requires_ds4_dir_and_gguf_path():
     )
     with pytest.raises(ValueError):
         provider.loadModel(model)
+
+
+def test_dwarfstar_load_waits_for_server_ready(monkeypatch):
+    import subprocess
+    from providers.dwarfstar import DwarfStarProvider
+
+    class FakeProcess:
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=0):
+            pass
+
+        def kill(self):
+            pass
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: FakeProcess())
+
+    calls = []
+    statuses = iter([503, 503, 200])
+
+    def fake_get(url, headers=None):
+        calls.append(url)
+        class Resp:
+            status_code = next(statuses)
+
+        return Resp()
+
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
+    monkeypatch.setattr("abstractions.ready.time.sleep", lambda *a: None)
+
+    provider = DwarfStarProvider(
+        config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf"}
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    )
+    provider.loadModel(model)
+
+    # loadModel blocks until the spawned ds4-server actually accepts requests;
+    # only then is the model marked loaded (ready), not immediately on spawn.
+    assert model.loaded
+    assert model.load_state == "ready"
+    assert all(c.endswith("/v1/models") for c in calls)
+    assert len(calls) == 3
+
+
+def test_dwarfstar_load_ready_timeout_raises(monkeypatch):
+    import subprocess
+    from providers.dwarfstar import DwarfStarProvider
+
+    class FakeProcess:
+        def __init__(self):
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=0):
+            pass
+
+        def kill(self):
+            pass
+
+        def poll(self):
+            return None
+
+    proc = FakeProcess()
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: proc)
+
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 503
+
+        return Resp()
+
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
+    monkeypatch.setattr("abstractions.ready.time.sleep", lambda *a: None)
+    monkeypatch.setattr("providers.dwarfstar.DS4_READY_TIMEOUT", 0.01)
+
+    provider = DwarfStarProvider(
+        config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf"}
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    )
+    with pytest.raises(RuntimeError):
+        provider.loadModel(model)
+
+    # A readiness timeout must terminate the spawned server, not orphan it.
+    assert proc.terminated
+    assert not model.loaded
+    assert model.load_state == "loading"
 
 
 def test_provider_type_ids():
@@ -1043,6 +1499,40 @@ def test_model_overrides_for():
     assert main.model_overrides_for(FakeProvider("http://b/v1", ["x"]), "x") == {}
 
 
+def test_collect_on_start_targets():
+    prov_a = FakeProvider("http://a.example/v1", ["a", "b", "c"])
+    prov_a.model_overrides = {
+        "a": {"on_start": "always", "ctx_length": 4096},
+        "b": {"on_start": "once", "ctx_length": 8192},
+        "c": {"temperature": 0.5},  # no on_start -> skipped
+    }
+    main.PROVIDERS = [prov_a]
+
+    targets = main.collect_on_start_targets()
+    # Deterministic: provider order, then model_overrides insertion order.
+    assert targets == [("a", 4096, True), ("b", 8192, False)]
+
+
+def test_lifespan_preloads_on_start_models():
+    prov_a = FakeProvider("http://a.example/v1", ["model-a", "model-b"])
+    prov_a.model_overrides = {
+        "model-a": {"on_start": "always"},
+        "model-b": {"on_start": "once"},
+    }
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    with TestClient(main.app) as client:
+        # lifespan startup preloads on_start models in order, released (not
+        # in-flight), and marks "always" models protected.
+        ids = [m.descriptor.modelId for m in main.SCHEDULER.resident]
+        assert ids == ["model-a", "model-b"]
+        assert main.SCHEDULER.protected == {"model-a"}
+        assert all(
+            main.SCHEDULER.in_flight[m] == 0 for m in main.SCHEDULER.resident
+        )
+
+
 def test_chat_completions_applies_ctx_and_override(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     prov_a.model_overrides = {"model-a": {"ctx_length": 8192, "temperature": 0.7}}
@@ -1066,6 +1556,69 @@ def test_chat_completions_applies_ctx_and_override(monkeypatch):
     assert json["temperature"] == 0.7
     # ctx_length itself is not forwarded to the upstream.
     assert "ctx_length" not in json
+
+
+def test_chat_completions_filters_internal_override_keys(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {
+        "model-a": {
+            "ctx_length": 8192,
+            "on_start": "always",
+            "allow_non_streaming": True,
+            "supports_streaming": True,
+            "temperature": 0.7,
+        }
+    }
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": True},
+        )
+
+    assert resp.status_code == 200
+    method, url, json, headers = fake.calls[0]
+    # Generation params still ride along as defaults...
+    assert json["temperature"] == 0.7
+    # ...but YAALLB-internal keys must never leak onto the wire.
+    for key in ("ctx_length", "on_start", "allow_non_streaming", "supports_streaming"):
+        assert key not in json
+
+
+def test_chat_completions_non_streaming_filters_internal_override_keys(monkeypatch):
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a.model_overrides = {
+        "model-a": {
+            "ctx_length": 8192,
+            "on_start": "always",
+            "allow_non_streaming": True,
+            "supports_streaming": False,
+            "temperature": 0.7,
+        }
+    }
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(nonstream=FakeResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": False},
+        )
+
+    assert resp.status_code == 200
+    method, url, json, headers = fake.calls[0]
+    assert json["temperature"] == 0.7
+    assert json["stream"] is False
+    for key in ("ctx_length", "on_start", "allow_non_streaming", "supports_streaming"):
+        assert key not in json
 
 
 def test_chat_completions_client_ctx_wins_over_override(monkeypatch):

@@ -13,6 +13,10 @@ class Model(ABC):
         self.descriptor = descriptor
         self.loadOptions = loadOptions
         self._loaded = False
+        # Track load progress: "loading" while a spawned/remote provider is
+        # still becoming ready, "ready" once it accepts requests, "failed"
+        # on a load/readiness error.
+        self._load_state = "loading"
 
     def load(self) -> None:
         self.descriptor.provider.loadModel(self)
@@ -23,6 +27,10 @@ class Model(ABC):
     @property
     def loaded(self) -> bool:
         return self._loaded
+
+    @property
+    def load_state(self) -> str:
+        return self._load_state
 
     @abstractmethod
     def memory(self) -> float:

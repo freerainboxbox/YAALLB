@@ -7,6 +7,7 @@ from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model as BaseModel
 from abstractions.provider import Provider
+from abstractions.ready import wait_server_ready
 
 # llama_cpp is a single-model provider: it serves one gguf_path, which maps to
 # a single OAI model ID given by the mandatory `alias` config key (unlike lms,
@@ -23,6 +24,11 @@ SERVER_BINARY = "llama-server"
 
 # llama-server terminate grace period before escalating to SIGKILL on unload.
 UNLOAD_TERMINATE_TIMEOUT = 10.0
+
+# How long loadModel waits for the spawned llama-server to start accepting
+# requests before failing the load. llama-server loads the model at launch, so
+# a 200 from /v1/models means the model is resident and ready.
+LLAMA_CPP_READY_TIMEOUT = 120
 
 # Flag registry: config key -> (flag, kind, default). These are the "core
 # options" — the memory-affecting flags that BOTH llama-server and
@@ -257,7 +263,22 @@ class LlamaCppProvider(Provider):
         command = self._build_command(model)
         self._process = subprocess.Popen(command, cwd=self.llama_cpp_dir)
         self.resident_model = model
+        # The model is loading until the spawned server actually accepts
+        # requests; only then is it marked loaded (ready).
+        model._loaded = False
+        model._load_state = "loading"
+        try:
+            wait_server_ready(
+                self.endpoint_uri, self._process, "llama-server", LLAMA_CPP_READY_TIMEOUT
+            )
+        except Exception:
+            # A readiness timeout (or server exit) must not orphan the spawned
+            # llama-server: terminate it and clear provider state before the
+            # load fails, so a VRAM-holding child isn't leaked.
+            self.unloadModel(model)
+            raise
         model._loaded = True
+        model._load_state = "ready"
 
     def unloadModel(self, model: BaseModel) -> None:
         process = self._process
