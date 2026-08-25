@@ -12,3 +12,9 @@ dependencies = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "mlx>=0.32.2",
+    "mlx-lm>=0.31.3",
+]
