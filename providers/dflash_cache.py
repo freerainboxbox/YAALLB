@@ -136,7 +136,7 @@ def ensure_dflash_cache(
         _attach(cached, providers)
         return cached
 
-    dflash_providers = [p for p in providers if p._type_id == "dflash"]
+    dflash_providers = [p for p in providers if p._type_id == "dflash-mlx"]
     if not dflash_providers:
         log.info("no dflash providers configured; skipping VRAM cache build")
         return {"dflash-mlx": {}}
@@ -155,7 +155,7 @@ def ensure_dflash_cache(
             continue
         log.info(
             f"precomputing dflash VRAM impact model={model_id} "
-            f"provider=dflash#{getattr(provider, '_instance_id', 0)}"
+            f"provider={provider._type_id}#{getattr(provider, '_instance_id', 0)}"
         )
         impact = compute_impact(
             provider.model_ref, getattr(provider, "draft_ref", None), compute_weights
@@ -173,7 +173,7 @@ def ensure_dflash_cache(
 
 
 def _attach(cache: dict, providers) -> None:
-    """Attach the cache to each dflash provider for ``Model.memory()``."""
+    """Attach the cache to each dflash-mlx provider for ``Model.memory()``."""
     for provider in providers:
-        if provider._type_id == "dflash":
+        if provider._type_id == "dflash-mlx":
             provider._vram_cache = cache

@@ -484,13 +484,13 @@ binary from a working directory.
 | `port`       | `8000`      | no — dflash bind port, also the reverse-proxy target                           |
 | `binary`     | `dflash`    | no — program to run (resolved via PATH)                                        |
 | `ctx_length` | —           | no — provider-level context length, overrides the per-model one                |
-| `options`    | `{}`        | no — overrides for `dflash serve` flags (metal limits, quant, diagnostics)     |
+| `options`    | `{}`        | no — overrides for memory-affecting `dflash serve` flags (metal limits, draft quant, KV-cache quant, draft cache sizes) |
 
 Example:
 
 ```json
 {
-  "dflash": [
+  "dflash-mlx": [
     {
       "dflash_dir": "/path/to/dflash-mlx",
       "model_ref": "/path/to/qwen-gdn",
@@ -498,11 +498,21 @@ Example:
       "host": "127.0.0.1",
       "port": 9000,
       "alias": "qwen-gdn",
-      "options": { "wired_limit": 128 }
+      "options": { "wired_limit": "48GB" }
     }
   ]
 }
 ```
+
+`options` keys are memory-affecting `dflash serve` flags with dashes turned
+into underscores (emitted only when they differ from the CLI default):
+`wired_limit` (`--wired-limit`, default `auto`), `cache_limit`
+(`--cache-limit`), `draft_quant` (`--draft-quant`), `quantize_kv_cache`
+(`--quantize-kv-cache`), `draft_sink_size` (`--draft-sink-size`, default
+`64`), `draft_window_size` (`--draft-window-size`, default `1024`),
+`draft_full_context_min_ctx` (`--draft-full-context-min-ctx`, default
+`16384`). `--wired-limit`/`--cache-limit` accept raw bytes or suffixes like
+`48GB`.
 
 YAALLB spawns it as:
 

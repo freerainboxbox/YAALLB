@@ -20,7 +20,7 @@ def _provider(alias="m1", model_ref="/tmp/t", draft_ref="/tmp/d"):
         "DflashP",
         (),
         {
-            "_type_id": "dflash",
+            "_type_id": "dflash-mlx",
             "_instance_id": 0,
             "alias": alias,
             "model_ref": model_ref,

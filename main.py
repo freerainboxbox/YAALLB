@@ -44,7 +44,7 @@ PROVIDER_TYPES = {
     "lms": LMStudioProvider,
     "ds4": DwarfStarProvider,
     "llama_cpp": LlamaCppProvider,
-    "dflash": DflashProvider,
+    "dflash-mlx": DflashProvider,
 }
 
 # YAALLB-internal per-model override keys: they configure YAALLB behavior
@@ -487,9 +487,9 @@ async def chat_completions(body: dict):
                 )
             except httpx.HTTPError as e:
                 await client.aclose()
-                # A spawned provider (llama_cpp/ds4) not answering means its
-                # model isn't actually ready yet; track that load state.
-                if provider._type_id in ("llama_cpp", "ds4"):
+                # A spawned provider (llama_cpp/ds4/dflash-mlx) not answering
+                # means its model isn't actually ready yet; track that load state.
+                if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx"):
                     model._load_state = "loading"
                 failures = _bump_startup_failures(provider, f"connection error: {e}")
             else:
@@ -497,7 +497,7 @@ async def chat_completions(body: dict):
                     provider.startup_failures = 0
                     # A spawned provider that transiently 4XX'd/errored was
                     # marked "loading"; a successful forward means it is ready.
-                    if provider._type_id in ("llama_cpp", "ds4"):
+                    if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx"):
                         model._load_state = "ready"
                     break
 
@@ -564,10 +564,10 @@ async def chat_completions(body: dict):
                     return
 
                 await client.aclose()
-                # A spawned provider (llama_cpp/ds4) returning non-200 means
-                # its model isn't actually ready yet; track that load state so
-                # the retry below continues until the readiness gate says ready.
-                if provider._type_id in ("llama_cpp", "ds4"):
+                # A spawned provider (llama_cpp/ds4/dflash-mlx) returning
+                # non-200 means its model isn't actually ready yet; track that
+                # load state so the retry below continues until readiness.
+                if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx"):
                     model._load_state = "loading"
                 failures = _bump_startup_failures(
                     provider, f"upstream status {upstream.status_code}"
@@ -584,7 +584,7 @@ async def chat_completions(body: dict):
             # provider whose model never became ready (load_state still
             # "loading") is a readiness failure (model_not_ready), not a
             # generic provider-start failure.
-            if provider._type_id in ("llama_cpp", "ds4") and model.load_state != "ready":
+            if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx") and model.load_state != "ready":
                 yield _sse_error(
                     "model_not_ready",
                     f"model `{model_id}` is not ready on "

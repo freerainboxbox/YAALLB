@@ -144,7 +144,7 @@ def test_build_command(tmp_path):
         host="0.0.0.0",
         port=9999,
         draft_ref=str(tmp_path / "d"),
-        options={"wired_limit": 128, "diagnostics": True},
+        options={"wired_limit": "48GB", "quantize_kv_cache": True},
     )
     cmd = p._build_command(_model(p))
     assert cmd[:3] == ["dflash", "serve", "--model"]
@@ -152,17 +152,19 @@ def test_build_command(tmp_path):
     assert "--host" in cmd and "0.0.0.0" in cmd
     assert "--port" in cmd and "9999" in cmd
     assert "--draft-model" in cmd and str(tmp_path / "d") in cmd
-    assert "--wired-limit" in cmd and "128" in cmd
-    assert "--diagnostics" in cmd
+    assert "--wired-limit" in cmd and "48GB" in cmd
+    assert "--quantize-kv-cache" in cmd
 
 
 def test_build_command_omits_defaults(tmp_path):
     p = _provider_with(tmp_path, alias="m1")
     cmd = p._build_command(_model(p))
-    # default host/port and absent draft/options are not emitted
+    # default host/port, absent draft/options, and default wired-limit ("auto")
+    # are not emitted
     assert "--host" not in cmd
     assert "--port" not in cmd
     assert "--draft-model" not in cmd
+    assert "--wired-limit" not in cmd
 
 
 # --------------------------------------------------------------------------- #

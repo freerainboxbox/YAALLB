@@ -30,12 +30,18 @@ UNLOAD_TERMINATE_TIMEOUT = 10.0
 UNLOAD_SIGTERM_TIMEOUT = 5.0
 
 # Flag registry for `dflash serve` (dflash_mlx/server/config.py build_parser):
-# config key -> (flag, kind, default). Metal limits, quant, diagnostics.
+# config key -> (flag, kind, default). Memory-affecting flags only (the
+# estimate stays in sync with the actual configuration): metal limits, draft
+# quant, KV-cache quant, and the draft cache structure sizes. --wired-limit
+# default is the string "auto" (metavar auto|none|BYTES).
 DFLASH_OPTIONS = {
-    "wired_limit": ("--wired-limit", "value", None),
+    "wired_limit": ("--wired-limit", "value", "auto"),
     "cache_limit": ("--cache-limit", "value", None),
-    "quant": ("--quant", "value", None),
-    "diagnostics": ("--diagnostics", "flag", False),
+    "draft_quant": ("--draft-quant", "value", None),
+    "quantize_kv_cache": ("--quantize-kv-cache", "flag", False),
+    "draft_sink_size": ("--draft-sink-size", "value", 64),
+    "draft_window_size": ("--draft-window-size", "value", 1024),
+    "draft_full_context_min_ctx": ("--draft-full-context-min-ctx", "value", 16384),
 }
 
 
@@ -89,7 +95,7 @@ def _projected_from_engine(provider, model: BaseModel) -> float:
 
 
 class DflashProvider(Provider):
-    _type_id = "dflash"
+    _type_id = "dflash-mlx"
     single_resident = True
 
     class Model(BaseModel):
