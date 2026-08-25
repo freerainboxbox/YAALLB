@@ -773,14 +773,10 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "httpx2" },
-    { name = "pytest" },
-    { name = "uvicorn" },
-]
-
-[package.dev-dependencies]
-dev = [
     { name = "mlx" },
     { name = "mlx-lm" },
+    { name = "pytest" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
@@ -788,12 +784,8 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "httpx2", specifier = ">=2.9.1" },
-    { name = "pytest", specifier = ">=9.1.1" },
-    { name = "uvicorn", specifier = ">=0.30" },
-]
-
-[package.metadata.requires-dev]
-dev = [
     { name = "mlx", specifier = ">=0.32.2" },
     { name = "mlx-lm", specifier = ">=0.31.3" },
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "uvicorn", specifier = ">=0.30" },
 ]
