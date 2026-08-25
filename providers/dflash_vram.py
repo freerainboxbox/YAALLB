@@ -1,9 +1,9 @@
 """Pre-load VRAM projection for the future ``dflash`` provider.
 
 The dflash scheduler calls ``Model.memory()`` *before* loading (to decide
-evictions / avoid OOM), so the footprint must be projected from metadata with
-zero VRAM touched. This module implements the two projection approaches from
-FINDINGS.md and the decision rule between them.
+evictions / avoid OOM), so the footprint must be projected with zero VRAM
+touched. This module implements the two projection approaches from FINDINGS.md
+and records the single approach chosen for ``Model.memory()``.
 
 Weight term — the only place the two approaches differ
 -------------------------------------------------------
@@ -11,29 +11,45 @@ Weight term — the only place the two approaches differ
   (``config.json`` + ``model.safetensors.index.json`` weight_map + each
   shard's header: tensor ``shape`` x ``dtype.itemsize``). No model graph is
   built; zero VRAM and zero weight data read.
-- **Approach B (lazy model structure):** build the nn.Module graph with
-  weights kept on disk, then ``get_total_parameters`` (real shapes) multiplied
-  out by the *real stored* bytes per weight. Needs the model classes (mlx_lm
-  for the target, dflash custom classes for the draft), so it is heavier than
-  A, but measures the architecture the runtime will actually use.
+- **Approach B (lazy model structure):** build the nn.Module graph (weights
+  kept on disk — shapes/dtypes from the graph, nbytes from shape x dtype),
+  then sum the *real stored* array nbytes. Needs the model classes (mlx_lm for
+  the target, dflash custom classes for the draft), so it is heavier than A,
+  but measures the architecture the runtime will actually use.
 
 Validated equivalence (see FINDINGS.md "VRAM estimation validation"):
   A and B agree *iff* both measure the stored bytes. In particular B must use
-  the real array nbytes (``compute_bits_per_weight``), never a fixed
-  ``count * bytes_per_param``: ``get_total_parameters`` returns the
-  *unquantized* element count for quantized layers and omits scales/bias, so a
-  naive multiplier diverges. When A and B disagree (e.g. a checkpoint whose
-  file dtype differs from the graph dtype, or an unexpected quantized storage
-  layout), **B — the real model graph — is the authoritative result**.
+  the exact integer sum of array nbytes, never a fixed ``count * bytes_per_param``:
+  ``get_total_parameters`` returns the *unquantized* element count for
+  quantized layers and omits scales/bias, so a naive multiplier diverges; the
+  float ``compute_bits_per_weight`` can also round a byte. When A and B
+  disagree (e.g. a checkpoint whose file dtype differs from the graph dtype,
+  or an unexpected quantized storage layout), **B — the real model graph — is
+  the authoritative result**.
 
-Decision rule
--------------
-A reads only headers (~KB, O(shard count)) so it is always cheap, but its
-correctness depends on the external metadata (config/index/shards/dtype
-mapping) matching the model the runtime actually loads. B measures the real
-graph and is robust to that, but costs graph construction (needs the model
-classes). Per FINDINGS, **prefer B whenever its estimate is fast**; fall back
-to A when the model classes are unavailable.
+Decision (single approach for ``Model.memory()``) — **B**
+---------------------------------------------------------
+``.memory()`` uses **Approach B**: the exact integer sum of the real model
+graph's array nbytes. Rationale:
+- **Always correct regardless of quantization.** B reads the loaded graph's
+  arrays, so quantized scales/bias and any quant method (4/8-bit, mxfp4,
+  awq/gptq transform, future layouts) are counted exactly and automatically;
+  A must hardcode the specific quantized file layout and dtype mapping and can
+  silently mis-count an unexpected layout.
+- **Always correct regardless of system.** B measures the architecture the
+  runtime actually loads (config + model classes), robust to file-vs-graph
+  dtype mismatch and missing/inconsistent index.json; A trusts external
+  metadata that varies between systems and can be *silently* wrong.
+- **Future-proof.** B adapts to whatever config/model the runtime loads; new
+  quant methods and layouts are handled by construction, not by format tables.
+- **Stable.** B is correct-by-construction and fails *loudly* (missing model
+  class / unsupported arch raise) rather than returning a silent wrong number.
+  Its estimate is fast (~1ms, O(layer count), not O(hidden size)).
+
+A is retained only as the validation cross-check (the synthetic test vectors
+and the real-MLX equivalence test). It is **not** the ``.memory()`` path: if B
+cannot build the graph, ``.memory()`` should raise rather than silently fall
+back to A, because a silent-wrong projection is the worst stability failure.
 """
 
 import math
@@ -214,11 +230,7 @@ def projected_mib(
     return base * overhead / (2**20)
 
 
-def prefer_approach(estimate_ms: float, threshold_ms: float = 50.0) -> str:
-    """Decision rule: prefer B (authoritative) when its estimate is fast.
-
-    B measures the real model graph, so it is robust to metadata-format
-    variation between systems; A is the zero-dependency fallback. Per
-    FINDINGS, prefer B whenever its estimate is under ``threshold_ms``.
-    """
-    return "B" if estimate_ms <= threshold_ms else "A"
+# Single approach chosen for Model.memory(): B (lazy model structure).
+# See the module docstring for the correctness / future-proof / stability
+# rationale. A is kept as a pure-Python cross-check only.
+CHOSEN_APPROACH = "B"

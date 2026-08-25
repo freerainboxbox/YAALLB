@@ -16,8 +16,8 @@ import pathlib
 import pytest
 
 from providers.dflash_vram import (
+    CHOSEN_APPROACH,
     dtype_itemsize,
-    prefer_approach,
     projected_mib,
     weight_bytes_from_metadata,
     weight_bytes_from_mlx_lazy,
@@ -203,13 +203,13 @@ def test_naive_count_times_bytes_diverges_for_f32():
 
 
 # --------------------------------------------------------------------------- #
-# Decision rule
+# Decision rule: a single approach is chosen for .memory()
 # --------------------------------------------------------------------------- #
-def test_prefer_approach_prefers_fast_b():
-    assert prefer_approach(estimate_ms=1.0) == "B"
-    assert prefer_approach(estimate_ms=10.0, threshold_ms=50.0) == "B"
-    assert prefer_approach(estimate_ms=500.0) == "A"
-    assert prefer_approach(estimate_ms=200.0, threshold_ms=100.0) == "A"
+def test_chosen_approach_is_b():
+    """The .memory() implementation uses Approach B (lazy model structure) as
+    the single authoritative approach — always-correct across quantization /
+    system, future-proof, stable (loud failure, not silent-wrong)."""
+    assert CHOSEN_APPROACH == "B"
 
 
 def test_projected_mib_uses_same_weight_bytes_for_a_and_b():
@@ -270,10 +270,11 @@ def test_real_mlx_model_a_equals_b(tmp_path):
                 dtype = str(f.get_slice(k).get_dtype())
                 a_total += math.prod(shape) * dtype_itemsize(dtype)
 
-        # Approach B: lazy graph + real stored bytes
+        # Approach B: lazy graph + real stored bytes (exact integer, no float)
         loaded, _ = U.load_model(tmp, lazy=True)
         b_total = weight_bytes_from_mlx_lazy(loaded)
 
+        assert isinstance(b_total, int)
         assert a_total == b_total, f"quant={quant}: A={a_total} B={b_total}"
         return a_total
 

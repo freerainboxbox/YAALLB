@@ -119,16 +119,32 @@ Compare `projected_mib` against the device budget
 dflash's `apply_metal_limits` uses). If `projected_mib + resident_mib >
 budget_mib`, evict before loading — never load-then-measure.
 
-**Which weight approach to use.** Option A depends on external metadata
-(config/index/shard headers/dtype mapping) matching what the runtime actually
-loads; it can diverge from the real model when a checkpoint's file dtype
-differs from the graph dtype or the quantized storage layout is unexpected. B
-measures the real model graph and is robust to that. So **prefer B whenever its
-estimate is fast** (measured ~1ms on a real graph; graph construction is
-O(layer count), not O(hidden size)); fall back to A when the model classes
-(dflash draft classes) are unavailable. If A and B ever disagree, **B — the
-real model graph — is the authoritative result**. (See "VRAM estimation
-validation".)
+**Which weight approach to use — a single approach is chosen: B.**
+``Model.memory()`` uses **Approach B** (lazy model structure): the exact
+integer sum of the real model graph's array nbytes. Rationale —
+- **Always correct regardless of quantization.** B reads the loaded graph's
+  arrays, so quantized scales/bias and any quant method (4/8-bit, mxfp4,
+  awq/gptq transform, future layouts) are counted exactly and automatically;
+  A must hardcode the quantized file layout + dtype mapping and can silently
+  mis-count an unexpected layout.
+- **Always correct regardless of system.** B measures the architecture the
+  runtime actually loads (config + model classes), robust to file-vs-graph
+  dtype mismatch and missing/inconsistent index.json; A trusts external
+  metadata that varies between systems and can be *silently* wrong.
+- **Future-proof.** B adapts to whatever config/model the runtime loads; new
+  quant methods and layouts are handled by construction, not format tables.
+- **Stable.** B is correct-by-construction and fails *loudly* (missing model
+  class / unsupported arch raise) rather than returning a silent wrong number.
+  Its estimate is fast (~1ms; graph construction is O(layer count), not
+  O(hidden size)). If B cannot build the graph, ``.memory()`` should **raise**
+  rather than silently fall back to A — a silent-wrong projection is the worst
+  stability failure.
+
+A is retained only as the validation cross-check (synthetic test vectors +
+real-MLX equivalence test), **not** the ``.memory()`` path. If A and B ever
+disagree, **B — the real model graph — is the authoritative result**.
+(Implementation: ``providers/dflash_vram.py`` ``CHOSEN_APPROACH = "B"``; see
+"VRAM estimation validation".)
 
 ### VRAM estimation validation
 
