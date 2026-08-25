@@ -3,7 +3,7 @@
 ## Project Context
 * This is a Python project written with FastAPI and targetting multiple LLM runners.
 * See README.md for project purpose.
-* Project is currently in setup phase.
+* Project is currently in early pre-release phase.
 * `uv` is used for version management.
 
 ## Instructions for Problematic Harnesses
@@ -20,6 +20,7 @@
 * Prefer to append bullets and delete bullets, and never make extremely structural changes. Only mutate bullets for specific reasons, like changed facts.
 * Do not modify system files or dotfiles, with the exception of .gitignore or .venv when the user asks for direct troubleshooting of .venv issues.
 * Install libraries as needed using `uv add`.
+* Libraries used for research purposes may be installed with `uv add`, provided they are cleaned up later if not meant to be retained.
 * Pin package versions or remove package versions as needed.
 * Prefer stable versions whenever possible, unless there is no way forward.
 * NEVER use local package patches. All code must be fully reproducible on any machine. Pin old versions if required.
