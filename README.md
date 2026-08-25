@@ -4,7 +4,7 @@
 
 A VRAM-aware LLM load balancer, quick and dirty, to point to your existing LLM runners.
 
-Currently targets LM Studio, antirez/ds4, and llama.cpp. More may be supported later.
+Currently targets LM Studio, antirez/ds4, llama.cpp, and dflash-mlx. More may be supported later.
 
 You can specify a VRAM limit on your Apple Silicon Mac in MB, and YAALLB will set `iogpu.wired_limit_mb` to that limit and respect your memory by evicting the least-impact resident models when a new load would exceed the budget.
 
@@ -15,7 +15,7 @@ main.py            FastAPI app, OpenAI-compatible routes, CLI launcher
 scheduling.py      VRAM-aware model scheduler and eviction
 log.py             Colored, ISO-timestamped logging to stderr
 abstractions/      Base types: Provider, Model, ModelDescriptor, LoadOptions; routing
-providers/         Concrete providers: LMStudioProvider, DwarfStarProvider, LlamaCppProvider
+providers/         Concrete providers: LMStudioProvider, DwarfStarProvider, LlamaCppProvider, DflashProvider
 config.json        Provider instances per type ("lms", "ds4", "llama_cpp", ...)
 tests/             pytest suite
 pyproject.toml     Project metadata and dependencies (uv-managed)
@@ -171,6 +171,48 @@ forward is **retried internally** up to `STARTUP_ATTEMPTS` (10) times, then an
 SSE error event (`code: provider_start_failed`) is emitted. Each failure bumps
 a per-provider startup counter, and the counter resets once the provider
 serves a request successfully.
+
+## Cached VRAM estimates
+
+Providers that cannot import their model classes into YAALLB's own process
+(e.g. dflash-mlx, which is spawned as a subprocess) still need a pre-load
+VRAM projection for the scheduler's eviction/OOM decisions. Rather than
+rebuild the expensive lazy model graph on every `Model.memory()` call, YAALLB
+precomputes each such provider's footprint **once at startup** and caches it.
+dflash-mlx is the first cached-VRAM-estimate provider; this section records
+the convention later ones should follow.
+
+**Cache key** — `sha256` of the canonical serialization of the *frozen* YAALLB
+config (`frozendict.deepfreeze` → canonical JSON bytes with `sort_keys=True`).
+This is deterministic across processes — plain `hash()` of a frozendict salts
+string hashes per-process and can't be recalled across restarts — and it
+changes whenever `config.json` changes, so a changed config naturally produces
+a fresh cache file. Key order in `config.json` does not matter.
+
+**Cache file** — `/tmp/yaallb/<sha256 hex>.json`.
+
+**Content** — a top-level key per provider type, mapping model id →
+ctx-independent footprint components:
+
+```json
+{ "dflash-mlx": { "qwen-gdn": {
+    "target_weight_bytes": ..., "draft_weight_bytes": ...,
+    "draft_kv_bytes": ..., "draft_context_bytes": ... } } }
+```
+
+The components are deliberately **ctx-independent**: `Model.memory()` is
+called per-request with a `ctx_length` (target KV scales with it), and the
+cache key holds no ctx — so a flat projected-MiB in the cache would go stale
+for long-context requests. Instead the cache stores the expensive weight
+bytes + fixed analytical terms, and `memory()` adds the ctx-scaled target KV
+at call time (O(1) arithmetic + a header-only `config.json` read).
+
+**Startup behavior** (`providers/dflash_cache.py`, wired in `main.py` before
+the scheduler starts): derive the key, and either **recall** the cache file
+if it exists (logging a found-cache event) or **compute** the impact for
+every dflash-mlx provider (logging progress per provider) and store it.
+`memory()` draws from the cache; on a miss it recomputes on the fly
+(defensive) rather than returning a stale/zero estimate.
 
 ### Providers
 
@@ -426,12 +468,66 @@ is configured as:
 }
 ```
 
+#### dflash-mlx
+
+`dflash-mlx` is spawned and terminated by YAALLB (it is a CLI/HTTP server, not
+an embeddable API), so each instance needs to know how to launch the `dflash`
+binary from a working directory.
+
+| key          | default     | required                                                                       |
+| ------------ | ----------- | ------------------------------------------------------------------------------ |
+| `dflash_dir` | —           | yes — working directory the `dflash` server runs from                          |
+| `model_ref`  | —           | yes — path to the target model directory (mlx_lm checkpoint)                   |
+| `draft_ref`  | —           | no — path to the draft model directory; when absent dflash auto-resolves drafts |
+| `alias`      | —           | yes — the OAI model ID this provider presents (dflash serves one per process)  |
+| `host`       | `127.0.0.1` | no — dflash bind address, also the reverse-proxy target                        |
+| `port`       | `8000`      | no — dflash bind port, also the reverse-proxy target                           |
+| `binary`     | `dflash`    | no — program to run (resolved via PATH)                                        |
+| `ctx_length` | —           | no — provider-level context length, overrides the per-model one                |
+| `options`    | `{}`        | no — overrides for `dflash serve` flags (metal limits, quant, diagnostics)     |
+
+Example:
+
+```json
+{
+  "dflash": [
+    {
+      "dflash_dir": "/path/to/dflash-mlx",
+      "model_ref": "/path/to/qwen-gdn",
+      "draft_ref": "/path/to/dflash-draft",
+      "host": "127.0.0.1",
+      "port": 9000,
+      "alias": "qwen-gdn",
+      "options": { "wired_limit": 128 }
+    }
+  ]
+}
+```
+
+YAALLB spawns it as:
+
+```sh
+dflash serve --model {model_ref} [--draft-model {draft_ref}] --host {host} --port {port} {options}
+```
+
+`Model.memory()` uses the **cached-VRAM-estimate** convention (above): the
+target's weight bytes come from a lazily built mlx_lm graph (Approach B), the
+draft's from safetensors metadata (Approach A — the dflash DFlash classes
+aren't importable in-process; A == B for the draft's mlx-native quantized
+checkpoint), and the ctx-scaled target KV is added at call time.
+`getOAIModels` is the default (dflash answers `/v1/models` natively once
+resident).
+
+On unload YAALLB sends **SIGINT first** (dflash's only clean teardown path —
+`KeyboardInterrupt` → HTTP shutdown + L2 cache flush), escalating to
+SIGTERM/SIGKILL on timeout.
+
 ## Graceful shutdown
 
 On exit (Ctrl-C/SIGTERM), YAALLB flushes queued and in-flight requests, then
 unloads every resident model: LM Studio instances get the unload API route
-called, and ds4/llama_cpp instances simply terminate their spawned server
-process.
+called, and ds4/llama_cpp/dflash instances simply terminate their spawned
+server process.
 
 ## Roadmap
 
