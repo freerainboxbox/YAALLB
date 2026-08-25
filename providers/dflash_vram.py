@@ -46,13 +46,21 @@ graph's array nbytes. Rationale:
   class / unsupported arch raise) rather than returning a silent wrong number.
   Its estimate is fast (~1ms, O(layer count), not O(hidden size)).
 
-A is retained only as the validation cross-check (the synthetic test vectors
-and the real-MLX equivalence test). It is **not** the ``.memory()`` path: if B
-cannot build the graph, ``.memory()`` should raise rather than silently fall
-back to A, because a silent-wrong projection is the worst stability failure.
+A is retained as the validation cross-check (synthetic test vectors +
+real-MLX equivalence test) and for the **production draft weight sum**: the
+dflash DFlash classes aren't importable in-process (dflash is spawned as a
+subprocess), so lazy-graph B can't be built for the draft — and A == B for the
+draft's mlx-native quantized checkpoint (validated), so A is exact there.
+The **target** uses B (mlx_lm lazy graph). If B cannot build the target graph,
+``.memory()`` should raise rather than silently fall back to A, because a
+silent-wrong projection is the worst stability failure.
 """
 
+import glob
+import json
 import math
+import os
+from pathlib import Path
 
 # safetensors dtype -> itemsize. MLX stores quantized weights as U32-packed
 # (weight) + F32 scales (+ bias); A sums every tensor in the header, so the
@@ -147,7 +155,7 @@ def weight_bytes_from_mlx_lazy(model) -> int:
     I/O-bound; a genuinely fast B must build the graph without reading weight
     data (shapes/dtypes come from the graph, nbytes from shape x dtype).
     """
-    import mlx  # deferred: mlx is not a runtime dependency
+    import mlx  # deferred import keeps this module importable without mlx
 
     return sum(v.nbytes for _, v in mlx.utils.tree_flatten(model.parameters()))
 
@@ -234,3 +242,90 @@ def projected_mib(
 # See the module docstring for the correctness / future-proof / stability
 # rationale. A is kept as a pure-Python cross-check only.
 CHOSEN_APPROACH = "B"
+
+
+# --------------------------------------------------------------------------- #
+# Production compute engine (target via B, draft via A)
+# --------------------------------------------------------------------------- #
+def _shard_tensors(path: str) -> dict:
+    """{tensor_name: (shape, dtype_str)} from a safetensors shard header.
+
+    Reads only the header metadata (shape x dtype), never the weight data.
+    """
+    from safetensors import safe_open
+
+    tensors = {}
+    with safe_open(path, framework="np") as f:
+        for k in f.keys():
+            sl = f.get_slice(k)
+            tensors[k] = (tuple(sl.get_shape()), str(sl.get_dtype()))
+    return tensors
+
+
+def build_target_weight_bytes(model_ref: str) -> int:
+    """Approach B (mlx_lm lazy graph): real stored bytes of the target graph.
+
+    The target is an mlx_lm-supported architecture, so its graph can be built
+    lazily and its exact integer array nbytes summed. NOTE:
+    ``mlx_lm.utils.load_model(lazy=True)`` still ``mx.load``s the weight files
+    into host RAM (lazy only skips the VRAM ``eval``), so this is I/O-bound —
+    acceptable as a one-time startup cache build; a true-lazy no-data-read
+    build (construct the graph from config + classes, skip ``mx.load``) is a
+    refinement for multi-GB checkpoints.
+    """
+    import mlx_lm.utils as U
+
+    # mlx_lm's load_model requires a pathlib.Path (it does ``path / "config.json"``).
+    model, _ = U.load_model(Path(model_ref), lazy=True)
+    return weight_bytes_from_mlx_lazy(model)
+
+
+def build_draft_weight_bytes(draft_ref: str) -> int:
+    """Approach A (pure metadata): sum the draft checkpoint's stored bytes.
+
+    Reads ``config.json`` + ``model.safetensors.index.json`` (``weight_map``)
+    + each shard's safetensors header (shape x dtype), never materializing
+    weights. Handles a single-file checkpoint without an index by reading that
+    shard directly. The draft is mlx-native quantized, and A == B was validated
+    for exactly those checkpoints, so this is exact — the dflash DFlash classes
+    are not importable in-process (dflash is spawned as a subprocess), so lazy-
+    graph B cannot be built for the draft.
+    """
+    index_path = os.path.join(draft_ref, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index["weight_map"]
+        headers = {
+            shard: _shard_tensors(os.path.join(draft_ref, shard))
+            for shard in set(weight_map.values())
+        }
+        return weight_bytes_from_metadata({"weight_map": weight_map}, headers)
+
+    # Single-file checkpoint without an index: sum the one model*.safetensors.
+    shards = sorted(glob.glob(os.path.join(draft_ref, "model*.safetensors")))
+    if not shards:
+        raise RuntimeError(f"no safetensors shards found in {draft_ref}")
+    total = 0
+    for shard in shards:
+        for shape, dtype in _shard_tensors(shard).values():
+            total += _numel(shape) * dtype_itemsize(dtype)
+    return total
+
+
+# --------------------------------------------------------------------------- #
+# Production compute_weights used by the VRAM cache (providers/dflash_cache.py)
+# --------------------------------------------------------------------------- #
+def compute_weights(model_ref: str, draft_ref: str | None):
+    """Production engine: target via B (lazy graph), draft via A (metadata).
+
+    Returns ``(target_weight_bytes, draft_weight_bytes)``. The draft path uses
+    A because the dflash DFlash classes aren't importable in-process; A == B
+    for the draft's mlx-native quantized checkpoint (validated).
+    """
+    target_weight_bytes = build_target_weight_bytes(model_ref)
+    if draft_ref is not None:
+        draft_weight_bytes = build_draft_weight_bytes(draft_ref)
+    else:
+        draft_weight_bytes = 0
+    return target_weight_bytes, draft_weight_bytes
