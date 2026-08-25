@@ -22,6 +22,8 @@ import log
 from abstractions.load_options import LoadOptions
 from abstractions.provider import Provider
 from abstractions.routing import lookup_model
+from providers.dflash import DflashProvider
+from providers.dflash_cache import ensure_dflash_cache
 from providers.dwarfstar import DwarfStarProvider
 from providers.llama_cpp import LlamaCppProvider
 from providers.lmstudio import LMStudioProvider
@@ -42,6 +44,7 @@ PROVIDER_TYPES = {
     "lms": LMStudioProvider,
     "ds4": DwarfStarProvider,
     "llama_cpp": LlamaCppProvider,
+    "dflash": DflashProvider,
 }
 
 # YAALLB-internal per-model override keys: they configure YAALLB behavior
@@ -645,6 +648,10 @@ def main() -> None:
     global SCHEDULER, PROVIDERS
     providers = load_providers(args.config)
     PROVIDERS.extend(providers)
+    # Precompute (or recall) the dflash VRAM impact cache before the scheduler
+    # starts, so Model.memory() can draw from it during on_start preload and
+    # request serving.
+    ensure_dflash_cache(args.config, providers)
     vram_limit_mb = load_vram_limit(args.config)
     SCHEDULER = Scheduler(PROVIDERS, vram_limit_mb)
 
