@@ -18,7 +18,9 @@ import pytest
 from providers.dflash_vram import (
     CHOSEN_APPROACH,
     dtype_itemsize,
+    draft_kv_bytes,
     projected_mib,
+    target_kv_bytes,
     weight_bytes_from_metadata,
     weight_bytes_from_mlx_lazy,
     weight_bytes_from_structure,
@@ -210,6 +212,58 @@ def test_chosen_approach_is_b():
     the single authoritative approach — always-correct across quantization /
     system, future-proof, stable (loud failure, not silent-wrong)."""
     assert CHOSEN_APPROACH == "B"
+
+
+# --------------------------------------------------------------------------- #
+# Analytical KV terms: hybrid (qwen3_5) targets nest text_config
+# --------------------------------------------------------------------------- #
+def test_target_kv_bytes_hybrid_nested_text_config():
+    """A qwen3_5-style config nests its text model under text_config and splits
+    layer_types into full-attention (ctx-scaled KV) and linear (fixed recurrent)
+    layers — must not KeyError on top-level num_hidden_layers."""
+    cfg = {
+        "model_type": "qwen3_5",
+        "text_config": {
+            "num_hidden_layers": 4,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "hidden_size": 128,
+            "layer_types": [
+                "linear_attention", "full_attention",
+                "linear_attention", "full_attention",
+            ],
+            "linear_num_key_heads": 4,
+            "linear_key_head_dim": 8,
+            "linear_num_value_heads": 8,
+            "linear_value_head_dim": 8,
+        },
+    }
+    ctx = 100
+    # 2 full-attn layers * 2 kv_heads * 16 head_dim * (K+V) * ctx * 2 bytes
+    full = 2 * 2 * 16 * 2 * ctx * 2
+    # 2 linear layers * (4*8 key + 8*8 value recurrent) * 2 bytes
+    linear = 2 * (4 * 8 + 8 * 8) * 2
+    assert target_kv_bytes(cfg, ctx) == full + linear
+
+
+def test_target_kv_bytes_plain_config_still_works():
+    cfg = {
+        "num_hidden_layers": 4, "num_attention_heads": 8,
+        "num_key_value_heads": 2, "head_dim": 16, "hidden_size": 128,
+    }
+    ctx = 100
+    assert target_kv_bytes(cfg, ctx) == 4 * 2 * 16 * 2 * ctx * 2
+
+
+def test_draft_kv_bytes_nested_text_config():
+    cfg = {"text_config": {
+        "num_hidden_layers": 2, "num_attention_heads": 4,
+        "num_key_value_heads": 2, "head_dim": 16, "hidden_size": 64,
+    }}
+    # sink(64)+window(1024) * 2kv_heads*16*2*2 + layers*per_token
+    per = 2 * 16 * 2 * 2
+    assert draft_kv_bytes(cfg) == (64 + 1024) * per + 2 * per
 
 
 def test_projected_mib_uses_same_weight_bytes_for_a_and_b():

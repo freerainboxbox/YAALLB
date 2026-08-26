@@ -163,22 +163,51 @@ def weight_bytes_from_mlx_lazy(model) -> int:
 # --------------------------------------------------------------------------- #
 # Analytical cache / activation terms (identical in A and B)
 # --------------------------------------------------------------------------- #
-def target_kv_bytes(config: dict, ctx_length: int) -> int:
-    """Target KV at ``ctx_length``, K+V per token, plus Qwen-GDN recurrent state.
-
-    ``bytes_per_el`` is the KV element size (e.g. 2 for bf16). GDN targets
-    carry recurrent state + captured hidden + rollback tape on top of KV.
+def _text_config(config: dict) -> dict:
+    """Effective text-model config: the nested ``text_config`` of hybrid
+    (qwen3_5/GDN) targets, else the config itself.
     """
-    layers = config["num_hidden_layers"]
-    kv_heads = config.get("num_key_value_heads", config.get("num_attention_heads"))
-    head_dim = config.get("head_dim") or config["hidden_size"] // config.get(
-        "num_attention_heads", 1
-    )
-    bytes_per_el = config.get("kv_bytes_per_element", 2)
-    kv = layers * kv_heads * head_dim * 2 * ctx_length * bytes_per_el
-    gdn = config.get("gdn_recurrent_bytes", 0)
-    captured = config.get("captured_hidden_bytes", 0)
-    rollback = config.get("rollback_tape_bytes", 0)
+    tc = config.get("text_config")
+    return tc if isinstance(tc, dict) else config
+
+
+def target_kv_bytes(config: dict, ctx_length: int) -> int:
+    """Target KV at ``ctx_length``, K+V per token, plus hybrid/linear state.
+
+    ``bytes_per_el`` is the KV element size (e.g. 2 for bf16). Hybrid
+    (qwen3_5/GDN) targets nest their text config under ``text_config`` and
+    split ``layer_types`` into full-attention (ctx-scaled KV) and linear
+    (gated-delta) layers (fixed recurrent state per layer). GDN extra buffers
+    (captured hidden, rollback tape) are config-overridable, default 0.
+    """
+    tc = _text_config(config)
+    layers = tc["num_hidden_layers"]
+    bytes_per_el = tc.get("kv_bytes_per_element", 2)
+    layer_types = tc.get("layer_types")
+    if layer_types:
+        full_attn = sum(1 for t in layer_types if t == "full_attention")
+        kv_heads = tc.get("num_key_value_heads", tc.get("num_attention_heads"))
+        head_dim = tc.get("head_dim") or tc["hidden_size"] // tc.get(
+            "num_attention_heads", 1
+        )
+        kv = full_attn * kv_heads * head_dim * 2 * ctx_length * bytes_per_el
+        linear = layers - full_attn
+        lin_k = tc.get("linear_num_key_heads", kv_heads) * tc.get(
+            "linear_key_head_dim", head_dim
+        )
+        lin_v = tc.get("linear_num_value_heads", lin_k) * tc.get(
+            "linear_value_head_dim", head_dim
+        )
+        kv += linear * (lin_k + lin_v) * bytes_per_el
+    else:
+        kv_heads = tc.get("num_key_value_heads", tc.get("num_attention_heads"))
+        head_dim = tc.get("head_dim") or tc["hidden_size"] // tc.get(
+            "num_attention_heads", 1
+        )
+        kv = layers * kv_heads * head_dim * 2 * ctx_length * bytes_per_el
+    gdn = tc.get("gdn_recurrent_bytes", config.get("gdn_recurrent_bytes", 0))
+    captured = tc.get("captured_hidden_bytes", config.get("captured_hidden_bytes", 0))
+    rollback = tc.get("rollback_tape_bytes", config.get("rollback_tape_bytes", 0))
     return kv + gdn + captured + rollback
 
 
@@ -187,18 +216,17 @@ def draft_kv_bytes(draft_config: dict) -> int:
 
     Not scaled by ctx_length the way target KV is: sink(64)+window(1024) is a
     fixed structure, and layers above ``draft_full_context_min_ctx`` carry a
-    full-context cache.
+    full-context cache. Reads the nested ``text_config`` for hybrid drafts too.
     """
-    layers = draft_config["num_hidden_layers"]
-    kv_heads = draft_config.get(
-        "num_key_value_heads", draft_config.get("num_attention_heads")
+    tc = _text_config(draft_config)
+    layers = tc["num_hidden_layers"]
+    kv_heads = tc.get("num_key_value_heads", tc.get("num_attention_heads"))
+    head_dim = tc.get("head_dim") or tc["hidden_size"] // (
+        tc.get("num_attention_heads") or 1
     )
-    head_dim = draft_config.get("head_dim") or draft_config["hidden_size"] // (
-        draft_config.get("num_attention_heads") or 1
-    )
-    bytes_per_el = draft_config.get("kv_bytes_per_element", 2)
-    sink = draft_config.get("sink_size", DFLASH_DRAFT_SINK_SIZE)
-    window = draft_config.get("window_size", DFLASH_DRAFT_WINDOW_SIZE)
+    bytes_per_el = tc.get("kv_bytes_per_element", 2)
+    sink = tc.get("sink_size", DFLASH_DRAFT_SINK_SIZE)
+    window = tc.get("window_size", DFLASH_DRAFT_WINDOW_SIZE)
     cache_per_token = kv_heads * head_dim * 2 * bytes_per_el
     return (sink + window) * cache_per_token + layers * cache_per_token
 
