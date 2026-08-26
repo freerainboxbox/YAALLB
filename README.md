@@ -79,6 +79,12 @@ on the number of tokens emitted and is **not** used for context sizing — only
 flags `--address` and `--port` override these only when explicitly passed;
 otherwise config.json is the source of truth.
 
+When a chat request omits `max_tokens`, YAALLB defaults it to the provider's
+configured context length (for spawned providers like dflash/llama_cpp/ds4),
+so the upstream never falls back to a small CLI `max_tokens` and stops
+mid-thought (dflash's `--max-tokens` CLI default is 512). An explicit client
+`max_tokens` is always respected.
+
 The position in each list is that instance's `_instance_id`. Types that are
 absent are simply disabled. Each instance object is applied on top of the
 provider's built-in defaults, so you only need to write the fields you want
