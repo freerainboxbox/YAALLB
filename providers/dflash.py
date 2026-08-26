@@ -59,9 +59,19 @@ def _options_flags(options: dict) -> list[str]:
     return flags
 
 
-def _read_config(model_ref: str) -> dict:
-    with open(os.path.join(model_ref, "config.json")) as f:
+def _read_config(model_path: str) -> dict:
+    with open(os.path.join(model_path, "config.json")) as f:
         return json.load(f)
+
+
+def _model_path(provider) -> str:
+    """Resolved target dir: the startup-resolved path, else resolve on the fly."""
+    path = getattr(provider, "model_path", None)
+    if path:
+        return path
+    from providers.dflash_shortcuts import resolve_model_path
+
+    return resolve_model_path(provider.model_ref)
 
 
 def _projected_from_cache(
@@ -71,7 +81,7 @@ def _projected_from_cache(
     from providers.dflash_vram import WORKING_SET_OVERHEAD, target_kv_bytes
 
     ctx = provider._effective_ctx(model)
-    target_config = _read_config(provider.model_ref)
+    target_config = _read_config(_model_path(provider))
     target_kv = target_kv_bytes(target_config, ctx)
     base = (
         entry["target_weight_bytes"]
@@ -88,9 +98,17 @@ def _projected_from_engine(provider, model: BaseModel) -> float:
     from providers.dflash_cache import compute_impact
     from providers.dflash_vram import compute_weights as engine
 
-    impact = compute_impact(
-        provider.model_ref, getattr(provider, "draft_ref", None), engine
-    )
+    model_path = _model_path(provider)
+    draft_path = getattr(provider, "draft_path", None)
+    if draft_path is None:
+        eff = getattr(provider, "draft_ref_eff", None) or getattr(
+            provider, "draft_ref", None
+        )
+        if eff:
+            from providers.dflash_shortcuts import resolve_model_path
+
+            draft_path = resolve_model_path(eff)
+    impact = compute_impact(model_path, draft_path, engine)
     return _projected_from_cache(impact, provider, model)
 
 
@@ -125,6 +143,12 @@ class DflashProvider(Provider):
         self.options: dict = {}
         self.resident_model: BaseModel | None = None
         self._process: subprocess.Popen | None = None
+        # Resolved local paths (set by ensure_dflash_cache at startup):
+        # model_path/draft_path are local dirs (local or HF-cache snapshot);
+        # draft_ref_eff is the effective draft ref (shortcut default if none).
+        self.model_path: str | None = None
+        self.draft_path: str | None = None
+        self.draft_ref_eff: str | None = None
         super().__init__(_instance_id, config)
 
     @property
@@ -161,14 +185,18 @@ class DflashProvider(Provider):
         return self.Model(descriptor, loadOptions)
 
     def _build_command(self, model: BaseModel) -> list[str]:
-        command = [self.binary, "serve", "--model", self.model_ref]
+        # Spawn with the resolved local paths (HF-cache snapshot or local dir)
+        # so dflash does not re-resolve/download; fall back to the configured
+        # refs if resolution did not run (e.g. tests without startup).
+        command = [self.binary, "serve", "--model", self.model_path or self.model_ref]
 
         if self.host != DFLASH_DEFAULT_HOST:
             command += ["--host", self.host]
         if self.port != DFLASH_DEFAULT_PORT:
             command += ["--port", str(self.port)]
-        if self.draft_ref is not None:
-            command += ["--draft-model", self.draft_ref]
+        draft = self.draft_path or getattr(self, "draft_ref_eff", None) or self.draft_ref
+        if draft:
+            command += ["--draft-model", draft]
 
         command += _options_flags(self.options)
         return command

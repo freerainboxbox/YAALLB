@@ -79,11 +79,14 @@ def test_cachename_is_hex_json_under_cache_dir(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_recall_miss_then_compute_then_hit(tmp_path, monkeypatch):
     monkeypatch.setattr(c, "CACHE_DIR", tmp_path)
+    # resolution requires the model dirs to exist (local dir or HF cache)
+    target_dir = tmp_path / "t"
+    target_dir.mkdir()
     draft_dir = tmp_path / "d"
     draft_dir.mkdir()
     (draft_dir / "config.json").write_text(json.dumps(DRAFT_CONFIG))
 
-    providers = [_provider(draft_ref=str(draft_dir))]
+    providers = [_provider(model_ref=str(target_dir), draft_ref=str(draft_dir))]
     cfg_path = tmp_path / "cfg.json"
     cfg_path.write_text(json.dumps({"vram_limit_mb": 100}))
 
@@ -123,6 +126,35 @@ def test_no_dflash_providers_skips_compute(tmp_path, monkeypatch):
     assert cache == {"dflash-mlx": {}}
     # no cache file written when there are no dflash providers
     assert not (tmp_path / c.cachename({"vram_limit_mb": 100})).exists()
+
+
+# --------------------------------------------------------------------------- #
+# Helpful download messages (no raw error output; exit handled by caller)
+# --------------------------------------------------------------------------- #
+def test_download_help_shows_target_and_shortcut_draft(capsys):
+    c._print_download_help("mlx-community/Qwen3.8-27B-4bit")
+    err = capsys.readouterr().err
+    assert "Qwen3.8-27B-4bit" in err
+    assert "huggingface-cli download mlx-community/Qwen3.8-27B-4bit" in err
+    # the shortcut's default drafter download command is also shown
+    assert "z-lab/Qwen3.8-27B-DFlash2" in err
+    assert "huggingface-cli download z-lab/Qwen3.8-27B-DFlash2" in err
+    assert "snapshot_download" in err
+
+
+def test_download_help_non_shortcut_lists_shortcuts(capsys):
+    c._print_download_help("mlx-community/SomeModel")
+    err = capsys.readouterr().err
+    assert "huggingface-cli download mlx-community/SomeModel" in err
+    assert "shortcuts:" in err
+    assert "Qwen3.8-27B" in err
+
+
+def test_draft_download_help(capsys):
+    c._print_draft_download_help("z-lab/Qwen3.8-27B-DFlash2")
+    err = capsys.readouterr().err
+    assert "huggingface-cli download z-lab/Qwen3.8-27B-DFlash2" in err
+    assert "Qwen3.8-27B-4bit" not in err  # target not mentioned for a draft miss
 
 
 def test_compute_impact_without_draft_zeros(tmp_path):

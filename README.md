@@ -520,6 +520,20 @@ YAALLB spawns it as:
 dflash serve --model {model_ref} [--draft-model {draft_ref}] --host {host} --port {port} {options}
 ```
 
+**Shortcut `model_ref` and draft auto-resolution.** `model_ref` may be a
+dflash shortcut name or repo-id (e.g. `mlx-community/Qwen3.8-27B-4bit`). YAALLB
+mirrors dflash-mlx's registry (`providers/dflash_shortcuts.py`) to resolve the
+shortcut's base -> drafter pair and to auto-pick the default drafter when
+`draft_ref` is omitted. A `model_ref` that is **not** a shortcut **requires**
+`draft_ref` — startup fails with a clear message if it is missing.
+
+**Path resolution.** VRAM estimation resolves `model_ref`/`draft_ref` to a real
+local directory: an existing local path, else a snapshot in the local HF Hub
+cache (`huggingface_hub.scan_cache_dir`). When a model isn't downloaded
+locally, YAALLB prints a helpful message with `huggingface-cli` /
+`snapshot_download` commands for the target **and** (for a shortcut) its
+default drafter, then exits with a non-zero code — no raw traceback.
+
 `Model.memory()` uses the **cached-VRAM-estimate** convention (above): the
 target's weight bytes come from a lazily built mlx_lm graph (Approach B), the
 draft's from safetensors metadata (Approach A — the dflash DFlash classes

@@ -21,11 +21,19 @@ Convention (see README "Cached VRAM estimates"):
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 
 import log
 from frozendict import deepfreeze
 
+from providers.dflash_shortcuts import (
+    DflashDraftRequiredError,
+    MODEL_SUPPORT_SPECS,
+    resolve_draft_ref,
+    resolve_model_path,
+    resolve_model_support_spec,
+)
 from providers.dflash_vram import draft_context_bytes, draft_kv_bytes
 
 # Shared cache directory for cached-VRAM-estimate providers.
@@ -79,25 +87,26 @@ def _read_json(path: str) -> dict:
 
 
 def compute_impact(
-    model_ref: str, draft_ref: str | None, compute_weights
+    model_path: str, draft_path: str | None, compute_weights
 ) -> dict:
     """ctx-independent footprint components for one dflash provider.
 
-    ``compute_weights(model_ref, draft_ref)`` returns
+    ``compute_weights(model_path, draft_path)`` returns
     ``(target_weight_bytes, draft_weight_bytes)``; it is the injected engine
     (pure-Python synthetic in tests, real mlx_lm/A in production). The draft
     KV and block-diffusion context terms are analytical from the draft's
-    config.json and do not scale with ctx_length.
+    config.json and do not scale with ctx_length. Both paths are already
+    resolved local model directories (see dflash_shortcuts.resolve_refs).
     """
     target_weight_bytes, draft_weight_bytes = compute_weights(
-        model_ref, draft_ref
+        model_path, draft_path
     )
     impact = {
         "target_weight_bytes": target_weight_bytes,
         "draft_weight_bytes": draft_weight_bytes,
     }
-    if draft_ref is not None:
-        draft_config = _read_json(os.path.join(draft_ref, "config.json"))
+    if draft_path is not None:
+        draft_config = _read_json(os.path.join(draft_path, "config.json"))
         impact["draft_kv_bytes"] = draft_kv_bytes(draft_config)
         impact["draft_context_bytes"] = draft_context_bytes(draft_config)
     else:
@@ -106,14 +115,93 @@ def compute_impact(
     return impact
 
 
-def _default_compute_weights(model_ref: str, draft_ref: str | None):
+def _default_compute_weights(model_path: str, draft_path: str | None):
     # Production engine: target via mlx_lm lazy graph (Approach B), draft via
     # safetensors metadata (Approach A — dflash classes aren't importable
     # in-process). Imported lazily so the cache module stays importable in
     # environments without mlx (e.g. pure-Python tests of the cache logic).
     from providers.dflash_vram import compute_weights
 
-    return compute_weights(model_ref, draft_ref)
+    return compute_weights(model_path, draft_path)
+
+
+# --------------------------------------------------------------------------- #
+# Helpful download messages (shown on a missing model, then exit non-zero)
+# --------------------------------------------------------------------------- #
+def _print_download_command(repo_id: str) -> None:
+    print(f"  huggingface-cli download {repo_id}", file=sys.stderr)
+    print(
+        f"  python -c \"from huggingface_hub import snapshot_download; "
+        f"snapshot_download('{repo_id}')\"",
+        file=sys.stderr,
+    )
+
+
+def _print_download_help(model_ref: str) -> None:
+    """Print download commands for a missing model_ref (and its default draft)."""
+    spec = resolve_model_support_spec(model_ref)
+    print(
+        f"ERROR: dflash-mlx model_ref '{model_ref}' is not downloaded locally "
+        "(not found on disk or in the HF Hub cache).",
+        file=sys.stderr,
+    )
+    print("Download the target model with a huggingface_hub command:", file=sys.stderr)
+    _print_download_command(model_ref)
+    if spec is not None:
+        print(
+            f"'{model_ref}' is a DFlash shortcut "
+            f"(base: {spec[0]} -> drafter: {spec[1]}); "
+            "its default drafter must also be downloaded:",
+            file=sys.stderr,
+        )
+        _print_download_command(spec[1])
+    else:
+        print(
+            "If you meant a DFlash shortcut, use the base name (e.g. "
+            f"'Qwen3.8-27B'); shortcuts: "
+            + ", ".join(base for base, _ in MODEL_SUPPORT_SPECS),
+            file=sys.stderr,
+        )
+
+
+def _print_draft_download_help(draft_ref: str) -> None:
+    print(
+        f"ERROR: dflash-mlx draft_ref '{draft_ref}' is not downloaded locally "
+        "(not found on disk or in the HF Hub cache).",
+        file=sys.stderr,
+    )
+    print("Download the drafter with a huggingface_hub command:", file=sys.stderr)
+    _print_download_command(draft_ref)
+
+
+def _resolve_provider_paths(provider) -> None:
+    """Resolve model/draft to local paths, storing them on the provider.
+
+    On a missing download (or a non-shortcut model with no draft_ref) this
+    prints the helpful message and exits with a non-zero code — no raw error
+    output is shown.
+    """
+    model_ref = provider.model_ref
+    try:
+        model_path = resolve_model_path(model_ref)
+    except FileNotFoundError:
+        _print_download_help(model_ref)
+        sys.exit(1)
+    try:
+        eff_draft = resolve_draft_ref(model_ref, getattr(provider, "draft_ref", None))
+    except DflashDraftRequiredError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    draft_path = None
+    if eff_draft:
+        try:
+            draft_path = resolve_model_path(eff_draft)
+        except FileNotFoundError:
+            _print_draft_download_help(eff_draft)
+            sys.exit(1)
+    provider.model_path = model_path
+    provider.draft_path = draft_path
+    provider.draft_ref_eff = eff_draft
 
 
 def ensure_dflash_cache(
@@ -127,16 +215,23 @@ def ensure_dflash_cache(
     and stores ``{"dflash-mlx": {model_id: components}}`` at
     ``/tmp/yaallb/<hex>.json``. The cache is attached to each dflash provider
     (``provider._vram_cache``) so ``Model.memory()`` can draw from it.
+
+    Model/draft paths are resolved first (local dir or HF Hub cache, shortcut
+    draft auto-picked); a missing download or a non-shortcut model without a
+    draft_ref prints a helpful message and exits non-zero.
     """
     with open(config_path) as f:
         config = json.load(f)
+
+    dflash_providers = [p for p in providers if p._type_id == "dflash-mlx"]
+    for provider in dflash_providers:
+        _resolve_provider_paths(provider)
 
     cached = recall(config)
     if cached is not None:
         _attach(cached, providers)
         return cached
 
-    dflash_providers = [p for p in providers if p._type_id == "dflash-mlx"]
     if not dflash_providers:
         log.info("no dflash providers configured; skipping VRAM cache build")
         return {"dflash-mlx": {}}
@@ -158,7 +253,7 @@ def ensure_dflash_cache(
             f"provider={provider._type_id}#{getattr(provider, '_instance_id', 0)}"
         )
         impact = compute_impact(
-            provider.model_ref, getattr(provider, "draft_ref", None), compute_weights
+            provider.model_path, provider.draft_path, compute_weights
         )
         cache["dflash-mlx"][model_id] = impact
 
