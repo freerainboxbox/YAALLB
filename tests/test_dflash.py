@@ -12,6 +12,7 @@ import pytest
 from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from providers.dflash import (
+    DFLASH_DEFAULT_CTX,
     DFLASH_DEFAULT_HOST,
     DFLASH_DEFAULT_PORT,
     DflashProvider,
@@ -125,6 +126,26 @@ def test_descriptors_single_alias():
     assert len(descriptors) == 1
     assert descriptors[0].modelId == "qwen-gdn"
     assert descriptors[0].provider is p
+
+
+def test_get_oai_models_static_no_http(tmp_path):
+    tdir = tmp_path / "t"
+    tdir.mkdir()
+    p = _provider_with(tmp_path, alias="m1", ctx_length=8192)
+    models = p.getOAIModels()
+    assert len(models) == 1 and models[0]["id"] == "m1"
+    assert models[0]["context_length"] == 8192
+    assert models[0]["owned_by"] == "dflash-mlx"
+    # no HTTP query: works even though the dflash server is not running
+
+
+def test_get_oai_models_default_ctx_no_resident(tmp_path):
+    tdir = tmp_path / "t"
+    tdir.mkdir()
+    p = _provider_with(tmp_path, alias="m1")  # no ctx_length, not resident
+    models = p.getOAIModels()
+    assert models[0]["context_length"] == DFLASH_DEFAULT_CTX
+    assert "stream" in models[0]["supported_parameters"]
 
 
 def test_effective_ctx_provider_overrides_model():

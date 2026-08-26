@@ -22,6 +22,10 @@ DFLASH_DEFAULT_PORT = 8000
 # from GET {endpoint}/models means the model is resident AND ready.
 DFLASH_READY_TIMEOUT = 120
 
+# Context length presented by /v1/models before any model is resident (dflash
+# is spawned lazily on load, so it cannot answer /v1/models at startup).
+DFLASH_DEFAULT_CTX = 4096
+
 # dflash's own teardown (L2 cache flush via shutdown_runtime_cache_manager)
 # only runs on SIGINT — mlx_lm._run_http_server catches KeyboardInterrupt.
 # So unloadModel prefers SIGINT first (clean flush), escalating to
@@ -174,10 +178,49 @@ class DflashProvider(Provider):
         # the mandatory `alias` config key (like llama_cpp).
         return [ModelDescriptor(self.alias, self)]
 
+    def _presented_ctx(self) -> int:
+        # Context length shown by /v1/models: provider ctx_length, else the
+        # resident model's, else a default (dflash is lazily spawned, so it
+        # cannot answer /v1/models itself at startup).
+        if self.ctx_length is not None:
+            return self.ctx_length
+        if self.resident_model is not None:
+            return self.resident_model.loadOptions.ctx_length
+        return DFLASH_DEFAULT_CTX
+
     def getOAIModels(self) -> list[dict]:
-        # dflash answers /v1/models natively once resident, so the default
-        # (query the downstream endpoint) works, unlike ds4.
-        return super().getOAIModels()
+        # dflash is spawned lazily on load (not at startup), so the default
+        # Provider.getOAIModels() (an HTTP query) would hit a non-running
+        # server and 500 /v1/models. Present a static single-model list keyed
+        # on the configured `alias`, like llama_cpp.
+        ctx_length = self._presented_ctx()
+        return [
+            {
+                "id": self.alias,
+                "object": "model",
+                "created": 1767225600,
+                "owned_by": "dflash-mlx",
+                "name": self.alias,
+                "context_length": ctx_length,
+                "top_provider": {
+                    "context_length": ctx_length,
+                    "max_completion_tokens": ctx_length,
+                    "is_moderated": False,
+                },
+                "supported_parameters": [
+                    "tools",
+                    "tool_choice",
+                    "max_tokens",
+                    "temperature",
+                    "top_p",
+                    "top_k",
+                    "min_p",
+                    "stop",
+                    "seed",
+                    "stream",
+                ],
+            }
+        ]
 
     def createModel(
         self, descriptor: ModelDescriptor, loadOptions: LoadOptions

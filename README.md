@@ -539,8 +539,13 @@ target's weight bytes come from a lazily built mlx_lm graph (Approach B), the
 draft's from safetensors metadata (Approach A — the dflash DFlash classes
 aren't importable in-process; A == B for the draft's mlx-native quantized
 checkpoint), and the ctx-scaled target KV is added at call time.
-`getOAIModels` is the default (dflash answers `/v1/models` natively once
-resident).
+
+`getOAIModels` presents a **static single-model list** keyed on `alias` (like
+llama_cpp) — it never HTTP-queries the server. dflash is spawned lazily on
+load (not at startup), so the default `Provider.getOAIModels()` (an HTTP GET
+on `/v1/models`) would hit a non-running server and 500 `/v1/models`.
+Once resident, dflash answers `/v1/models` natively, but YAALLB doesn't
+contact it for the model list.
 
 On unload YAALLB sends **SIGINT first** (dflash's only clean teardown path —
 `KeyboardInterrupt` → HTTP shutdown + L2 cache flush), escalating to
