@@ -177,6 +177,25 @@ def test_build_command(tmp_path):
     assert "--quantize-kv-cache" in cmd
 
 
+def test_binary_resolves_venv_under_dflash_dir(tmp_path):
+    # dflash-mlx run via uv keeps the console script at <dir>/.venv/bin/dflash
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    (tmp_path / ".venv" / "bin" / "dflash").write_text("")
+    tdir = tmp_path / "t"
+    tdir.mkdir()
+    p = _provider_with(tmp_path, alias="m1")
+    cmd = p._build_command(_model(p))
+    assert cmd[0] == str(tmp_path / ".venv" / "bin" / "dflash")
+
+
+def test_binary_absolute_used_verbatim(tmp_path):
+    tdir = tmp_path / "t"
+    tdir.mkdir()
+    p = _provider_with(tmp_path, alias="m1", binary="/opt/dflash")
+    cmd = p._build_command(_model(p))
+    assert cmd[0] == "/opt/dflash"
+
+
 def test_build_command_omits_defaults(tmp_path):
     p = _provider_with(tmp_path, alias="m1")
     cmd = p._build_command(_model(p))

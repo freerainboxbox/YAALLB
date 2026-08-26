@@ -227,11 +227,31 @@ class DflashProvider(Provider):
     ) -> BaseModel:
         return self.Model(descriptor, loadOptions)
 
+    def _binary_path(self) -> str:
+        """Resolve the ``dflash`` binary to a runnable path.
+
+        The bare default ``dflash`` is resolved via PATH; dflash-mlx run from
+        its repo via ``uv`` keeps the console script at ``<dflash_dir>/.venv/
+        bin/dflash`` (not on PATH), so also probe that layout before falling
+        back to the bare name. Absolute ``binary`` is used verbatim.
+        """
+        binary = self.binary
+        if os.path.isabs(binary):
+            return binary
+        if self.dflash_dir:
+            for candidate in (
+                os.path.join(self.dflash_dir, binary),
+                os.path.join(self.dflash_dir, ".venv", "bin", binary),
+            ):
+                if os.path.exists(candidate):
+                    return candidate
+        return binary
+
     def _build_command(self, model: BaseModel) -> list[str]:
         # Spawn with the resolved local paths (HF-cache snapshot or local dir)
         # so dflash does not re-resolve/download; fall back to the configured
         # refs if resolution did not run (e.g. tests without startup).
-        command = [self.binary, "serve", "--model", self.model_path or self.model_ref]
+        command = [self._binary_path(), "serve", "--model", self.model_path or self.model_ref]
 
         if self.host != DFLASH_DEFAULT_HOST:
             command += ["--host", self.host]
