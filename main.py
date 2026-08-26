@@ -55,6 +55,34 @@ INTERNAL_OVERRIDE_KEYS = frozenset(
 )
 
 
+def _default_max_tokens(provider: Provider) -> int | None:
+    """Upstream max_tokens default for spawned providers that declare a
+    provider-level context length (dflash/llama_cpp/ds4): their CLI fallback
+    is often a small value (e.g. dflash's --max-tokens default 512) that stops
+    generation mid-thought, so default to the provider's generation capacity.
+    LM Studio has no provider-level ctx_length and keeps its own default, so
+    this returns None there and no max_tokens default is injected."""
+    provider_ctx = getattr(provider, "ctx_length", None)
+    return provider_ctx if provider_ctx else None
+
+
+def _forward_body(body: dict, overrides: dict, provider: Provider) -> dict:
+    """Build the upstream chat-completions body: the client body + non-
+    internal model overrides as defaults, defaulting max_tokens to the
+    provider's generation capacity so a spawned provider never falls back to a
+    small CLI max_tokens and stops mid-thought. An explicit client max_tokens
+    is always respected (setdefault only fills when absent)."""
+    forward_body = dict(body)
+    for key, value in overrides.items():
+        if key in INTERNAL_OVERRIDE_KEYS:
+            continue
+        forward_body.setdefault(key, value)
+    default_max_tokens = _default_max_tokens(provider)
+    if default_max_tokens is not None:
+        forward_body.setdefault("max_tokens", default_max_tokens)
+    return forward_body
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if SCHEDULER is not None:
@@ -315,17 +343,15 @@ async def _forward_non_streaming(
             },
         )
 
+    provider = model.descriptor.provider
+
     # Apply generation-param model overrides as defaults; force non-streaming
     # upstream. YAALLB-internal keys (ctx_length, on_start, streaming policy)
-    # are filtered out so they never leak onto the wire.
-    forward_body = dict(body)
-    for key, value in overrides.items():
-        if key in INTERNAL_OVERRIDE_KEYS:
-            continue
-        forward_body.setdefault(key, value)
+    # are filtered out so they never leak onto the wire. max_tokens defaults
+    # to the provider's context capacity (so dflash's CLI fallback of 512
+    # never caps generation mid-thought).
+    forward_body = _forward_body(body, overrides, provider)
     forward_body["stream"] = False
-
-    provider = model.descriptor.provider
     log.info(
         f"chat request model={model_id} "
         f"provider={provider._type_id}#{getattr(provider, '_instance_id', 0)} "
@@ -446,15 +472,12 @@ async def chat_completions(body: dict):
         # Apply generation-param model overrides (temperature, top_p, ...) as
         # defaults when the client didn't specify them; they ride along in the
         # body. YAALLB-internal keys (ctx_length, on_start, streaming policy)
-        # are filtered out so they never leak onto the wire.
-        forward_body = dict(body)
-        for key, value in overrides.items():
-            if key in INTERNAL_OVERRIDE_KEYS:
-                continue
-            forward_body.setdefault(key, value)
-        forward_body["stream"] = True
-
+        # are filtered out so they never leak onto the wire. max_tokens
+        # defaults to the provider's context capacity (so dflash's CLI fallback
+        # of 512 never caps generation mid-thought).
         provider = model.descriptor.provider
+        forward_body = _forward_body(body, overrides, provider)
+        forward_body["stream"] = True
         log.info(
             f"chat request model={model_id} "
             f"provider={provider._type_id}#{getattr(provider, '_instance_id', 0)} "
