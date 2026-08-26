@@ -530,7 +530,7 @@ shortcut's base -> drafter pair and to auto-pick the default drafter when
 **Path resolution.** VRAM estimation resolves `model_ref`/`draft_ref` to a real
 local directory: an existing local path, else a snapshot in the local HF Hub
 cache (`huggingface_hub.scan_cache_dir`). When a model isn't downloaded
-locally, YAALLB prints a helpful message with `huggingface-cli` /
+locally, YAALLB prints a helpful message with `hf` /
 `snapshot_download` commands for the target **and** (for a shortcut) its
 default drafter, then exits with a non-zero code — no raw traceback.
 

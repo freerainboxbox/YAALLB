@@ -135,17 +135,17 @@ def test_download_help_shows_target_and_shortcut_draft(capsys):
     c._print_download_help("mlx-community/Qwen3.8-27B-4bit")
     err = capsys.readouterr().err
     assert "Qwen3.8-27B-4bit" in err
-    assert "huggingface-cli download mlx-community/Qwen3.8-27B-4bit" in err
+    assert "hf download mlx-community/Qwen3.8-27B-4bit" in err
     # the shortcut's default drafter download command is also shown
     assert "z-lab/Qwen3.8-27B-DFlash2" in err
-    assert "huggingface-cli download z-lab/Qwen3.8-27B-DFlash2" in err
+    assert "hf download z-lab/Qwen3.8-27B-DFlash2" in err
     assert "snapshot_download" in err
 
 
 def test_download_help_non_shortcut_lists_shortcuts(capsys):
     c._print_download_help("mlx-community/SomeModel")
     err = capsys.readouterr().err
-    assert "huggingface-cli download mlx-community/SomeModel" in err
+    assert "hf download mlx-community/SomeModel" in err
     assert "shortcuts:" in err
     assert "Qwen3.8-27B" in err
 
@@ -153,7 +153,7 @@ def test_download_help_non_shortcut_lists_shortcuts(capsys):
 def test_draft_download_help(capsys):
     c._print_draft_download_help("z-lab/Qwen3.8-27B-DFlash2")
     err = capsys.readouterr().err
-    assert "huggingface-cli download z-lab/Qwen3.8-27B-DFlash2" in err
+    assert "hf download z-lab/Qwen3.8-27B-DFlash2" in err
     assert "Qwen3.8-27B-4bit" not in err  # target not mentioned for a draft miss
 
 

@@ -129,7 +129,7 @@ def _default_compute_weights(model_path: str, draft_path: str | None):
 # Helpful download messages (shown on a missing model, then exit non-zero)
 # --------------------------------------------------------------------------- #
 def _print_download_command(repo_id: str) -> None:
-    print(f"  huggingface-cli download {repo_id}", file=sys.stderr)
+    print(f"  hf download {repo_id}", file=sys.stderr)
     print(
         f"  python -c \"from huggingface_hub import snapshot_download; "
         f"snapshot_download('{repo_id}')\"",

@@ -7,7 +7,7 @@ small, stable registry is duplicated here — keep it in sync with that file.
 
 Resolution searches the local HF Hub cache (``huggingface_hub.scan_cache_dir``)
 so a repo-id model_ref/draft_ref that was downloaded via ``snapshot_download``
-/ ``huggingface-cli download`` resolves to its snapshot directory for VRAM
+/ ``hf download`` resolves to its snapshot directory for VRAM
 estimation. A missing download raises ``FileNotFoundError`` so startup can
 print download help and exit; a missing draft_ref for a non-shortcut raises
 ``DflashDraftRequiredError``.
