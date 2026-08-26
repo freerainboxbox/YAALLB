@@ -538,7 +538,11 @@ default drafter, then exits with a non-zero code — no raw traceback.
 target's weight bytes come from a lazily built mlx_lm graph (Approach B), the
 draft's from safetensors metadata (Approach A — the dflash DFlash classes
 aren't importable in-process; A == B for the draft's mlx-native quantized
-checkpoint), and the ctx-scaled target KV is added at call time.
+checkpoint), and the ctx-scaled target KV is added at call time. Hybrid
+(qwen3_5/GDN) targets nest their text config under `text_config` and split
+`layer_types` into full-attention layers (ctx-scaled KV) and linear/gated-delta
+layers (fixed recurrent state) — YAALLB reads the nested config and sizes the
+KV accordingly.
 
 `getOAIModels` presents a **static single-model list** keyed on `alias` (like
 llama_cpp) — it never HTTP-queries the server. dflash is spawned lazily on
