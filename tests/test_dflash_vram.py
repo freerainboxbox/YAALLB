@@ -17,7 +17,9 @@ import pytest
 
 from providers.dflash_vram import (
     CHOSEN_APPROACH,
+    DFLASH_DRAFT_PARALLEL_TOKENS,
     dtype_itemsize,
+    draft_context_bytes,
     draft_kv_bytes,
     projected_mib,
     target_kv_bytes,
@@ -254,6 +256,14 @@ def test_target_kv_bytes_plain_config_still_works():
     }
     ctx = 100
     assert target_kv_bytes(cfg, ctx) == 4 * 2 * 16 * 2 * ctx * 2
+
+
+def test_draft_context_bytes_dflash2_block_size():
+    # DFlash2 declares its block width in dflash_config.block_size; use it
+    # over the default parallel width.
+    assert draft_context_bytes({"hidden_size": 64, "dflash_config": {"block_size": 8}}) == 8 * 64 * 2
+    # DFlash v1 (no dflash_config) uses the default parallel width
+    assert draft_context_bytes({"hidden_size": 64}) == DFLASH_DRAFT_PARALLEL_TOKENS * 64 * 2
 
 
 def test_draft_kv_bytes_nested_text_config():

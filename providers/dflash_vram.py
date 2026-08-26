@@ -234,11 +234,17 @@ def draft_kv_bytes(draft_config: dict) -> int:
 def draft_context_bytes(draft_config: dict) -> int:
     """Block-diffusion context activations: the parallel draft context and
     draft-generated hidden chunks.
+
+    DFlash2 drafts declare their block width in ``dflash_config.block_size``;
+    DFlash v1 uses the default parallel width. Reads the nested ``text_config``
+    for hybrid drafts too.
     """
-    hidden = draft_config["hidden_size"]
-    bytes_per_el = draft_config.get("draft_bytes_per_element", 2)
-    parallel = draft_config.get(
-        "parallel_tokens", DFLASH_DRAFT_PARALLEL_TOKENS
+    tc = _text_config(draft_config)
+    hidden = tc["hidden_size"]
+    bytes_per_el = tc.get("draft_bytes_per_element", 2)
+    dflash_cfg = draft_config.get("dflash_config") or {}
+    parallel = dflash_cfg.get(
+        "block_size", tc.get("parallel_tokens", DFLASH_DRAFT_PARALLEL_TOKENS)
     )
     return parallel * hidden * bytes_per_el
 
