@@ -22,6 +22,8 @@ import log
 from abstractions.load_options import LoadOptions
 from abstractions.provider import Provider
 from abstractions.routing import lookup_model
+from providers.dflash import DflashProvider
+from providers.dflash_cache import ensure_dflash_cache
 from providers.dwarfstar import DwarfStarProvider
 from providers.llama_cpp import LlamaCppProvider
 from providers.lmstudio import LMStudioProvider
@@ -42,6 +44,7 @@ PROVIDER_TYPES = {
     "lms": LMStudioProvider,
     "ds4": DwarfStarProvider,
     "llama_cpp": LlamaCppProvider,
+    "dflash-mlx": DflashProvider,
 }
 
 # YAALLB-internal per-model override keys: they configure YAALLB behavior
@@ -50,6 +53,34 @@ PROVIDER_TYPES = {
 INTERNAL_OVERRIDE_KEYS = frozenset(
     {"ctx_length", "on_start", "allow_non_streaming", "supports_streaming"}
 )
+
+
+def _default_max_tokens(provider: Provider) -> int | None:
+    """Upstream max_tokens default for spawned providers that declare a
+    provider-level context length (dflash/llama_cpp/ds4): their CLI fallback
+    is often a small value (e.g. dflash's --max-tokens default 512) that stops
+    generation mid-thought, so default to the provider's generation capacity.
+    LM Studio has no provider-level ctx_length and keeps its own default, so
+    this returns None there and no max_tokens default is injected."""
+    provider_ctx = getattr(provider, "ctx_length", None)
+    return provider_ctx if provider_ctx else None
+
+
+def _forward_body(body: dict, overrides: dict, provider: Provider) -> dict:
+    """Build the upstream chat-completions body: the client body + non-
+    internal model overrides as defaults, defaulting max_tokens to the
+    provider's generation capacity so a spawned provider never falls back to a
+    small CLI max_tokens and stops mid-thought. An explicit client max_tokens
+    is always respected (setdefault only fills when absent)."""
+    forward_body = dict(body)
+    for key, value in overrides.items():
+        if key in INTERNAL_OVERRIDE_KEYS:
+            continue
+        forward_body.setdefault(key, value)
+    default_max_tokens = _default_max_tokens(provider)
+    if default_max_tokens is not None:
+        forward_body.setdefault("max_tokens", default_max_tokens)
+    return forward_body
 
 
 @asynccontextmanager
@@ -312,17 +343,15 @@ async def _forward_non_streaming(
             },
         )
 
+    provider = model.descriptor.provider
+
     # Apply generation-param model overrides as defaults; force non-streaming
     # upstream. YAALLB-internal keys (ctx_length, on_start, streaming policy)
-    # are filtered out so they never leak onto the wire.
-    forward_body = dict(body)
-    for key, value in overrides.items():
-        if key in INTERNAL_OVERRIDE_KEYS:
-            continue
-        forward_body.setdefault(key, value)
+    # are filtered out so they never leak onto the wire. max_tokens defaults
+    # to the provider's context capacity (so dflash's CLI fallback of 512
+    # never caps generation mid-thought).
+    forward_body = _forward_body(body, overrides, provider)
     forward_body["stream"] = False
-
-    provider = model.descriptor.provider
     log.info(
         f"chat request model={model_id} "
         f"provider={provider._type_id}#{getattr(provider, '_instance_id', 0)} "
@@ -443,15 +472,12 @@ async def chat_completions(body: dict):
         # Apply generation-param model overrides (temperature, top_p, ...) as
         # defaults when the client didn't specify them; they ride along in the
         # body. YAALLB-internal keys (ctx_length, on_start, streaming policy)
-        # are filtered out so they never leak onto the wire.
-        forward_body = dict(body)
-        for key, value in overrides.items():
-            if key in INTERNAL_OVERRIDE_KEYS:
-                continue
-            forward_body.setdefault(key, value)
-        forward_body["stream"] = True
-
+        # are filtered out so they never leak onto the wire. max_tokens
+        # defaults to the provider's context capacity (so dflash's CLI fallback
+        # of 512 never caps generation mid-thought).
         provider = model.descriptor.provider
+        forward_body = _forward_body(body, overrides, provider)
+        forward_body["stream"] = True
         log.info(
             f"chat request model={model_id} "
             f"provider={provider._type_id}#{getattr(provider, '_instance_id', 0)} "
@@ -484,9 +510,9 @@ async def chat_completions(body: dict):
                 )
             except httpx.HTTPError as e:
                 await client.aclose()
-                # A spawned provider (llama_cpp/ds4) not answering means its
-                # model isn't actually ready yet; track that load state.
-                if provider._type_id in ("llama_cpp", "ds4"):
+                # A spawned provider (llama_cpp/ds4/dflash-mlx) not answering
+                # means its model isn't actually ready yet; track that load state.
+                if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx"):
                     model._load_state = "loading"
                 failures = _bump_startup_failures(provider, f"connection error: {e}")
             else:
@@ -494,7 +520,7 @@ async def chat_completions(body: dict):
                     provider.startup_failures = 0
                     # A spawned provider that transiently 4XX'd/errored was
                     # marked "loading"; a successful forward means it is ready.
-                    if provider._type_id in ("llama_cpp", "ds4"):
+                    if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx"):
                         model._load_state = "ready"
                     break
 
@@ -561,10 +587,10 @@ async def chat_completions(body: dict):
                     return
 
                 await client.aclose()
-                # A spawned provider (llama_cpp/ds4) returning non-200 means
-                # its model isn't actually ready yet; track that load state so
-                # the retry below continues until the readiness gate says ready.
-                if provider._type_id in ("llama_cpp", "ds4"):
+                # A spawned provider (llama_cpp/ds4/dflash-mlx) returning
+                # non-200 means its model isn't actually ready yet; track that
+                # load state so the retry below continues until readiness.
+                if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx"):
                     model._load_state = "loading"
                 failures = _bump_startup_failures(
                     provider, f"upstream status {upstream.status_code}"
@@ -581,7 +607,7 @@ async def chat_completions(body: dict):
             # provider whose model never became ready (load_state still
             # "loading") is a readiness failure (model_not_ready), not a
             # generic provider-start failure.
-            if provider._type_id in ("llama_cpp", "ds4") and model.load_state != "ready":
+            if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx") and model.load_state != "ready":
                 yield _sse_error(
                     "model_not_ready",
                     f"model `{model_id}` is not ready on "
@@ -645,6 +671,10 @@ def main() -> None:
     global SCHEDULER, PROVIDERS
     providers = load_providers(args.config)
     PROVIDERS.extend(providers)
+    # Precompute (or recall) the dflash VRAM impact cache before the scheduler
+    # starts, so Model.memory() can draw from it during on_start preload and
+    # request serving.
+    ensure_dflash_cache(args.config, providers)
     vram_limit_mb = load_vram_limit(args.config)
     SCHEDULER = Scheduler(PROVIDERS, vram_limit_mb)
 

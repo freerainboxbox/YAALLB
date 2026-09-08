@@ -1621,6 +1621,46 @@ def test_chat_completions_non_streaming_filters_internal_override_keys(monkeypat
         assert key not in json
 
 
+# --------------------------------------------------------------------------- #
+# Upstream body building: max_tokens defaults to provider ctx (spawned
+# providers like dflash fall back to a small CLI max_tokens otherwise)
+# --------------------------------------------------------------------------- #
+def test_forward_body_defaults_max_tokens_to_provider_ctx():
+    prov = FakeProvider("http://a.example/v1", ["m"])
+    prov.ctx_length = 262144
+    body = {"model": "m", "messages": [], "stream": True}
+    fb = main._forward_body(body, {}, prov)
+    assert fb["max_tokens"] == 262144
+    assert fb["model"] == "m"
+
+
+def test_forward_body_respects_explicit_client_max_tokens():
+    prov = FakeProvider("http://a.example/v1", ["m"])
+    prov.ctx_length = 262144
+    body = {"model": "m", "max_tokens": 100, "messages": []}
+    fb = main._forward_body(body, {}, prov)
+    assert fb["max_tokens"] == 100
+
+
+def test_forward_body_no_max_tokens_for_provider_without_ctx():
+    prov = FakeProvider("http://a.example/v1", ["m"])  # no ctx_length
+    body = {"model": "m", "messages": []}
+    fb = main._forward_body(body, {}, prov)
+    assert "max_tokens" not in fb
+
+
+def test_forward_body_filters_internal_override_keys():
+    prov = FakeProvider("http://a.example/v1", ["m"])
+    prov.ctx_length = 262144
+    body = {"model": "m", "messages": []}
+    overrides = {"ctx_length": 8192, "temperature": 0.7, "on_start": "always"}
+    fb = main._forward_body(body, overrides, prov)
+    assert "ctx_length" not in fb
+    assert "on_start" not in fb
+    assert fb["temperature"] == 0.7
+    assert fb["max_tokens"] == 262144
+
+
 def test_chat_completions_client_ctx_wins_over_override(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     prov_a.model_overrides = {"model-a": {"ctx_length": 8192, "temperature": 0.7}}
