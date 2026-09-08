@@ -37,19 +37,19 @@ def select_evictions(resident: list[Model], shortfall_mib: float) -> list[Model]
     Return whichever set is closer to shortfall (smaller over-eviction),
     tie-breaking toward the single model. Raise if neither can free enough.
     """
-    candidates = [m for m in resident if m.memory() > 0]
+    candidates = [m for m in resident if m.vram_mib() > 0]
 
     a = min(
-        (m for m in candidates if m.memory() >= shortfall_mib),
-        key=lambda m: m.memory(),
+        (m for m in candidates if m.vram_mib() >= shortfall_mib),
+        key=lambda m: m.vram_mib(),
         default=None,
     )
 
     b = []
     total = 0.0
-    for m in sorted(candidates, key=lambda m: m.memory()):
+    for m in sorted(candidates, key=lambda m: m.vram_mib()):
         b.append(m)
-        total += m.memory()
+        total += m.vram_mib()
         if total >= shortfall_mib:
             break
     if total < shortfall_mib:
@@ -62,7 +62,7 @@ def select_evictions(resident: list[Model], shortfall_mib: float) -> list[Model]
     if b is None:
         return [a]
 
-    a_freed = a.memory()
+    a_freed = a.vram_mib()
     b_freed = total
     if a_freed - shortfall_mib <= b_freed - shortfall_mib:
         return [a]
@@ -106,7 +106,7 @@ class Scheduler:
         self._task = None
 
     def current_free(self) -> float:
-        used = sum(m.memory() for m in self.resident)
+        used = sum(m.vram_mib() for m in self.resident)
         return self.budget_mib - used
 
     def _resident_for(self, provider: Provider, model_id: str):
@@ -167,7 +167,7 @@ class Scheduler:
         # unloaded request as quiescent and tear down the coordinator early.
         self.in_flight[model] += 1
         try:
-            mem = await asyncio.to_thread(model.memory)
+            mem = await asyncio.to_thread(model.vram_mib)
             if mem > 0:
                 shortfall = mem - self.current_free()
                 if shortfall > 0:

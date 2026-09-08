@@ -137,6 +137,14 @@ ties breaking toward the single model. If neither candidate can free enough,
 the request fails rather than over-committing. Models reporting `memory() == 0`
 (future cloud providers) are never evicted and load without eviction.
 
+Each provider instance may carry an optional `safety_buffer_mib` key: a fixed
+MiB headroom added on top of the provider's `memory()` estimate. The scheduler
+budgets and evicts against `memory() + safety_buffer_mib`, so a provider whose
+estimator under-reports (e.g. llama-fit-params, which does not account for
+mmproj files) can reserve extra room to avoid OOM. Models reporting a raw
+`memory() == 0` but a non-zero safety buffer are treated as VRAM-holding for
+eviction purposes.
+
 Requests for an eviction target are **line-cut** (served first out of the
 queue) and **drained** (in-flight I/O completes) before the model is actually
 unloaded, so no request is cut off mid-generation.

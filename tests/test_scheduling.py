@@ -84,6 +84,52 @@ def test_evict_excludes_zero_memory():
     assert select_evictions(models, 100) == [models[1]]
 
 
+# ---- safety buffer (vram_mib) ----
+
+
+def test_vram_mib_adds_provider_safety_buffer():
+    p = MemProvider("http://a", {"m1": 100})
+    p.safety_buffer_mib = 50
+    m = p.createModel(p.getModelsDescriptors()[0], LoadOptions())
+    assert m.memory() == 100
+    assert m.vram_mib() == 150
+
+
+def test_vram_mib_no_buffer_defaults_to_memory():
+    p = MemProvider("http://a", {"m1": 100})
+    m = p.createModel(p.getModelsDescriptors()[0], LoadOptions())
+    assert m.vram_mib() == 100
+
+
+def test_select_evictions_uses_safety_buffer():
+    # Raw memory 40+40=80 cannot free a 100-MiB shortfall (RuntimeError), but
+    # with a 30-MiB safety buffer each model's vram_mib is 70 -> B frees 140.
+    models = [MemModel(40), MemModel(40)]
+    for m in models:
+        m.descriptor.provider = MemProvider("http://a", {})
+        m.descriptor.provider.safety_buffer_mib = 30
+    assert select_evictions(models, 100) == [models[0], models[1]]
+
+
+def test_scheduler_evicts_for_safety_buffer_headroom():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80, "m2": 80})
+        p.safety_buffer_mib = 40
+        # Raw memory 80+80=160 fits budget 200, but vram_mib 120+120=240 does not.
+        s = Scheduler([p], budget_mib=200)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)
+            m2 = await s.submit("m2", LoadOptions())
+            assert m1 not in s.resident  # evicted because of the buffer
+            assert m2 in s.resident
+            s.release(m2)
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
 # ---- Scheduler ----
 
 def run(coro):
