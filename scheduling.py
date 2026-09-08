@@ -1,4 +1,5 @@
 import asyncio
+import time
 from collections import defaultdict
 
 import log
@@ -21,6 +22,11 @@ STOP_DRAIN_TIMEOUT = 30.0
 # eviction quiesce). sleep(0) would busy-spin a core for the whole drain,
 # which lasts as long as the longest in-flight generation.
 DRAIN_POLL_INTERVAL = 0.05
+
+# How often the TTL auto-eviction task scans resident models for idle ones
+# that have sat unserved for >= ttl seconds. A 1s scan keeps eviction prompt
+# without much overhead.
+TTL_CHECK_INTERVAL = 1.0
 
 
 class ModelNotFound(Exception):
@@ -70,20 +76,29 @@ def select_evictions(resident: list[Model], shortfall_mib: float) -> list[Model]
 
 
 class Scheduler:
-    def __init__(self, providers: list[Provider], budget_mib: float) -> None:
+    def __init__(
+        self, providers: list[Provider], budget_mib: float, ttl: float | None = None
+    ) -> None:
         self.providers = providers
         self.budget_mib = budget_mib
+        # TTL in seconds: an idle model that has not served a request for >= ttl
+        # is auto-evicted. None/0/negative disables the feature.
+        self.ttl = ttl or 0.0
         self.resident: list[Model] = []
         self.pending: list[tuple] = []  # (model_id, load_options, future)
         self.in_flight: dict[Model, int] = defaultdict(int)
+        # monotonic() timestamp of when each model last finished a request.
+        self.last_finish: dict[Model, float] = {}
         # Model ids that must never be evicted (on_start "always" models).
         self.protected: set[str] = set()
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
+        self._ttl_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         if self._task is None:
             self._task = asyncio.create_task(self._run())
+            self._ttl_task = asyncio.create_task(self._ttl_loop())
 
     async def stop(self, timeout: float = STOP_DRAIN_TIMEOUT) -> None:
         if self._task is None:
@@ -103,6 +118,13 @@ class Scheduler:
             await self._task
         except asyncio.CancelledError:
             pass
+        if self._ttl_task is not None:
+            self._ttl_task.cancel()
+            try:
+                await self._ttl_task
+            except asyncio.CancelledError:
+                pass
+            self._ttl_task = None
         self._task = None
 
     def current_free(self) -> float:
@@ -134,19 +156,22 @@ class Scheduler:
     def release(self, model: Model) -> None:
         if self.in_flight[model] > 0:
             self.in_flight[model] -= 1
+            if self.in_flight[model] == 0:
+                self.last_finish[model] = time.monotonic()
 
-    async def evict_idle(self) -> None:
-        """Prune every resident model that is not actively serving a request.
+    async def _prune(self, predicate) -> None:
+        """Unload every resident model that is idle, non-protected, and matches
+        predicate.
 
-        Models with in-flight requests are left resident — their eviction is
-        *not* queued — while quiescent, non-protected models are unloaded
-        immediately. This is the cleanup path for a manual ctrl+e (and the
-        TTL auto-eviction); it never cuts off a running generation.
+        In-flight models are left resident — their eviction is *not* queued —
+        so a running generation is never cut off. Used by the manual ctrl+e
+        prune (predicate always True) and the TTL auto-eviction.
         """
         to_evict = [
             m for m in self.resident
             if self.in_flight[m] == 0
             and m.descriptor.modelId not in self.protected
+            and predicate(m)
         ]
         if not to_evict:
             return
@@ -157,6 +182,25 @@ class Scheduler:
             )
             await asyncio.to_thread(m.descriptor.provider.unloadModel, m)
         self.resident = [m for m in self.resident if m not in to_evict]
+
+    async def evict_idle(self) -> None:
+        """Prune every resident model that is not actively serving a request.
+
+        This is the cleanup path for a manual ctrl+e; it never cuts off a
+        running generation and skips protected models.
+        """
+        await self._prune(lambda m: True)
+
+    async def _ttl_loop(self) -> None:
+        """Periodically auto-evict models idle for >= ttl seconds."""
+        if not self.ttl or self.ttl <= 0:
+            return
+        while True:
+            await asyncio.sleep(TTL_CHECK_INTERVAL)
+            now = time.monotonic()
+            await self._prune(
+                lambda m: now - self.last_finish.get(m, 0.0) >= self.ttl
+            )
 
     async def _run(self) -> None:
         while True:

@@ -1476,6 +1476,31 @@ def test_load_vram_limit_clamps_above_wired(tmp_path):
     assert main.load_vram_limit(str(path)) == 112640
 
 
+# ---- TTL ----
+
+
+def test_load_ttl_absent_is_none(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"wired_limit_mb": 112640}))
+    assert main.load_ttl(str(path)) is None
+
+
+def test_load_ttl_reads_seconds(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"wired_limit_mb": 112640, "ttl": 300}))
+    assert main.load_ttl(str(path)) == 300
+
+
+def test_load_ttl_zero_disables(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"ttl": 0}))
+    assert main.load_ttl(str(path)) == 0
+
+
+def test_load_ttl_missing_file_is_none(tmp_path):
+    assert main.load_ttl(str(tmp_path / "nope.json")) is None
+
+
 def test_main_wires_scheduler_globals(tmp_path, monkeypatch):
     config = {"wired_limit_mb": 112640, "lms": [{"host": "127.0.0.1", "port": 1234}]}
     path = tmp_path / "config.json"

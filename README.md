@@ -165,6 +165,12 @@ immediately (it is not a signal). The prune skips `on_start: "always"`
 (protected) models and requires stdin to be a TTY (it no-ops when headless/
 piped).
 
+`ttl` (top-level, optional) is an idle-eviction timer in **seconds**: a
+resident model that has not finished a request for `>= ttl` seconds is
+auto-evicted in the background (skipping protected and in-flight models, so a
+running generation is never cut off). Setting `ttl` to `0` or omitting it
+disables the feature.
+
 On startup YAALLB sets the macOS Metal VRAM cap to match `wired_limit_mb` via
 `sudo sysctl iogpu.wired_limit_mb=<mb>`. It first reads the current value (no
 privileges needed); if it already matches, no write is attempted, so you only

@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import pytest
 
@@ -487,6 +488,85 @@ def test_evict_idle_noop_when_nothing_idle():
             await s.evict_idle()
             assert [m.descriptor.modelId for m in s.resident] == ["m1"]
             s.release(m1)
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+# ---- TTL auto-eviction ----
+
+
+def test_ttl_prune_evicts_expired_keeps_fresh():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80, "m2": 80})
+        s = Scheduler([p], budget_mib=1000, ttl=5)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)
+            m2 = await s.submit("m2", LoadOptions()); s.release(m2)
+            # m1 sat idle past the TTL; m2 finished only 1s ago -> stays.
+            s.last_finish[m1] = time.monotonic() - 10
+            s.last_finish[m2] = time.monotonic() - 1
+            await s._prune(
+                lambda m: time.monotonic() - s.last_finish.get(m, 0.0) >= s.ttl
+            )
+            assert [m.descriptor.modelId for m in s.resident] == ["m2"]
+            assert m1._loaded is False
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_ttl_prune_skips_in_flight(monkeypatch):
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80})
+        s = Scheduler([p], budget_mib=1000, ttl=5)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions())  # still in-flight
+            s.last_finish[m1] = time.monotonic() - 10  # aged past TTL
+            await s._prune(
+                lambda m: time.monotonic() - s.last_finish.get(m, 0.0) >= s.ttl
+            )
+            assert [m.descriptor.modelId for m in s.resident] == ["m1"]
+            s.release(m1)
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_ttl_loop_auto_evicts(monkeypatch):
+    monkeypatch.setattr("scheduling.TTL_CHECK_INTERVAL", 0.05)
+
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80})
+        s = Scheduler([p], budget_mib=1000, ttl=0.1)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)
+            await asyncio.sleep(0.3)
+            # The background loop should have auto-evicted m1 after >= ttl idle.
+            assert m1 not in s.resident
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_ttl_disabled_no_eviction():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80})
+        s = Scheduler([p], budget_mib=1000, ttl=0)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)
+            s.last_finish[m1] = time.monotonic() - 100
+            await asyncio.sleep(0.1)
+            # ttl=0 disables the loop entirely: the idle model is kept.
+            assert [m.descriptor.modelId for m in s.resident] == ["m1"]
         finally:
             await s.stop()
 

@@ -226,6 +226,20 @@ def load_vram_limit(config_path: str) -> int:
     return vram
 
 
+def load_ttl(config_path: str) -> int | None:
+    """Read the TTL (seconds) for auto-evicting idle models.
+
+    None (key absent) or 0 disables the feature. A positive value means a
+    resident model that has not finished a request for >= ttl seconds is
+    auto-evicted (unless protected or still in-flight).
+    """
+    if not Path(config_path).exists():
+        return None
+    with open(config_path) as f:
+        config = json.load(f)
+    return config.get("ttl")
+
+
 def load_yaallb_config(config_path: str) -> dict:
     """Read the server-level settings (bind address, port, default ctx_length).
 
@@ -770,7 +784,8 @@ def main() -> None:
     # <= wired_limit_mb to leave breathing room for other VRAM-heavy tasks.
     wired_limit_mb = load_wired_limit(args.config)
     vram_limit_mb = load_vram_limit(args.config)
-    SCHEDULER = Scheduler(PROVIDERS, vram_limit_mb)
+    ttl = load_ttl(args.config)
+    SCHEDULER = Scheduler(PROVIDERS, vram_limit_mb, ttl=ttl)
 
     # CLI flags override config only when explicitly passed (differs from the
     # CLI defaults); otherwise config.json is the source of truth.
