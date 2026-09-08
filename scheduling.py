@@ -13,6 +13,19 @@ def _provider_label(provider: Provider) -> str:
     return f"{provider._type_id}#{getattr(provider, '_instance_id', 0)}"
 
 
+def _impact_suffix(prev_used: float, impact: float, is_evict: bool) -> str:
+    """Append the VRAM impact of a load/eviction to a log line.
+
+    Formats `` <sign><impact> MiB computed impact (<prev> -> <new>)``, where
+    sign is '+' for a load and '-' for an eviction, and ``new = prev +/- 
+    impact`` — e.g. 1000 MiB already loaded and a 2000 MiB model incoming
+    yields `` +2000 MiB computed impact (1000 -> 3000)``.
+    """
+    delta = -impact if is_evict else impact
+    new_used = prev_used + delta
+    return f" {delta:+.0f} MiB computed impact ({prev_used:.0f} -> {new_used:.0f})"
+
+
 # How long stop() waits for queued/in-flight requests to drain before force
 # tearing down the coordinator, so a stuck upstream or disconnected client
 # can't hang graceful shutdown forever.
@@ -175,10 +188,14 @@ class Scheduler:
         ]
         if not to_evict:
             return
+        running = sum(m.vram_mib() for m in self.resident)
         for m in to_evict:
+            impact = m.vram_mib()
+            running -= impact
             log.warning(
                 f"prune model={m.descriptor.modelId} "
                 f"provider={_provider_label(m.descriptor.provider)}"
+                + _impact_suffix(running + impact, impact, is_evict=True)
             )
             await asyncio.to_thread(m.descriptor.provider.unloadModel, m)
         self.resident = [m for m in self.resident if m not in to_evict]
@@ -252,17 +269,23 @@ class Scheduler:
                         f"evicting=[{', '.join(m.descriptor.modelId for m in to_evict)}]"
                     )
                     await self._quiesce(to_evict)
+                    running = sum(m.vram_mib() for m in self.resident)
                     for m in to_evict:
+                        impact = m.vram_mib()
+                        running -= impact
                         log.warning(
                             f"unload model={m.descriptor.modelId} "
                             f"provider={_provider_label(m.descriptor.provider)}"
+                            + _impact_suffix(running + impact, impact, is_evict=True)
                         )
                         m.descriptor.provider.unloadModel(m)
                     self.resident = [m for m in self.resident if m not in to_evict]
+            used_before_load = sum(m.vram_mib() for m in self.resident)
             log.warning(
                 f"load model={model_id} "
                 f"provider={_provider_label(provider)} "
                 f"ctx={load_options.ctx_length}"
+                + _impact_suffix(used_before_load, mem, is_evict=False)
             )
             await asyncio.to_thread(provider.loadModel, model)
             self.resident.append(model)

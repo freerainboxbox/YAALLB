@@ -152,6 +152,18 @@ mmproj files) can reserve extra room to avoid OOM. Models reporting a raw
 `memory() == 0` but a non-zero safety buffer are treated as VRAM-holding for
 eviction purposes.
 
+Every load/eviction log line reports the **VRAM impact** and the previous
+total usage -> new usage, e.g. with 1000 MiB already loaded and a 2000 MiB
+model incoming:
+
+```
+load model=... provider=... ctx=... +2000 MiB computed impact (1000 -> 3000)
+unload model=... provider=... -2000 MiB computed impact (1000 -> -1000)
+```
+
+The sign is `+` for a load and `-` for an eviction (or prune); the numbers
+are the effective footprint including any safety buffer.
+
 Requests for an eviction target are **line-cut** (served first out of the
 queue) and **drained** (in-flight I/O completes) before the model is actually
 unloaded, so no request is cut off mid-generation.

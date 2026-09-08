@@ -7,7 +7,12 @@ from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model as BaseModel
 from abstractions.provider import Provider
-from scheduling import ModelNotFound, Scheduler, select_evictions
+from scheduling import (
+    ModelNotFound,
+    Scheduler,
+    _impact_suffix,
+    select_evictions,
+)
 
 
 class MemModel(BaseModel):
@@ -83,6 +88,47 @@ def test_evict_no_solution_raises():
 def test_evict_excludes_zero_memory():
     models = [MemModel(0), MemModel(120)]
     assert select_evictions(models, 100) == [models[1]]
+
+
+# ---- VRAM impact log suffix ----
+
+
+def test_impact_suffix_load():
+    # 1000 MiB already loaded, 2000 MiB model incoming -> +2000 (1000 -> 3000).
+    assert _impact_suffix(1000, 2000, False) == (
+        " +2000 MiB computed impact (1000 -> 3000)"
+    )
+
+
+def test_impact_suffix_evict():
+    # Eviction uses a negative impact: -2000 (1000 -> -1000).
+    assert _impact_suffix(1000, 2000, True) == (
+        " -2000 MiB computed impact (1000 -> -1000)"
+    )
+
+
+def test_impact_suffix_rounds_floats():
+    assert _impact_suffix(150.4, 83.7, False) == (
+        " +84 MiB computed impact (150 -> 234)"
+    )
+
+
+def test_scheduler_logs_vram_impact(capsys):
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 100, "m2": 80})
+        s = Scheduler([p], budget_mib=150)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)
+            # m2 needs to evict m1: logs an unload (-100) then a load (+80).
+            m2 = await s.submit("m2", LoadOptions()); s.release(m2)
+        finally:
+            await s.stop()
+
+    run(scenario())
+    captured = capsys.readouterr().err
+    assert "-100 MiB computed impact" in captured
+    assert "+80 MiB computed impact" in captured
 
 
 # ---- safety buffer (vram_mib) ----
