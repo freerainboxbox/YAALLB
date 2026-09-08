@@ -1,4 +1,5 @@
 import asyncio
+import time
 from collections import defaultdict
 
 import log
@@ -12,6 +13,19 @@ def _provider_label(provider: Provider) -> str:
     return f"{provider._type_id}#{getattr(provider, '_instance_id', 0)}"
 
 
+def _impact_suffix(prev_used: float, impact: float, is_evict: bool) -> str:
+    """Append the VRAM impact of a load/eviction to a log line.
+
+    Formats `` <sign><impact> MiB computed impact (<prev> -> <new>)``, where
+    sign is '+' for a load and '-' for an eviction, and ``new = prev +/- 
+    impact`` — e.g. 1000 MiB already loaded and a 2000 MiB model incoming
+    yields `` +2000 MiB computed impact (1000 -> 3000)``.
+    """
+    delta = -impact if is_evict else impact
+    new_used = prev_used + delta
+    return f" {delta:+.0f} MiB computed impact ({prev_used:.0f} -> {new_used:.0f})"
+
+
 # How long stop() waits for queued/in-flight requests to drain before force
 # tearing down the coordinator, so a stuck upstream or disconnected client
 # can't hang graceful shutdown forever.
@@ -21,6 +35,11 @@ STOP_DRAIN_TIMEOUT = 30.0
 # eviction quiesce). sleep(0) would busy-spin a core for the whole drain,
 # which lasts as long as the longest in-flight generation.
 DRAIN_POLL_INTERVAL = 0.05
+
+# How often the TTL auto-eviction task scans resident models for idle ones
+# that have sat unserved for >= ttl seconds. A 1s scan keeps eviction prompt
+# without much overhead.
+TTL_CHECK_INTERVAL = 1.0
 
 
 class ModelNotFound(Exception):
@@ -37,19 +56,19 @@ def select_evictions(resident: list[Model], shortfall_mib: float) -> list[Model]
     Return whichever set is closer to shortfall (smaller over-eviction),
     tie-breaking toward the single model. Raise if neither can free enough.
     """
-    candidates = [m for m in resident if m.memory() > 0]
+    candidates = [m for m in resident if m.vram_mib() > 0]
 
     a = min(
-        (m for m in candidates if m.memory() >= shortfall_mib),
-        key=lambda m: m.memory(),
+        (m for m in candidates if m.vram_mib() >= shortfall_mib),
+        key=lambda m: m.vram_mib(),
         default=None,
     )
 
     b = []
     total = 0.0
-    for m in sorted(candidates, key=lambda m: m.memory()):
+    for m in sorted(candidates, key=lambda m: m.vram_mib()):
         b.append(m)
-        total += m.memory()
+        total += m.vram_mib()
         if total >= shortfall_mib:
             break
     if total < shortfall_mib:
@@ -62,7 +81,7 @@ def select_evictions(resident: list[Model], shortfall_mib: float) -> list[Model]
     if b is None:
         return [a]
 
-    a_freed = a.memory()
+    a_freed = a.vram_mib()
     b_freed = total
     if a_freed - shortfall_mib <= b_freed - shortfall_mib:
         return [a]
@@ -70,20 +89,29 @@ def select_evictions(resident: list[Model], shortfall_mib: float) -> list[Model]
 
 
 class Scheduler:
-    def __init__(self, providers: list[Provider], budget_mib: float) -> None:
+    def __init__(
+        self, providers: list[Provider], budget_mib: float, ttl: float | None = None
+    ) -> None:
         self.providers = providers
         self.budget_mib = budget_mib
+        # TTL in seconds: an idle model that has not served a request for >= ttl
+        # is auto-evicted. None/0/negative disables the feature.
+        self.ttl = ttl or 0.0
         self.resident: list[Model] = []
         self.pending: list[tuple] = []  # (model_id, load_options, future)
         self.in_flight: dict[Model, int] = defaultdict(int)
+        # monotonic() timestamp of when each model last finished a request.
+        self.last_finish: dict[Model, float] = {}
         # Model ids that must never be evicted (on_start "always" models).
         self.protected: set[str] = set()
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
+        self._ttl_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         if self._task is None:
             self._task = asyncio.create_task(self._run())
+            self._ttl_task = asyncio.create_task(self._ttl_loop())
 
     async def stop(self, timeout: float = STOP_DRAIN_TIMEOUT) -> None:
         if self._task is None:
@@ -103,10 +131,17 @@ class Scheduler:
             await self._task
         except asyncio.CancelledError:
             pass
+        if self._ttl_task is not None:
+            self._ttl_task.cancel()
+            try:
+                await self._ttl_task
+            except asyncio.CancelledError:
+                pass
+            self._ttl_task = None
         self._task = None
 
     def current_free(self) -> float:
-        used = sum(m.memory() for m in self.resident)
+        used = sum(m.vram_mib() for m in self.resident)
         return self.budget_mib - used
 
     def _resident_for(self, provider: Provider, model_id: str):
@@ -134,6 +169,55 @@ class Scheduler:
     def release(self, model: Model) -> None:
         if self.in_flight[model] > 0:
             self.in_flight[model] -= 1
+            if self.in_flight[model] == 0:
+                self.last_finish[model] = time.monotonic()
+
+    async def _prune(self, predicate) -> None:
+        """Unload every resident model that is idle, non-protected, and matches
+        predicate.
+
+        In-flight models are left resident — their eviction is *not* queued —
+        so a running generation is never cut off. Used by the manual ctrl+e
+        prune (predicate always True) and the TTL auto-eviction.
+        """
+        to_evict = [
+            m for m in self.resident
+            if self.in_flight[m] == 0
+            and m.descriptor.modelId not in self.protected
+            and predicate(m)
+        ]
+        if not to_evict:
+            return
+        running = sum(m.vram_mib() for m in self.resident)
+        for m in to_evict:
+            impact = m.vram_mib()
+            running -= impact
+            log.warning(
+                f"prune model={m.descriptor.modelId} "
+                f"provider={_provider_label(m.descriptor.provider)}"
+                + _impact_suffix(running + impact, impact, is_evict=True)
+            )
+            await asyncio.to_thread(m.descriptor.provider.unloadModel, m)
+        self.resident = [m for m in self.resident if m not in to_evict]
+
+    async def evict_idle(self) -> None:
+        """Prune every resident model that is not actively serving a request.
+
+        This is the cleanup path for a manual ctrl+e; it never cuts off a
+        running generation and skips protected models.
+        """
+        await self._prune(lambda m: True)
+
+    async def _ttl_loop(self) -> None:
+        """Periodically auto-evict models idle for >= ttl seconds."""
+        if not self.ttl or self.ttl <= 0:
+            return
+        while True:
+            await asyncio.sleep(TTL_CHECK_INTERVAL)
+            now = time.monotonic()
+            await self._prune(
+                lambda m: now - self.last_finish.get(m, 0.0) >= self.ttl
+            )
 
     async def _run(self) -> None:
         while True:
@@ -167,7 +251,7 @@ class Scheduler:
         # unloaded request as quiescent and tear down the coordinator early.
         self.in_flight[model] += 1
         try:
-            mem = await asyncio.to_thread(model.memory)
+            mem = await asyncio.to_thread(model.vram_mib)
             if mem > 0:
                 shortfall = mem - self.current_free()
                 if shortfall > 0:
@@ -185,17 +269,23 @@ class Scheduler:
                         f"evicting=[{', '.join(m.descriptor.modelId for m in to_evict)}]"
                     )
                     await self._quiesce(to_evict)
+                    running = sum(m.vram_mib() for m in self.resident)
                     for m in to_evict:
+                        impact = m.vram_mib()
+                        running -= impact
                         log.warning(
                             f"unload model={m.descriptor.modelId} "
                             f"provider={_provider_label(m.descriptor.provider)}"
+                            + _impact_suffix(running + impact, impact, is_evict=True)
                         )
                         m.descriptor.provider.unloadModel(m)
                     self.resident = [m for m in self.resident if m not in to_evict]
+            used_before_load = sum(m.vram_mib() for m in self.resident)
             log.warning(
                 f"load model={model_id} "
                 f"provider={_provider_label(provider)} "
                 f"ctx={load_options.ctx_length}"
+                + _impact_suffix(used_before_load, mem, is_evict=False)
             )
             await asyncio.to_thread(provider.loadModel, model)
             self.resident.append(model)

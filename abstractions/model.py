@@ -35,3 +35,16 @@ class Model(ABC):
     @abstractmethod
     def memory(self) -> float:
         """Projected memory footprint of the model in MiB."""
+
+    def vram_mib(self) -> float:
+        """Effective VRAM footprint in MiB, including the provider's optional
+        safety buffer.
+
+        The provider config key ``safety_buffer_mib`` lets a provider reserve
+        extra headroom on top of its own ``memory()`` estimate (e.g. to cover
+        VRAM the estimator can't see, like llama-fit-params missing mmproj
+        files). The scheduler budgets and evicts against this effective
+        footprint so the buffer prevents OOM.
+        """
+        buffer = getattr(self.descriptor.provider, "safety_buffer_mib", 0.0)
+        return self.memory() + (buffer or 0.0)

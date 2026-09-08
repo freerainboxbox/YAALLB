@@ -8,9 +8,15 @@ every provider.
 
 import argparse
 import asyncio
+import functools
 import json
+import os
+import select
 import shutil
 import subprocess
+import sys
+import termios
+import tty
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -30,7 +36,7 @@ from providers.lmstudio import LMStudioProvider
 from scheduling import ModelNotFound, Scheduler
 import uvicorn
 
-DEFAULT_VRAM_LIMIT_MIB = 24576
+DEFAULT_WIRED_LIMIT_MIB = 24576
 DEFAULT_CTX_LENGTH = 4096
 STARTUP_ATTEMPTS = 10
 
@@ -83,13 +89,68 @@ def _forward_body(body: dict, overrides: dict, provider: Provider) -> dict:
     return forward_body
 
 
+# ctrl+e (ENQ, byte 0x05) triggers a manual prune of all idle models.
+CTRL_E = b"\x05"
+
+
+async def input_monitor(scheduler: "Scheduler") -> None:
+    """Watch stdin for ctrl+e and evict every idle (non-serving) model.
+
+    ctrl+e is not a signal, so it needs an input loop rather than a signal
+    handler. We put stdin in cbreak mode (per-character delivery, echo kept)
+    and read one byte at a time off the event loop; on 0x05 we ask the
+    scheduler to evict_idle(). If stdin is not a TTY (headless, background,
+    piped, or a test harness) the monitor silently no-ops.
+    """
+    try:
+        fd = sys.stdin.fileno()
+        if not os.isatty(fd):
+            return
+        old_attrs = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except Exception:
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            # Non-blocking poll (bounded by a 1s select timeout) so the loop
+            # stays cancellable; each select call is off-thread, so no thread
+            # is ever parked on an uninterruptible blocking read.
+            ready, _, _ = await loop.run_in_executor(
+                None, functools.partial(select.select, [fd], [], [], 1.0)
+            )
+            if ready:
+                data = os.read(fd, 1)
+                if not data:
+                    break
+                if data == CTRL_E:
+                    log.info("ctrl+e received; evicting idle models")
+                    await scheduler.evict_idle()
+            else:
+                await asyncio.sleep(0)
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSAFLUSH, old_attrs)
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if SCHEDULER is not None:
         await SCHEDULER.start()
         await _preload_on_start()
+        monitor = asyncio.create_task(input_monitor(SCHEDULER))
+    else:
+        monitor = None
     yield
     if SCHEDULER is not None:
+        if monitor is not None:
+            monitor.cancel()
+            try:
+                await monitor
+            except (asyncio.CancelledError, Exception):
+                pass
         await SCHEDULER.stop()
         for model in SCHEDULER.resident:
             try:
@@ -128,12 +189,55 @@ def load_providers(config_path: str) -> list[Provider]:
     return providers
 
 
-def load_vram_limit(config_path: str) -> int:
+def load_wired_limit(config_path: str) -> int:
+    """Read the macOS Metal VRAM cap (``wired_limit_mb``), in MiB.
+
+    This is the value YAALLB writes to ``iogpu.wired_limit_mb`` via sudo
+    sysctl. Falls back to the default when the key is absent.
+    """
     if not Path(config_path).exists():
-        return DEFAULT_VRAM_LIMIT_MIB
+        return DEFAULT_WIRED_LIMIT_MIB
     with open(config_path) as f:
         config = json.load(f)
-    return config.get("vram_limit_mb", DEFAULT_VRAM_LIMIT_MIB)
+    return config.get("wired_limit_mb", DEFAULT_WIRED_LIMIT_MIB)
+
+
+def load_vram_limit(config_path: str) -> int:
+    """Read the scheduler VRAM budget (``vram_limit_mb``), in MiB.
+
+    This is the *software* budget YAALLB's scheduler enforces (the wired
+    limit is the hardware cap, set separately). ``vram_limit_mb`` is optional:
+    when absent it defaults to the wired limit (no breathing room), and when
+    present it is clamped to be strictly <= wired_limit_mb so the software
+    scheduler never asks for more headroom than the hardware allows.
+    """
+    wired = load_wired_limit(config_path)
+    if not Path(config_path).exists():
+        return wired
+    with open(config_path) as f:
+        config = json.load(f)
+    vram = config.get("vram_limit_mb", wired)
+    if vram > wired:
+        log.warning(
+            f"vram_limit_mb={vram} exceeds wired_limit_mb={wired}; "
+            f"clamping scheduler budget to {wired}"
+        )
+        return wired
+    return vram
+
+
+def load_ttl(config_path: str) -> int | None:
+    """Read the TTL (seconds) for auto-evicting idle models.
+
+    None (key absent) or 0 disables the feature. A positive value means a
+    resident model that has not finished a request for >= ttl seconds is
+    auto-evicted (unless protected or still in-flight).
+    """
+    if not Path(config_path).exists():
+        return None
+    with open(config_path) as f:
+        config = json.load(f)
+    return config.get("ttl")
 
 
 def load_yaallb_config(config_path: str) -> dict:
@@ -222,22 +326,22 @@ def read_iogpu_wired_limit() -> int | None:
         return None
 
 
-def set_iogpu_wired_limit(vram_limit_mb: int) -> bool:
-    """Set the macOS Metal VRAM cap to match YAALLB's budget.
+def set_iogpu_wired_limit(wired_limit_mb: int) -> bool:
+    """Set the macOS Metal VRAM cap to match YAALLB's wired limit.
 
     The kernel sysctl is privileged, so the write runs under sudo. Returns
     True on success. On failure logs a warning; YAALLB's own scheduler still
-    enforces the budget in software regardless.
+    enforces its (software) VRAM budget regardless.
     """
     current = read_iogpu_wired_limit()
-    if current == vram_limit_mb:
+    if current == wired_limit_mb:
         log.info(
-            f"iogpu.wired_limit_mb already {vram_limit_mb}; no sudo needed"
+            f"iogpu.wired_limit_mb already {wired_limit_mb}; no sudo needed"
         )
         return True
     log.info(
         f"iogpu.wired_limit_mb={current if current is not None else '?'}, "
-        f"target={vram_limit_mb} -> requesting sudo write"
+        f"target={wired_limit_mb} -> requesting sudo write"
     )
     sysctl = shutil.which("sysctl")
     sudo = shutil.which("sudo")
@@ -249,7 +353,7 @@ def set_iogpu_wired_limit(vram_limit_mb: int) -> bool:
         return False
     try:
         proc = subprocess.run(
-            [sudo, sysctl, "-w", f"iogpu.wired_limit_mb={vram_limit_mb}"],
+            [sudo, sysctl, "-w", f"iogpu.wired_limit_mb={wired_limit_mb}"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -259,11 +363,11 @@ def set_iogpu_wired_limit(vram_limit_mb: int) -> bool:
         return False
     if proc.returncode != 0:
         log.warning(
-            f"could not set iogpu.wired_limit_mb={vram_limit_mb} "
+            f"could not set iogpu.wired_limit_mb={wired_limit_mb} "
             f"(sudo denied or requires a password): {proc.stderr.strip()}"
         )
         return False
-    log.info(f"set iogpu.wired_limit_mb={vram_limit_mb}")
+    log.info(f"set iogpu.wired_limit_mb={wired_limit_mb}")
     return True
 
 
@@ -675,8 +779,13 @@ def main() -> None:
     # starts, so Model.memory() can draw from it during on_start preload and
     # request serving.
     ensure_dflash_cache(args.config, providers)
+    # wired_limit_mb is the hardware cap written to iogpu.wired_limit_mb;
+    # vram_limit_mb is the software scheduler budget, optional and clamped to
+    # <= wired_limit_mb to leave breathing room for other VRAM-heavy tasks.
+    wired_limit_mb = load_wired_limit(args.config)
     vram_limit_mb = load_vram_limit(args.config)
-    SCHEDULER = Scheduler(PROVIDERS, vram_limit_mb)
+    ttl = load_ttl(args.config)
+    SCHEDULER = Scheduler(PROVIDERS, vram_limit_mb, ttl=ttl)
 
     # CLI flags override config only when explicitly passed (differs from the
     # CLI defaults); otherwise config.json is the source of truth.
@@ -685,12 +794,13 @@ def main() -> None:
     global DEFAULT_CTX_LENGTH
     DEFAULT_CTX_LENGTH = yaallb["ctx_length"]
 
-    set_iogpu_wired_limit(vram_limit_mb)
+    set_iogpu_wired_limit(wired_limit_mb)
 
     log.info(
         f"starting yaallb on {address}:{port} "
         f"providers={[p._type_id for p in providers]} "
-        f"vram_limit={vram_limit_mb} MiB default_ctx={yaallb['ctx_length']}"
+        f"wired_limit={wired_limit_mb} MiB vram_limit={vram_limit_mb} MiB "
+        f"default_ctx={yaallb['ctx_length']}"
     )
 
     uvicorn.run(app, host=address, port=port)

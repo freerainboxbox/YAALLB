@@ -47,7 +47,8 @@ list of instance config objects:
 
 ```jsonc
 {
-  "vram_limit_mb": 24576,
+  "wired_limit_mb": 24576,
+  "vram_limit_mb": 23552,  // optional scheduler budget, <= wired_limit_mb
   "yaallb": {
     "address": "127.0.0.1",
     "port": 4343,
@@ -124,9 +125,15 @@ consumed locally, never forwarded to the upstream API:
 - `supports_streaming` — `false` marks a model that physically cannot stream
   (e.g. a diffusion LLM); such a model rejects `stream: true` requests.
 
-`vram_limit_mb` (top-level, default `24576`) is the global VRAM budget in
-MiB. When a new load would exceed it, YAALLB picks the **least-impact
-eviction set** from the resident models (those reporting `memory() > 0`):
+Two top-level keys control VRAM. `wired_limit_mb` (default `24576`) is the
+hardware Metal VRAM cap YAALLB writes to `iogpu.wired_limit_mb` on startup.
+`vram_limit_mb` (optional, defaults to `wired_limit_mb`) is the *software*
+budget YAALLB's scheduler enforces and evicts against. It is clamped to be
+strictly <= `wired_limit_mb`, so the software scheduler never asks for more
+headroom than the hardware allows — set it below the wired limit to leave
+breathing room for other VRAM-heavy tasks. When a new load would exceed it,
+YAALLB picks the **least-impact eviction set** from the resident models
+(those reporting `memory() > 0`):
 
 - Candidate A: the smallest single resident model that alone frees enough.
 - Candidate B: greedily accumulate resident models smallest-to-next-smallest
@@ -137,14 +144,49 @@ ties breaking toward the single model. If neither candidate can free enough,
 the request fails rather than over-committing. Models reporting `memory() == 0`
 (future cloud providers) are never evicted and load without eviction.
 
+Each provider instance may carry an optional `safety_buffer_mib` key: a fixed
+MiB headroom added on top of the provider's `memory()` estimate. The scheduler
+budgets and evicts against `memory() + safety_buffer_mib`, so a provider whose
+estimator under-reports (e.g. llama-fit-params, which does not account for
+mmproj files) can reserve extra room to avoid OOM. Models reporting a raw
+`memory() == 0` but a non-zero safety buffer are treated as VRAM-holding for
+eviction purposes.
+
+Every load/eviction log line reports the **VRAM impact** and the previous
+total usage -> new usage, e.g. with 1000 MiB already loaded and a 2000 MiB
+model incoming:
+
+```
+load model=... provider=... ctx=... +2000 MiB computed impact (1000 -> 3000)
+unload model=... provider=... -2000 MiB computed impact (1000 -> -1000)
+```
+
+The sign is `+` for a load and `-` for an eviction (or prune); the numbers
+are the effective footprint including any safety buffer.
+
 Requests for an eviction target are **line-cut** (served first out of the
 queue) and **drained** (in-flight I/O completes) before the model is actually
 unloaded, so no request is cut off mid-generation.
 
-On startup YAALLB sets the macOS Metal VRAM cap to match `vram_limit_mb` via
+Pressing **ctrl+e** in the terminal prunes every resident model that is not
+actively serving a request (in-flight I/O keeps a model resident; its
+pruning is never queued). It is a manual cleanup/eviction override — useful
+when you want to free VRAM without a new load forcing evictions. YAALLB puts
+stdin in cbreak mode and reads one byte at a time, so ctrl+e is delivered
+immediately (it is not a signal). The prune skips `on_start: "always"`
+(protected) models and requires stdin to be a TTY (it no-ops when headless/
+piped).
+
+`ttl` (top-level, optional) is an idle-eviction timer in **seconds**: a
+resident model that has not finished a request for `>= ttl` seconds is
+auto-evicted in the background (skipping protected and in-flight models, so a
+running generation is never cut off). Setting `ttl` to `0` or omitting it
+disables the feature.
+
+On startup YAALLB sets the macOS Metal VRAM cap to match `wired_limit_mb` via
 `sudo sysctl iogpu.wired_limit_mb=<mb>`. It first reads the current value (no
 privileges needed); if it already matches, no write is attempted, so you only
-need `sudo` once after a reboot — unless you change `vram_limit_mb`. The write
+need `sudo` once after a reboot — unless you change `wired_limit_mb`. The write
 runs under sudo: YAALLB logs a warning and continues (the software scheduler
 still enforces the budget) when sudo is denied or a password is required.
 

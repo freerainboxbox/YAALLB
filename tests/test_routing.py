@@ -1434,8 +1434,75 @@ def test_set_iogpu_wired_limit_no_sudo(monkeypatch):
     assert main.set_iogpu_wired_limit(112640) is False
 
 
+# ---- wired_limit_mb vs vram_limit_mb ----
+
+
+def test_load_wired_limit_default(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({}))
+    assert main.load_wired_limit(str(path)) == main.DEFAULT_WIRED_LIMIT_MIB
+
+
+def test_load_wired_limit_missing_file(tmp_path):
+    assert (
+        main.load_wired_limit(str(tmp_path / "nope.json"))
+        == main.DEFAULT_WIRED_LIMIT_MIB
+    )
+
+
+def test_load_wired_limit_reads(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"wired_limit_mb": 112640}))
+    assert main.load_wired_limit(str(path)) == 112640
+
+
+def test_load_vram_limit_defaults_to_wired(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"wired_limit_mb": 112640}))
+    assert main.load_vram_limit(str(path)) == 112640
+
+
+def test_load_vram_limit_reads(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"wired_limit_mb": 112640, "vram_limit_mb": 100000}))
+    assert main.load_vram_limit(str(path)) == 100000
+
+
+def test_load_vram_limit_clamps_above_wired(tmp_path):
+    # vram_limit_mb must be strictly <= wired_limit_mb: an over-budget value is
+    # clamped back to the wired limit (with a warning) instead of over-committing.
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"wired_limit_mb": 112640, "vram_limit_mb": 200000}))
+    assert main.load_vram_limit(str(path)) == 112640
+
+
+# ---- TTL ----
+
+
+def test_load_ttl_absent_is_none(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"wired_limit_mb": 112640}))
+    assert main.load_ttl(str(path)) is None
+
+
+def test_load_ttl_reads_seconds(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"wired_limit_mb": 112640, "ttl": 300}))
+    assert main.load_ttl(str(path)) == 300
+
+
+def test_load_ttl_zero_disables(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"ttl": 0}))
+    assert main.load_ttl(str(path)) == 0
+
+
+def test_load_ttl_missing_file_is_none(tmp_path):
+    assert main.load_ttl(str(tmp_path / "nope.json")) is None
+
+
 def test_main_wires_scheduler_globals(tmp_path, monkeypatch):
-    config = {"vram_limit_mb": 112640, "lms": [{"host": "127.0.0.1", "port": 1234}]}
+    config = {"wired_limit_mb": 112640, "lms": [{"host": "127.0.0.1", "port": 1234}]}
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
 

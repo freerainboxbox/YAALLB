@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import pytest
 
@@ -6,7 +7,12 @@ from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model as BaseModel
 from abstractions.provider import Provider
-from scheduling import ModelNotFound, Scheduler, select_evictions
+from scheduling import (
+    ModelNotFound,
+    Scheduler,
+    _impact_suffix,
+    select_evictions,
+)
 
 
 class MemModel(BaseModel):
@@ -82,6 +88,93 @@ def test_evict_no_solution_raises():
 def test_evict_excludes_zero_memory():
     models = [MemModel(0), MemModel(120)]
     assert select_evictions(models, 100) == [models[1]]
+
+
+# ---- VRAM impact log suffix ----
+
+
+def test_impact_suffix_load():
+    # 1000 MiB already loaded, 2000 MiB model incoming -> +2000 (1000 -> 3000).
+    assert _impact_suffix(1000, 2000, False) == (
+        " +2000 MiB computed impact (1000 -> 3000)"
+    )
+
+
+def test_impact_suffix_evict():
+    # Eviction uses a negative impact: -2000 (1000 -> -1000).
+    assert _impact_suffix(1000, 2000, True) == (
+        " -2000 MiB computed impact (1000 -> -1000)"
+    )
+
+
+def test_impact_suffix_rounds_floats():
+    assert _impact_suffix(150.4, 83.7, False) == (
+        " +84 MiB computed impact (150 -> 234)"
+    )
+
+
+def test_scheduler_logs_vram_impact(capsys):
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 100, "m2": 80})
+        s = Scheduler([p], budget_mib=150)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)
+            # m2 needs to evict m1: logs an unload (-100) then a load (+80).
+            m2 = await s.submit("m2", LoadOptions()); s.release(m2)
+        finally:
+            await s.stop()
+
+    run(scenario())
+    captured = capsys.readouterr().err
+    assert "-100 MiB computed impact" in captured
+    assert "+80 MiB computed impact" in captured
+
+
+# ---- safety buffer (vram_mib) ----
+
+
+def test_vram_mib_adds_provider_safety_buffer():
+    p = MemProvider("http://a", {"m1": 100})
+    p.safety_buffer_mib = 50
+    m = p.createModel(p.getModelsDescriptors()[0], LoadOptions())
+    assert m.memory() == 100
+    assert m.vram_mib() == 150
+
+
+def test_vram_mib_no_buffer_defaults_to_memory():
+    p = MemProvider("http://a", {"m1": 100})
+    m = p.createModel(p.getModelsDescriptors()[0], LoadOptions())
+    assert m.vram_mib() == 100
+
+
+def test_select_evictions_uses_safety_buffer():
+    # Raw memory 40+40=80 cannot free a 100-MiB shortfall (RuntimeError), but
+    # with a 30-MiB safety buffer each model's vram_mib is 70 -> B frees 140.
+    models = [MemModel(40), MemModel(40)]
+    for m in models:
+        m.descriptor.provider = MemProvider("http://a", {})
+        m.descriptor.provider.safety_buffer_mib = 30
+    assert select_evictions(models, 100) == [models[0], models[1]]
+
+
+def test_scheduler_evicts_for_safety_buffer_headroom():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80, "m2": 80})
+        p.safety_buffer_mib = 40
+        # Raw memory 80+80=160 fits budget 200, but vram_mib 120+120=240 does not.
+        s = Scheduler([p], budget_mib=200)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)
+            m2 = await s.submit("m2", LoadOptions())
+            assert m1 not in s.resident  # evicted because of the buffer
+            assert m2 in s.resident
+            s.release(m2)
+        finally:
+            await s.stop()
+
+    run(scenario())
 
 
 # ---- Scheduler ----
@@ -384,6 +477,142 @@ def test_scheduler_impossible_load_raises():
             with pytest.raises(RuntimeError):
                 await s.submit("m1", LoadOptions())
             assert s.resident == []
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+# ---- evict_idle (manual ctrl+e prune) ----
+
+
+def test_evict_idle_evicts_idle_keeps_in_flight():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80, "m2": 80, "m3": 80})
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)  # idle
+            m2 = await s.submit("m2", LoadOptions())  # stays in-flight
+            m3 = await s.submit("m3", LoadOptions()); s.release(m3)  # idle
+            await s.evict_idle()
+            # m1/m3 were idle -> evicted; m2 still in-flight -> left resident.
+            assert [m.descriptor.modelId for m in s.resident] == ["m2"]
+            assert all(m._loaded is False for m in [m1, m3])
+            s.release(m2)
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_evict_idle_skips_protected():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80, "m2": 80})
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)
+            m2 = await s.submit("m2", LoadOptions()); s.release(m2)
+            s.protected.add("m1")
+            await s.evict_idle()
+            # m1 protected stays resident; m2 idle non-protected is pruned.
+            assert [m.descriptor.modelId for m in s.resident] == ["m1"]
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_evict_idle_noop_when_nothing_idle():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80})
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions())  # in-flight
+            await s.evict_idle()
+            assert [m.descriptor.modelId for m in s.resident] == ["m1"]
+            s.release(m1)
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+# ---- TTL auto-eviction ----
+
+
+def test_ttl_prune_evicts_expired_keeps_fresh():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80, "m2": 80})
+        s = Scheduler([p], budget_mib=1000, ttl=5)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)
+            m2 = await s.submit("m2", LoadOptions()); s.release(m2)
+            # m1 sat idle past the TTL; m2 finished only 1s ago -> stays.
+            s.last_finish[m1] = time.monotonic() - 10
+            s.last_finish[m2] = time.monotonic() - 1
+            await s._prune(
+                lambda m: time.monotonic() - s.last_finish.get(m, 0.0) >= s.ttl
+            )
+            assert [m.descriptor.modelId for m in s.resident] == ["m2"]
+            assert m1._loaded is False
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_ttl_prune_skips_in_flight(monkeypatch):
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80})
+        s = Scheduler([p], budget_mib=1000, ttl=5)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions())  # still in-flight
+            s.last_finish[m1] = time.monotonic() - 10  # aged past TTL
+            await s._prune(
+                lambda m: time.monotonic() - s.last_finish.get(m, 0.0) >= s.ttl
+            )
+            assert [m.descriptor.modelId for m in s.resident] == ["m1"]
+            s.release(m1)
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_ttl_loop_auto_evicts(monkeypatch):
+    monkeypatch.setattr("scheduling.TTL_CHECK_INTERVAL", 0.05)
+
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80})
+        s = Scheduler([p], budget_mib=1000, ttl=0.1)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)
+            await asyncio.sleep(0.3)
+            # The background loop should have auto-evicted m1 after >= ttl idle.
+            assert m1 not in s.resident
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_ttl_disabled_no_eviction():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80})
+        s = Scheduler([p], budget_mib=1000, ttl=0)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)
+            s.last_finish[m1] = time.monotonic() - 100
+            await asyncio.sleep(0.1)
+            # ttl=0 disables the loop entirely: the idle model is kept.
+            assert [m.descriptor.modelId for m in s.resident] == ["m1"]
         finally:
             await s.stop()
 
