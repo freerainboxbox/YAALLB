@@ -8,9 +8,15 @@ every provider.
 
 import argparse
 import asyncio
+import functools
 import json
+import os
+import select
 import shutil
 import subprocess
+import sys
+import termios
+import tty
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -83,13 +89,68 @@ def _forward_body(body: dict, overrides: dict, provider: Provider) -> dict:
     return forward_body
 
 
+# ctrl+e (ENQ, byte 0x05) triggers a manual prune of all idle models.
+CTRL_E = b"\x05"
+
+
+async def input_monitor(scheduler: "Scheduler") -> None:
+    """Watch stdin for ctrl+e and evict every idle (non-serving) model.
+
+    ctrl+e is not a signal, so it needs an input loop rather than a signal
+    handler. We put stdin in cbreak mode (per-character delivery, echo kept)
+    and read one byte at a time off the event loop; on 0x05 we ask the
+    scheduler to evict_idle(). If stdin is not a TTY (headless, background,
+    piped, or a test harness) the monitor silently no-ops.
+    """
+    try:
+        fd = sys.stdin.fileno()
+        if not os.isatty(fd):
+            return
+        old_attrs = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except Exception:
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            # Non-blocking poll (bounded by a 1s select timeout) so the loop
+            # stays cancellable; each select call is off-thread, so no thread
+            # is ever parked on an uninterruptible blocking read.
+            ready, _, _ = await loop.run_in_executor(
+                None, functools.partial(select.select, [fd], [], [], 1.0)
+            )
+            if ready:
+                data = os.read(fd, 1)
+                if not data:
+                    break
+                if data == CTRL_E:
+                    log.info("ctrl+e received; evicting idle models")
+                    await scheduler.evict_idle()
+            else:
+                await asyncio.sleep(0)
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSAFLUSH, old_attrs)
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if SCHEDULER is not None:
         await SCHEDULER.start()
         await _preload_on_start()
+        monitor = asyncio.create_task(input_monitor(SCHEDULER))
+    else:
+        monitor = None
     yield
     if SCHEDULER is not None:
+        if monitor is not None:
+            monitor.cancel()
+            try:
+                await monitor
+            except (asyncio.CancelledError, Exception):
+                pass
         await SCHEDULER.stop()
         for model in SCHEDULER.resident:
             try:

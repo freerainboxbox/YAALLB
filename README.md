@@ -156,6 +156,15 @@ Requests for an eviction target are **line-cut** (served first out of the
 queue) and **drained** (in-flight I/O completes) before the model is actually
 unloaded, so no request is cut off mid-generation.
 
+Pressing **ctrl+e** in the terminal prunes every resident model that is not
+actively serving a request (in-flight I/O keeps a model resident; its
+pruning is never queued). It is a manual cleanup/eviction override — useful
+when you want to free VRAM without a new load forcing evictions. YAALLB puts
+stdin in cbreak mode and reads one byte at a time, so ctrl+e is delivered
+immediately (it is not a signal). The prune skips `on_start: "always"`
+(protected) models and requires stdin to be a TTY (it no-ops when headless/
+piped).
+
 On startup YAALLB sets the macOS Metal VRAM cap to match `wired_limit_mb` via
 `sudo sysctl iogpu.wired_limit_mb=<mb>`. It first reads the current value (no
 privileges needed); if it already matches, no write is attempted, so you only

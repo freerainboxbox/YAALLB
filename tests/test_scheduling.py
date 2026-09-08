@@ -434,3 +434,60 @@ def test_scheduler_impossible_load_raises():
             await s.stop()
 
     run(scenario())
+
+
+# ---- evict_idle (manual ctrl+e prune) ----
+
+
+def test_evict_idle_evicts_idle_keeps_in_flight():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80, "m2": 80, "m3": 80})
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)  # idle
+            m2 = await s.submit("m2", LoadOptions())  # stays in-flight
+            m3 = await s.submit("m3", LoadOptions()); s.release(m3)  # idle
+            await s.evict_idle()
+            # m1/m3 were idle -> evicted; m2 still in-flight -> left resident.
+            assert [m.descriptor.modelId for m in s.resident] == ["m2"]
+            assert all(m._loaded is False for m in [m1, m3])
+            s.release(m2)
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_evict_idle_skips_protected():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80, "m2": 80})
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions()); s.release(m1)
+            m2 = await s.submit("m2", LoadOptions()); s.release(m2)
+            s.protected.add("m1")
+            await s.evict_idle()
+            # m1 protected stays resident; m2 idle non-protected is pruned.
+            assert [m.descriptor.modelId for m in s.resident] == ["m1"]
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_evict_idle_noop_when_nothing_idle():
+    async def scenario():
+        p = MemProvider("http://a", {"m1": 80})
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        try:
+            m1 = await s.submit("m1", LoadOptions())  # in-flight
+            await s.evict_idle()
+            assert [m.descriptor.modelId for m in s.resident] == ["m1"]
+            s.release(m1)
+        finally:
+            await s.stop()
+
+    run(scenario())

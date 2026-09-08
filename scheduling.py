@@ -135,6 +135,29 @@ class Scheduler:
         if self.in_flight[model] > 0:
             self.in_flight[model] -= 1
 
+    async def evict_idle(self) -> None:
+        """Prune every resident model that is not actively serving a request.
+
+        Models with in-flight requests are left resident — their eviction is
+        *not* queued — while quiescent, non-protected models are unloaded
+        immediately. This is the cleanup path for a manual ctrl+e (and the
+        TTL auto-eviction); it never cuts off a running generation.
+        """
+        to_evict = [
+            m for m in self.resident
+            if self.in_flight[m] == 0
+            and m.descriptor.modelId not in self.protected
+        ]
+        if not to_evict:
+            return
+        for m in to_evict:
+            log.warning(
+                f"prune model={m.descriptor.modelId} "
+                f"provider={_provider_label(m.descriptor.provider)}"
+            )
+            await asyncio.to_thread(m.descriptor.provider.unloadModel, m)
+        self.resident = [m for m in self.resident if m not in to_evict]
+
     async def _run(self) -> None:
         while True:
             while self.pending:
