@@ -412,13 +412,27 @@ second (~0.3s measured against an 80.8 GiB GGUF), since it only maps the GGUF
 and reads its metadata — and are memoized afterwards.
 
 Counted in the projection: GGUF bytes (main model plus `mtp_model`/`vision`
-support GGUFs), `batched_session` × ds4's context bytes (each resident ds4
-session gets its own session graphs/caches), and a fixed process overhead
-(`DS4_PROCESS_OVERHEAD_MIB` in `providers/dwarfstar_estimate.py`). Not counted:
-the DSpark/speculative-capture scratch (tens of MiB) and per-GPU placement
-(`--gpu-vram`, `--cuda-tensor-parallel`) or distributed layer slices
-(`--role`/`--layers`/`--tensor-parallel`), which is also why those flag families
-stay out of the options registry; `safety_buffer_mib` is the escape hatch.
+support GGUFs — the whole support file, which is conservative), `batched_session`
+× ds4's context bytes (each resident ds4 session gets its own session
+graphs/caches), and a fixed process overhead (`DS4_PROCESS_OVERHEAD_MIB` in
+`providers/dwarfstar_estimate.py`).
+
+Not counted, and to be covered with `safety_buffer_mib` when you use them:
+
+- DSpark's per-session graph scratch. ds4 allocates it per session
+  (`ds4_session_create` → `metal_graph_configure_dspark_capture`) at up to
+  `8 target layers × prefill_cap × embedding` for the target-hidden batch
+  buffer plus `8 stages × raw_kv_rows × head_dim` of draft-side raw cache — on
+  DeepSeek V4 Flash/Metal at `ctx=1000000` (prefill_cap 4096, raw rows 4352)
+  that is ~512 MiB + ~71 MiB **per session**, shrinking with the support
+  checkpoint's real stage/target-layer counts. `--mtp-draft` frontier-snapshot
+  state adds a further ≤17 MiB. ds4's own public estimator has no term for any
+  of this, so `ds4-estimate` cannot report it either.
+- Per-GPU placement (`--gpu-vram`, `--cuda-tensor-parallel`) and distributed
+  layer slices (`--role`/`--layers`/`--tensor-parallel`), which is also why those
+  flag families stay out of the options registry.
+- `--mtp-model` with `--ssd-streaming`: ds4 refuses that combination at boot, so
+  such a config fails at load rather than being mis-budgeted.
 
 **If the estimator is missing or fails** (never built, stale against the ds4
 tree, wrong model path), YAALLB logs one warning per (model, ctx) configuration
