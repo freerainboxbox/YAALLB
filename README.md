@@ -294,9 +294,11 @@ defaults for everything you don't set.
 
 | options key                          | flag                                   | kind  | default |
 | ------------------------------------ | -------------------------------------- | ----- | ------- |
+| `vision`                             | `--vision`                             | value | —       |
 | `backend`                            | `--backend`                            | value | —       |
 | `metal`                              | `--metal`                              | flag  | false   |
 | `cuda`                               | `--cuda`                               | flag  | false   |
+| `rocm`                               | `--rocm`                               | flag  | false   |
 | `cpu`                                | `--cpu`                                | flag  | false   |
 | `gpu_vram`                           | `--gpu-vram`                           | value | —       |
 | `gpu_devices`                        | `--gpu-devices`                        | value | —       |
@@ -311,9 +313,21 @@ defaults for everything you don't set.
 | `ssd_streaming_preload_experts`      | `--ssd-streaming-preload-experts`      | value | —       |
 | `simulate_used_memory`               | `--simulate-used-memory`               | value | —       |
 | `prefill_chunk`                      | `--prefill-chunk`                      | value | —       |
+| `mtp`                                | `--mtp`                                | flag  | false   |
+| `mtp_model`                          | `--mtp-model`                          | value | —       |
+| `mtp_draft`                          | `--mtp-draft`                          | value | 1       |
+| `mtp_margin`                         | `--mtp-margin`                         | value | 3       |
+| `mtp_timing`                         | `--mtp-timing`                         | flag  | false   |
+| `dspark`                             | `--dspark`                             | flag  | false   |
+| `dspark_confidence`                  | `--dspark-confidence`                  | value | —       |
+| `mtp_exact_sampling`                 | `--mtp-exact-sampling`                 | flag  | false   |
+| `dspark_strict`                      | `--dspark-strict`                      | flag  | false   |
+| `quality`                            | `--quality`                            | flag  | false   |
+| `warm_weights`                       | `--warm-weights`                       | flag  | false   |
 | `cors`                               | `--cors`                               | flag  | false   |
 | `trace`                              | `--trace`                              | value | —       |
 | `batched_session`                    | `--batched-session`                    | value | —       |
+| `mixed_prefill_quantum`              | `--mixed-prefill-quantum`              | value | 128     |
 | `kv_disk_dir`                        | `--kv-disk-dir`                        | value | —       |
 | `kv_disk_space_mb`                   | `--kv-disk-space-mb`                   | value | 4096    |
 | `kv_cache_min_tokens`                | `--kv-cache-min-tokens`                | value | 512     |
