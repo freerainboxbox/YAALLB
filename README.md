@@ -16,6 +16,7 @@ scheduling.py      VRAM-aware model scheduler and eviction
 log.py             Colored, ISO-timestamped logging to stderr
 abstractions/      Base types: Provider, Model, ModelDescriptor, LoadOptions; routing
 providers/         Concrete providers: LMStudioProvider, DwarfStarProvider, LlamaCppProvider, DflashProvider
+tools/             ds4_estimate.c + ds4-estimate.mk: footprint estimator built inside your ds4 tree
 config.json        Provider instances per type ("lms", "ds4", "llama_cpp", ...)
 tests/             pytest suite
 pyproject.toml     Project metadata and dependencies (uv-managed)
@@ -262,6 +263,14 @@ every dflash-mlx provider (logging progress per provider) and store it.
 `memory()` draws from the cache; on a miss it recomputes on the fly
 (defensive) rather than returning a stale/zero estimate.
 
+**Not every provider caches.** `ds4` (see below) deliberately does not, because
+none of the convention's assumptions hold for it: its footprint is computed by
+the ds4 build itself in a subprocess that costs well under a second, it has no
+ctx-independent part worth storing (the entire context/KV/scratch term depends
+on the model shape that GGUF records), and the ctx to price changes per
+request. ds4 instead memoizes estimates per process and warms the configured
+contexts at startup.
+
 ### Providers
 
 #### ds4
@@ -270,15 +279,16 @@ every dflash-mlx provider (logging progress per provider) and store it.
 each instance needs to know how to launch `ds4-server` from a working
 directory.
 
-| key          | default        | required                                                                 |
-| ------------ | -------------- | ------------------------------------------------------------------------ |
-| `ds4_dir`    | —              | yes — path to your ds4 build; the working directory the server runs from |
-| `gguf_path`  | —              | yes — path to the GGUF model loaded by ds4 (relative to `ds4_dir`)       |
-| `host`       | `127.0.0.1`    | no — ds4 bind address, also the reverse-proxy target                     |
-| `port`       | `8000`         | no — ds4 bind port, also the reverse-proxy target                        |
-| `binary`     | `./ds4-server` | no — program to run, relative to `ds4_dir`                               |
-| `options`    | `{}`           | no — overrides for ds4-server flags (see below)                          |
-| `ctx_length` | —              | no — provider-level context length, overrides the per-model one          |
+| key             | default          | required                                                                 |
+| --------------- | ---------------- | ------------------------------------------------------------------------ |
+| `ds4_dir`       | —                | yes — path to your ds4 build; the working directory the server runs from |
+| `gguf_path`     | —                | yes — path to the GGUF model loaded by ds4 (relative to `ds4_dir`)       |
+| `host`          | `127.0.0.1`      | no — ds4 bind address, also the reverse-proxy target                     |
+| `port`          | `8000`           | no — ds4 bind port, also the reverse-proxy target                        |
+| `binary`        | `./ds4-server`   | no — program to run, relative to `ds4_dir`                               |
+| `options`       | `{}`             | no — overrides for ds4-server flags (see below)                          |
+| `estimate_binary` | `./ds4-estimate` | no — footprint estimator, relative to `ds4_dir` (see "VRAM footprint")   |
+| `ctx_length`    | —                | no — provider-level context length, overrides the per-model one          |
 
 `ctx_length` is available as a provider-level override,
 and is a key in the provider object (see usage below) rather than model-level (so NOT in the "options" key).
@@ -365,6 +375,56 @@ is configured as:
   ]
 }
 ```
+
+**VRAM footprint** — `Model.memory()` for a ds4 model reports what **ds4 itself**
+computes, not a formula YAALLB maintains. The context/KV/scratch footprint
+depends on the model shape recorded in the GGUF (Flash and Pro differ in layer
+count and per-layer compression ratios), the backend, the effective prefill
+chunk, and the SSD streaming mode, and drafter/MTP support GGUFs add mapped
+weights on top; ds4 already does exactly this arithmetic for its own
+`context buffers … MiB` startup log. `tools/ds4_estimate.c` opens the GGUF
+metadata-only (`inspect_only`), asks ds4 for the components, and prints one JSON
+line. Build it once per ds4 tree, next to `ds4-server`:
+
+```sh
+make -C /path/to/ds4 -f /path/to/yaallb/tools/ds4-estimate.mk
+
+# a tree built with `make cpu` has no GPU objects to link against
+make -C /path/to/ds4 -f /path/to/yaallb/tools/ds4-estimate.mk \
+  CORE_OBJS="$(CPU_CORE_OBJS)" DS4_ESTIMATE_CPU_ONLY=1
+```
+
+The fragment reads the ds4 tree's own `Makefile`, so it links whatever that tree
+was built with (Metal/CUDA/ROCm objects and link flags come from it). The
+estimator is spawned with `ds4_dir` as its cwd — so a relative `gguf_path` means
+the same thing it does in config.json — and takes its own ds4 instance lock, so
+estimating never disturbs (or is refused by) a running `ds4-server`.
+
+`main.py` warms the footprint for each ds4 provider's configured contexts at
+startup, one line each:
+
+```
+… ds4 VRAM estimate model=./ds4flash-0731.gguf ctx=1000000 sessions=1 projected=99088 MiB source=ds4
+```
+
+Requests that ask for a ctx nobody warmed pay one estimator run — well under a
+second (~0.3s measured against an 80.8 GiB GGUF), since it only maps the GGUF
+and reads its metadata — and are memoized afterwards.
+
+Counted in the projection: GGUF bytes (main model plus `mtp_model`/`vision`
+support GGUFs), `batched_session` × ds4's context bytes (each resident ds4
+session gets its own session graphs/caches), and a fixed process overhead
+(`DS4_PROCESS_OVERHEAD_MIB` in `providers/dwarfstar_estimate.py`). Not counted:
+the DSpark/speculative-capture scratch (tens of MiB) and per-GPU placement
+(`--gpu-vram`, `--cuda-tensor-parallel`) or distributed layer slices
+(`--role`/`--layers`/`--tensor-parallel`), which is also why those flag families
+stay out of the options registry; `safety_buffer_mib` is the escape hatch.
+
+**If the estimator is missing or fails** (never built, stale against the ds4
+tree, wrong model path), YAALLB logs one warning per (model, ctx) configuration
+and budgets the model from its **real GGUF bytes plus a flat context term**
+(16416 bytes/token, the DeepSeek V4 Flash Metal slope): correct GGUF size,
+approximate context. The fallback is cached, so the request path stays cheap.
 
 #### lms
 

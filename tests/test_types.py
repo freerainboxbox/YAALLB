@@ -6,7 +6,7 @@ from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model
 from abstractions.provider import Provider
-from providers.dwarfstar import DS4_CONTEXT_LENGTH, DwarfStarProvider
+from providers.dwarfstar import DwarfStarProvider
 from providers.llama_cpp import LlamaCppProvider
 from providers.lmstudio import LMStudioProvider
 
@@ -112,17 +112,38 @@ def test_providers_list_descriptors(monkeypatch):
     assert all(d.provider is provider for d in descs)
 
 
-def test_dwarfstar_memory_piecewise():
-    # Without a provider ctx_length, memory uses the resident model's ctx
-    # (or DS4_CONTEXT_LENGTH when nothing is resident). With one set, the
-    # provider-level ctx wins regardless of the model's load options.
-    p = DwarfStarProvider()
-    small = p.createModel(ModelDescriptor("b", p), LoadOptions(ctx_length=4096))
-    assert small.memory() == pytest.approx(83065.32 + 16416 * DS4_CONTEXT_LENGTH / (2**20))
+def test_dwarfstar_memory_prices_the_effective_ctx(monkeypatch):
+    # ds4 sizes its context buffers once at spawn, so the footprint must be
+    # asked for the ctx the model would actually be spawned with: the model's
+    # own ctx_length, unless the provider pins a provider-level ctx_length.
+    import providers.dwarfstar_estimate as dse
 
-    p2 = DwarfStarProvider(config={"ctx_length": 8192})
-    big = p2.createModel(ModelDescriptor("b", p2), LoadOptions(ctx_length=4096))
-    assert big.memory() == pytest.approx(83065.32 + 16416 * 8192 / (2**20))
+    monkeypatch.setattr(dse, "_ESTIMATE_CACHE", {})
+    asked = []
+
+    def fake_estimator(**kwargs):
+        asked.append(kwargs["ctx"])
+        return {
+            "model_bytes": 1 << 30,
+            "support_bytes": 0,
+            "vision_bytes": 0,
+            "context_bytes": 0,
+        }
+
+    monkeypatch.setattr(dse, "run_estimator", fake_estimator)
+
+    flat = (1 << 30) / 2**20 + dse.DS4_PROCESS_OVERHEAD_MIB
+    p = DwarfStarProvider(config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf"})
+    model = p.createModel(ModelDescriptor("b", p), LoadOptions(ctx_length=4096))
+    assert model.memory() == pytest.approx(flat)
+    assert asked == [4096]
+
+    p2 = DwarfStarProvider(
+        config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf", "ctx_length": 8192}
+    )
+    pinned = p2.createModel(ModelDescriptor("b", p2), LoadOptions(ctx_length=4096))
+    pinned.memory()
+    assert asked[-1] == 8192
 
 
 def test_lmstudio_memory_parses_gib(monkeypatch):
