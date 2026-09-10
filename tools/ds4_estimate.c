@@ -9,6 +9,12 @@
  * This program asks ds4 for it and prints the components as one JSON object,
  * so YAALLB never re-derives ds4's shape-dependent arithmetic in Python.
  *
+ * A drafter (--mtp-model/--dspark/--mtp) also costs per-session graph scratch
+ * that the context estimate does not cover, so the JSON reports ds4's own
+ * ds4_engine_spec_graph_memory_estimate() numbers next to it. That accessor
+ * exists because no public API exposes the DSpark stage/target-layer counts the
+ * capture buffers are sized from.
+ *
  * Build it against a built ds4 tree (objects already compiled):
  *
  *   make -C <ds4_dir> -f <yaallb>/tools/ds4-estimate.mk
@@ -16,7 +22,7 @@
  * Usage:
  *   ds4-estimate --model GGUF [--backend metal|cuda|rocm|cpu] --ctx N
  *                [--prefill-chunk N] [--ssd-streaming]
- *                [--mtp-model GGUF] [--vision GGUF]
+ *                [--mtp-model GGUF] [--dspark] [--vision GGUF]
  *
  * Relative --model/--mtp-model/--vision paths resolve against the current
  * working directory, exactly as they do for ds4-server.
@@ -36,14 +42,14 @@
 
 #include "ds4.h"
 
-#define DS4_ESTIMATE_SCHEMA_VERSION 1
+#define DS4_ESTIMATE_SCHEMA_VERSION 2
 
 static void usage(void) {
     fprintf(stderr,
             "usage: ds4-estimate --model GGUF "
             "[--backend metal|cuda|rocm|cpu] --ctx N "
             "[--prefill-chunk N] [--ssd-streaming] "
-            "[--mtp-model GGUF] [--vision GGUF]\n");
+            "[--mtp-model GGUF] [--dspark] [--vision GGUF]\n");
 }
 
 /* Bytes of a mapped GGUF (weights YAALLB must budget as resident). A missing
@@ -81,6 +87,7 @@ int main(int argc, char **argv) {
     int ctx = 0;
     uint32_t prefill_chunk = 0;
     bool ssd_streaming = false;
+    bool dspark = false;
     char private_lock[128] = {0};
 
     for (int i = 1; i < argc; i++) {
@@ -99,6 +106,10 @@ int main(int argc, char **argv) {
             prefill_chunk = (uint32_t)atoi(need_value(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--ssd-streaming")) {
             ssd_streaming = true;
+        } else if (!strcmp(arg, "--dspark")) {
+            /* Only affects the verifier-side scratch; the DSpark capture
+             * buffers and the support GGUF are there either way. */
+            dspark = true;
         } else if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             usage();
             return 0;
@@ -157,6 +168,7 @@ int main(int argc, char **argv) {
     opt.context_size = ctx;
     opt.prefill_chunk = prefill_chunk;
     opt.ssd_streaming = ssd_streaming;
+    opt.dspark = dspark;
     opt.inspect_only = true;
 
     ds4_engine *engine = NULL;
@@ -171,6 +183,12 @@ int main(int argc, char **argv) {
     const ds4_context_memory m = ds4_context_memory_estimate_with_prefill_mode(
             backend, ctx, effective_chunk, ssd_streaming);
     const uint64_t context_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
+
+    /* Drafter-only per-session scratch: DSpark capture buffers (allocated
+     * whenever a DSpark support model is loaded, --dspark or not), the verifier
+     * snapshots/MTP buffers/draft logits, and the draft-side host buffers. */
+    const ds4_spec_graph_memory spec = ds4_engine_spec_graph_memory_estimate(
+            engine, ctx, effective_chunk);
 
     /* model_name/backend_name are ds4's own fixed shape/backend strings, so
      * they need no JSON escaping; nothing here is model- or path-derived. */
@@ -190,6 +208,11 @@ int main(int argc, char **argv) {
            "\"compressed_bytes\":%llu,"
            "\"scratch_bytes\":%llu,"
            "\"context_bytes\":%llu,"
+           "\"dspark_capture_bytes\":%llu,"
+           "\"verifier_scratch_bytes\":%llu,"
+           "\"host_scratch_bytes\":%llu,"
+           "\"spec_graph_bytes\":%llu,"
+           "\"dspark_capture_stages\":%u,"
            "\"has_mtp\":%s,"
            "\"mtp_draft_tokens\":%d}\n",
            DS4_ESTIMATE_SCHEMA_VERSION,
@@ -208,6 +231,11 @@ int main(int argc, char **argv) {
            (unsigned long long)m.compressed_bytes,
            (unsigned long long)m.scratch_bytes,
            (unsigned long long)context_bytes,
+           (unsigned long long)spec.dspark_capture_bytes,
+           (unsigned long long)spec.verifier_scratch_bytes,
+           (unsigned long long)spec.host_scratch_bytes,
+           (unsigned long long)spec.total_bytes,
+           spec.dspark_capture_stages,
            ds4_engine_has_mtp(engine) ? "true" : "false",
            ds4_engine_mtp_draft_tokens(engine));
 

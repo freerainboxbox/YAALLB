@@ -157,8 +157,8 @@ class DwarfStarProvider(Provider):
 
     def _sessions(self) -> int:
         # ds4-server keeps one session, or `--batched-session N` resident
-        # sessions, and gives each its own session graphs/caches, so the
-        # context term is multiplied.
+        # sessions, and gives each its own session graphs/caches and its own
+        # drafter scratch, so both per-session terms are multiplied.
         try:
             sessions = int(self.options.get("batched_session") or 1)
         except (TypeError, ValueError):
@@ -177,6 +177,10 @@ class DwarfStarProvider(Provider):
             ssd_streaming=bool(self.options.get("ssd_streaming", False)),
             mtp_model=self.options.get("mtp_model"),
             vision=self.options.get("vision"),
+            # --dspark decides whether a session also gets the verifier graph;
+            # the DSpark capture buffers and the support GGUF are budgeted
+            # whether or not it is on.
+            dspark=bool(self.options.get("dspark", False)),
         )
 
     def getModelsDescriptors(self) -> list[ModelDescriptor]:

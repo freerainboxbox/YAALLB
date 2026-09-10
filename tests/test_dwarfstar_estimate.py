@@ -17,7 +17,7 @@ from abstractions.load_options import LoadOptions
 from providers.dwarfstar import DwarfStarProvider, warm_dwarfstar_estimates
 
 ESTIMATE = {
-    "version": 1,
+    "version": 2,
     "model_name": "DeepSeek V4 Flash",
     "backend": "metal",
     "ctx": 8192,
@@ -33,6 +33,13 @@ ESTIMATE = {
     "compressed_bytes": 200,
     "scratch_bytes": 300,
     "context_bytes": 1_000_000,
+    # Per-session drafter scratch, as ds4 reports it (see ds4.h
+    # ds4_spec_graph_memory): capture + verifier graph + host buffers.
+    "dspark_capture_bytes": 200_000_000,
+    "verifier_scratch_bytes": 80_000_000,
+    "host_scratch_bytes": 1_000_000,
+    "spec_graph_bytes": 281_000_000,
+    "dspark_capture_stages": 3,
     "has_mtp": False,
     "mtp_draft_tokens": 0,
 }
@@ -100,6 +107,7 @@ def test_run_estimator_passes_the_serve_configuration(fake_estimator):
         ssd_streaming=True,
         mtp_model="./support.gguf",
         vision="./vision.gguf",
+        dspark=True,
     )
 
     # Paths are handed through untouched: the estimator runs with cwd=ds4_dir,
@@ -118,6 +126,7 @@ def test_run_estimator_passes_the_serve_configuration(fake_estimator):
         "--ssd-streaming",
         "--mtp-model",
         "./support.gguf",
+        "--dspark",
         "--vision",
         "./vision.gguf",
     ]
@@ -162,6 +171,28 @@ def test_run_estimator_rejects_a_foreign_schema(fake_estimator):
     with pytest.raises(dse.Ds4EstimatorError, match="rebuild"):
         dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
 
+    # A schema-1 helper (no drafter-scratch fields) predates ds4's
+    # ds4_engine_spec_graph_memory_estimate(), so its numbers would silently
+    # under-budget a drafter. It must say "rebuild", not fall back quietly.
+    schema_one = {
+        key: value
+        for key, value in ESTIMATE.items()
+        if key not in (
+            "dspark_capture_bytes",
+            "verifier_scratch_bytes",
+            "host_scratch_bytes",
+            "spec_graph_bytes",
+            "dspark_capture_stages",
+        )
+    } | {"version": 1}
+    fake_estimator(stdout=json.dumps(schema_one))
+    with pytest.raises(dse.Ds4EstimatorError, match="rebuild"):
+        dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
+    fake_estimator(stdout=json.dumps({**ESTIMATE, "spec_graph_bytes": None}))
+    with pytest.raises(dse.Ds4EstimatorError, match="spec_graph_bytes"):
+        dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
     fake_estimator(stdout="ds4: model is not a GGUF file\n")
     with pytest.raises(dse.Ds4EstimatorError, match="rebuild"):
         dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
@@ -188,6 +219,13 @@ def test_fallback_uses_real_gguf_sizes_plus_a_flat_ctx_term(tmp_path):
     assert result["model_bytes"] == 3 * MIB
     assert result["support_bytes"] == MIB
     assert result["context_bytes"] == dse.DS4_CTX_BYTES_PER_TOKEN * 8192
+    # A drafter's graph scratch cannot be read off file sizes, so the fallback
+    # budgets its measured per-session stand-in rather than nothing.
+    assert result["spec_graph_bytes"] == int(dse.DS4_DRAFTER_SCRATCH_FALLBACK_MIB * MIB)
+    plain = dse.fallback_estimate(
+        ds4_dir=str(tmp_path), gguf_path="./m.gguf", ctx=8192
+    )
+    assert plain["spec_graph_bytes"] == 0
     # A missing/renamed GGUF must not raise; it contributes nothing.
     assert dse.gguf_bytes(str(tmp_path), "./nope.gguf", None) == 0
 
@@ -243,13 +281,14 @@ def test_estimate_falls_back_once_and_warns(fake_estimator, monkeypatch):
     assert "falling back" in warnings[0] and "exited 1" in warnings[0]
 
 
-def test_estimate_mib_scales_the_context_term_by_sessions():
+def test_estimate_mib_scales_the_per_session_terms_by_sessions():
     sessions = 4
     expected = (
         ESTIMATE["model_bytes"]
         + ESTIMATE["support_bytes"]
         + ESTIMATE["vision_bytes"]
         + ESTIMATE["context_bytes"] * sessions
+        + ESTIMATE["spec_graph_bytes"] * sessions
     ) / MIB + dse.DS4_PROCESS_OVERHEAD_MIB
     assert dse.estimate_mib(ESTIMATE, sessions) == pytest.approx(expected)
     assert dse.estimate_mib(ESTIMATE, 0) == pytest.approx(
@@ -276,9 +315,10 @@ def test_memory_projects_the_ds4_estimate(fake_estimator):
         ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
     )
 
-    # Weights + one session of context + the fixed process overhead, in MiB.
+    # Weights + one session of context and drafter scratch + the fixed process
+    # overhead, in MiB.
     assert model.memory() == pytest.approx(
-        (8_000_000_000 + 1_000_000_000 + 1_000_000) / MIB
+        (8_000_000_000 + 1_000_000_000 + 1_000_000 + 281_000_000) / MIB
         + dse.DS4_PROCESS_OVERHEAD_MIB
     )
 
@@ -291,7 +331,12 @@ def test_memory_projects_the_ds4_estimate(fake_estimator):
 def test_memory_counts_drafter_gguf_and_batched_sessions(fake_estimator):
     fake = fake_estimator()
     provider = _provider(
-        options={"batched_session": 3, "mtp_model": "./support.gguf", "metal": True}
+        options={
+            "batched_session": 3,
+            "mtp_model": "./support.gguf",
+            "dspark": True,
+            "metal": True,
+        }
     )
     model = provider.createModel(
         ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
@@ -299,9 +344,10 @@ def test_memory_counts_drafter_gguf_and_batched_sessions(fake_estimator):
 
     projected = model.memory()
     assert provider._sessions() == 3
-    # Context is per resident session (x3); the support GGUF is mapped once.
+    # Context and drafter scratch are per resident session (x3); the support
+    # GGUF is mapped once.
     assert projected == pytest.approx(
-        (8_000_000_000 + 1_000_000_000 + 1_000_000 * 3) / MIB
+        (8_000_000_000 + 1_000_000_000 + (1_000_000 + 281_000_000) * 3) / MIB
         + dse.DS4_PROCESS_OVERHEAD_MIB
     )
     assert projected > dse.estimate_mib(ESTIMATE, 1)
@@ -315,6 +361,7 @@ def test_memory_counts_drafter_gguf_and_batched_sessions(fake_estimator):
         "metal",
         "--mtp-model",
         "./support.gguf",
+        "--dspark",
     ]
 
 

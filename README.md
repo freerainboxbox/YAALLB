@@ -413,21 +413,27 @@ and reads its metadata — and are memoized afterwards.
 
 Counted in the projection: GGUF bytes (main model plus `mtp_model`/`vision`
 support GGUFs — the whole support file, which is conservative), `batched_session`
-× ds4's context bytes (each resident ds4 session gets its own session
-graphs/caches), and a fixed process overhead (`DS4_PROCESS_OVERHEAD_MIB` in
-`providers/dwarfstar_estimate.py`).
+× (ds4's context bytes + ds4's drafter scratch — each resident session gets its
+own session graphs/caches and its own draft buffers), and a fixed process
+overhead (`DS4_PROCESS_OVERHEAD_MIB` in `providers/dwarfstar_estimate.py`).
+
+The drafter half comes from ds4's `ds4_engine_spec_graph_memory_estimate()`:
+DSpark target-hidden capture buffers, verifier frontier snapshots, MTP projection
+buffers, draft logits, and the draft-side host buffers. None of it follows from
+file sizes, and none of it is in ds4's *context* estimate either. On Flash 0731 +
+its DSpark support GGUF (3 stages, 3 target layers, block 5) at `ctx=1000000` on
+Metal it is 218.98 MiB capture + 86.66 MiB verifier graph + 1.00 MiB host =
+**306.64 MiB per session**, on top of 5712 MiB of support GGUF. The capture
+buffers (like the support GGUF itself) are budgeted even with `dspark` off,
+because ds4 maps the support model and configures capture as soon as it is
+loaded; only the verifier half needs `dspark` or a legacy MTP support model.
+That accessor is part of the estimator's link, so `ds4-estimate` needs a ds4 tree
+that has it: rebuild the estimator after updating ds4. Start a server with
+`DS4_SPEC_MEM_REPORT=1` to see each session print what it allocated next to what
+was projected, flagging any sizing drift.
 
 Not counted, and to be covered with `safety_buffer_mib` when you use them:
 
-- DSpark's per-session graph scratch. ds4 allocates it per session
-  (`ds4_session_create` → `metal_graph_configure_dspark_capture`) at up to
-  `8 target layers × prefill_cap × embedding` for the target-hidden batch
-  buffer plus `8 stages × raw_kv_rows × head_dim` of draft-side raw cache — on
-  DeepSeek V4 Flash/Metal at `ctx=1000000` (prefill_cap 4096, raw rows 4352)
-  that is ~512 MiB + ~71 MiB **per session**, shrinking with the support
-  checkpoint's real stage/target-layer counts. `--mtp-draft` frontier-snapshot
-  state adds a further ≤17 MiB. ds4's own public estimator has no term for any
-  of this, so `ds4-estimate` cannot report it either.
 - Per-GPU placement (`--gpu-vram`, `--cuda-tensor-parallel`) and distributed
   layer slices (`--role`/`--layers`/`--tensor-parallel`), which is also why those
   flag families stay out of the options registry.
@@ -437,8 +443,11 @@ Not counted, and to be covered with `safety_buffer_mib` when you use them:
 **If the estimator is missing or fails** (never built, stale against the ds4
 tree, wrong model path), YAALLB logs one warning per (model, ctx) configuration
 and budgets the model from its **real GGUF bytes plus a flat context term**
-(16416 bytes/token, the DeepSeek V4 Flash Metal slope): correct GGUF size,
-approximate context. The fallback is cached, so the request path stays cheap.
+(16416 bytes/token, the DeepSeek V4 Flash Metal slope) plus
+`DS4_DRAFTER_SCRATCH_FALLBACK_MIB` per session when a drafter is configured:
+correct GGUF size, approximate context and scratch. The fallback is cached, so
+the request path stays cheap. A schema-1 estimator (no drafter-scratch output, so
+it would silently under-budget DSpark) is rejected with the same rebuild hint.
 
 #### lms
 
