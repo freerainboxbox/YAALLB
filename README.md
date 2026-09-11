@@ -16,6 +16,7 @@ scheduling.py      VRAM-aware model scheduler and eviction
 log.py             Colored, ISO-timestamped logging to stderr
 abstractions/      Base types: Provider, Model, ModelDescriptor, LoadOptions; routing
 providers/         Concrete providers: LMStudioProvider, DwarfStarProvider, LlamaCppProvider, DflashProvider
+tools/             ds4_estimate.c + ds4-estimate.mk: footprint estimator built inside your ds4 tree
 config.json        Provider instances per type ("lms", "ds4", "llama_cpp", ...)
 tests/             pytest suite
 pyproject.toml     Project metadata and dependencies (uv-managed)
@@ -262,6 +263,14 @@ every dflash-mlx provider (logging progress per provider) and store it.
 `memory()` draws from the cache; on a miss it recomputes on the fly
 (defensive) rather than returning a stale/zero estimate.
 
+**Not every provider caches.** `ds4` (see below) deliberately does not, because
+none of the convention's assumptions hold for it: its footprint is computed by
+the ds4 build itself in a subprocess that costs well under a second, it has no
+ctx-independent part worth storing (the entire context/KV/scratch term depends
+on the model shape that GGUF records), and the ctx to price changes per
+request. ds4 instead memoizes estimates per process and warms the configured
+contexts at startup.
+
 ### Providers
 
 #### ds4
@@ -270,15 +279,16 @@ every dflash-mlx provider (logging progress per provider) and store it.
 each instance needs to know how to launch `ds4-server` from a working
 directory.
 
-| key          | default        | required                                                                 |
-| ------------ | -------------- | ------------------------------------------------------------------------ |
-| `ds4_dir`    | —              | yes — path to your ds4 build; the working directory the server runs from |
-| `gguf_path`  | —              | yes — path to the GGUF model loaded by ds4 (relative to `ds4_dir`)       |
-| `host`       | `127.0.0.1`    | no — ds4 bind address, also the reverse-proxy target                     |
-| `port`       | `8000`         | no — ds4 bind port, also the reverse-proxy target                        |
-| `binary`     | `./ds4-server` | no — program to run, relative to `ds4_dir`                               |
-| `options`    | `{}`           | no — overrides for ds4-server flags (see below)                          |
-| `ctx_length` | —              | no — provider-level context length, overrides the per-model one          |
+| key             | default          | required                                                                 |
+| --------------- | ---------------- | ------------------------------------------------------------------------ |
+| `ds4_dir`       | —                | yes — path to your ds4 build; the working directory the server runs from |
+| `gguf_path`     | —                | yes — path to the GGUF model loaded by ds4 (relative to `ds4_dir`)       |
+| `host`          | `127.0.0.1`      | no — ds4 bind address, also the reverse-proxy target                     |
+| `port`          | `8000`           | no — ds4 bind port, also the reverse-proxy target                        |
+| `binary`        | `./ds4-server`   | no — program to run, relative to `ds4_dir`                               |
+| `options`       | `{}`             | no — overrides for ds4-server flags (see below)                          |
+| `estimate_binary` | `./ds4-estimate` | no — footprint estimator, relative to `ds4_dir` (see "VRAM footprint")   |
+| `ctx_length`    | —                | no — provider-level context length, overrides the per-model one          |
 
 `ctx_length` is available as a provider-level override,
 and is a key in the provider object (see usage below) rather than model-level (so NOT in the "options" key).
@@ -294,9 +304,11 @@ defaults for everything you don't set.
 
 | options key                          | flag                                   | kind  | default |
 | ------------------------------------ | -------------------------------------- | ----- | ------- |
+| `vision`                             | `--vision`                             | value | —       |
 | `backend`                            | `--backend`                            | value | —       |
 | `metal`                              | `--metal`                              | flag  | false   |
 | `cuda`                               | `--cuda`                               | flag  | false   |
+| `rocm`                               | `--rocm`                               | flag  | false   |
 | `cpu`                                | `--cpu`                                | flag  | false   |
 | `gpu_vram`                           | `--gpu-vram`                           | value | —       |
 | `gpu_devices`                        | `--gpu-devices`                        | value | —       |
@@ -311,9 +323,21 @@ defaults for everything you don't set.
 | `ssd_streaming_preload_experts`      | `--ssd-streaming-preload-experts`      | value | —       |
 | `simulate_used_memory`               | `--simulate-used-memory`               | value | —       |
 | `prefill_chunk`                      | `--prefill-chunk`                      | value | —       |
+| `mtp`                                | `--mtp`                                | flag  | false   |
+| `mtp_model`                          | `--mtp-model`                          | value | —       |
+| `mtp_draft`                          | `--mtp-draft`                          | value | 1       |
+| `mtp_margin`                         | `--mtp-margin`                         | value | 3       |
+| `mtp_timing`                         | `--mtp-timing`                         | flag  | false   |
+| `dspark`                             | `--dspark`                             | flag  | false   |
+| `dspark_confidence`                  | `--dspark-confidence`                  | value | —       |
+| `mtp_exact_sampling`                 | `--mtp-exact-sampling`                 | flag  | false   |
+| `dspark_strict`                      | `--dspark-strict`                      | flag  | false   |
+| `quality`                            | `--quality`                            | flag  | false   |
+| `warm_weights`                       | `--warm-weights`                       | flag  | false   |
 | `cors`                               | `--cors`                               | flag  | false   |
 | `trace`                              | `--trace`                              | value | —       |
 | `batched_session`                    | `--batched-session`                    | value | —       |
+| `mixed_prefill_quantum`              | `--mixed-prefill-quantum`              | value | 128     |
 | `kv_disk_dir`                        | `--kv-disk-dir`                        | value | —       |
 | `kv_disk_space_mb`                   | `--kv-disk-space-mb`                   | value | 4096    |
 | `kv_cache_min_tokens`                | `--kv-cache-min-tokens`                | value | 512     |
@@ -351,6 +375,79 @@ is configured as:
   ]
 }
 ```
+
+**VRAM footprint** — `Model.memory()` for a ds4 model reports what **ds4 itself**
+computes, not a formula YAALLB maintains. The context/KV/scratch footprint
+depends on the model shape recorded in the GGUF (Flash and Pro differ in layer
+count and per-layer compression ratios), the backend, the effective prefill
+chunk, and the SSD streaming mode, and drafter/MTP support GGUFs add mapped
+weights on top; ds4 already does exactly this arithmetic for its own
+`context buffers … MiB` startup log. `tools/ds4_estimate.c` opens the GGUF
+metadata-only (`inspect_only`), asks ds4 for the components, and prints one JSON
+line. Build it once per ds4 tree, next to `ds4-server`:
+
+```sh
+make -C /path/to/ds4 -f /path/to/yaallb/tools/ds4-estimate.mk
+
+# a tree built with `make cpu` has no GPU objects to link against
+make -C /path/to/ds4 -f /path/to/yaallb/tools/ds4-estimate.mk \
+  CORE_OBJS="$(CPU_CORE_OBJS)" DS4_ESTIMATE_CPU_ONLY=1
+```
+
+The fragment reads the ds4 tree's own `Makefile`, so it links whatever that tree
+was built with (Metal/CUDA/ROCm objects and link flags come from it). The
+estimator is spawned with `ds4_dir` as its cwd — so a relative `gguf_path` means
+the same thing it does in config.json — and takes its own ds4 instance lock, so
+estimating never disturbs (or is refused by) a running `ds4-server`.
+
+`main.py` warms the footprint for each ds4 provider's configured contexts at
+startup, one line each:
+
+```
+… ds4 VRAM estimate model=./ds4flash-0731.gguf ctx=1000000 sessions=1 projected=99088 MiB source=ds4
+```
+
+Requests that ask for a ctx nobody warmed pay one estimator run — well under a
+second (~0.3s measured against an 80.8 GiB GGUF), since it only maps the GGUF
+and reads its metadata — and are memoized afterwards.
+
+Counted in the projection: GGUF bytes (main model plus `mtp_model`/`vision`
+support GGUFs — the whole support file, which is conservative), `batched_session`
+× (ds4's context bytes + ds4's drafter scratch — each resident session gets its
+own session graphs/caches and its own draft buffers), and a fixed process
+overhead (`DS4_PROCESS_OVERHEAD_MIB` in `providers/dwarfstar_estimate.py`).
+
+The drafter half comes from ds4's `ds4_engine_spec_graph_memory_estimate()`:
+DSpark target-hidden capture buffers, verifier frontier snapshots, MTP projection
+buffers, draft logits, and the draft-side host buffers. None of it follows from
+file sizes, and none of it is in ds4's *context* estimate either. On Flash 0731 +
+its DSpark support GGUF (3 stages, 3 target layers, block 5) at `ctx=1000000` on
+Metal it is 218.98 MiB capture + 86.66 MiB verifier graph + 1.00 MiB host =
+**306.64 MiB per session**, on top of 5712 MiB of support GGUF. The capture
+buffers (like the support GGUF itself) are budgeted even with `dspark` off,
+because ds4 maps the support model and configures capture as soon as it is
+loaded; only the verifier half needs `dspark` or a legacy MTP support model.
+That accessor is part of the estimator's link, so `ds4-estimate` needs a ds4 tree
+that has it: rebuild the estimator after updating ds4. Start a server with
+`DS4_SPEC_MEM_REPORT=1` to see each session print what it allocated next to what
+was projected, flagging any sizing drift.
+
+Not counted, and to be covered with `safety_buffer_mib` when you use them:
+
+- Per-GPU placement (`--gpu-vram`, `--cuda-tensor-parallel`) and distributed
+  layer slices (`--role`/`--layers`/`--tensor-parallel`), which is also why those
+  flag families stay out of the options registry.
+- `--mtp-model` with `--ssd-streaming`: ds4 refuses that combination at boot, so
+  such a config fails at load rather than being mis-budgeted.
+
+**If the estimator is missing or fails** (never built, stale against the ds4
+tree, wrong model path), YAALLB logs one warning per (model, ctx) configuration
+and budgets the model from its **real GGUF bytes plus a flat context term**
+(16416 bytes/token, the DeepSeek V4 Flash Metal slope) plus
+`DS4_DRAFTER_SCRATCH_FALLBACK_MIB` per session when a drafter is configured:
+correct GGUF size, approximate context and scratch. The fallback is cached, so
+the request path stays cheap. A schema-1 estimator (no drafter-scratch output, so
+it would silently under-budget DSpark) is rejected with the same rebuild hint.
 
 #### lms
 

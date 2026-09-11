@@ -30,7 +30,7 @@ from abstractions.provider import Provider
 from abstractions.routing import lookup_model
 from providers.dflash import DflashProvider
 from providers.dflash_cache import ensure_dflash_cache
-from providers.dwarfstar import DwarfStarProvider
+from providers.dwarfstar import DwarfStarProvider, warm_dwarfstar_estimates
 from providers.llama_cpp import LlamaCppProvider
 from providers.lmstudio import LMStudioProvider
 from scheduling import ModelNotFound, Scheduler
@@ -793,6 +793,10 @@ def main() -> None:
     port = yaallb["port"] if args.port == 4343 else args.port
     global DEFAULT_CTX_LENGTH
     DEFAULT_CTX_LENGTH = yaallb["ctx_length"]
+
+    # ds4's footprint comes from the ds4 build itself (a subprocess that reads
+    # the GGUF shape), so warm the configured contexts before serving.
+    warm_dwarfstar_estimates(providers, DEFAULT_CTX_LENGTH)
 
     set_iogpu_wired_limit(wired_limit_mb)
 

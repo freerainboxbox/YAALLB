@@ -1247,6 +1247,98 @@ def test_dwarfstar_load_ready_timeout_raises(monkeypatch):
     assert model.load_state == "loading"
 
 
+def test_dwarfstar_drafter_and_vision_flags_reach_the_server():
+    from providers.dwarfstar import DwarfStarProvider
+
+    # ds4's drafter/MTP/DSpark surface and its vision encoder are configurable
+    # per provider instance, and each flag must arrive intact at ds4-server.
+    provider = DwarfStarProvider(
+        config={
+            "ds4_dir": "/tmp/ds4",
+            "gguf_path": "./m.gguf",
+            "options": {
+                "vision": "./vision.gguf",
+                "mtp": True,
+                "mtp_model": "./support.gguf",
+                "mtp_draft": 4,
+                "dspark": True,
+                "dspark_confidence": 0.5,
+                "mixed_prefill_quantum": 256,
+                "warm_weights": True,
+            },
+        }
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    )
+
+    assert provider._build_command(model) == [
+        "./ds4-server",
+        "-m",
+        "./m.gguf",
+        "--vision",
+        "./vision.gguf",
+        "--mtp",
+        "--mtp-model",
+        "./support.gguf",
+        "--mtp-draft",
+        "4",
+        "--dspark",
+        "--dspark-confidence",
+        "0.5",
+        "--warm-weights",
+        "--mixed-prefill-quantum",
+        "256",
+        "--ctx",
+        "8192",
+    ]
+
+    # Values ds4 would default to itself stay out of the command line, so ds4
+    # keeps ownership of its own defaults (backend builds differ).
+    defaulted = DwarfStarProvider(
+        config={
+            "ds4_dir": "/tmp/ds4",
+            "gguf_path": "./m.gguf",
+            "options": {"mtp_draft": 1, "mtp_margin": 3},
+        }
+    )
+    assert defaulted._build_command(model) == [
+        "./ds4-server",
+        "-m",
+        "./m.gguf",
+        "--ctx",
+        "8192",
+    ]
+
+
+def test_dwarfstar_options_table_matches_readme():
+    """The README ds4 options table is the documentation for DS4_OPTIONS."""
+    import re
+    from pathlib import Path
+
+    from providers.dwarfstar import DS4_OPTIONS
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    section = readme[readme.index("#### ds4") : readme.index("#### lms")]
+    table = re.findall(
+        r"^\| `([a-z_]+)`\s+\| `(-{1,2}[a-z-]+)`\s+\| (value|flag)\s+\| (.+?)\s+\|$",
+        section,
+        re.M,
+    )
+
+    def rendered(default):
+        if default is None:
+            return "—"
+        if isinstance(default, bool):
+            return "true" if default else "false"
+        return str(default)
+
+    assert {key: (flag, kind, default) for key, flag, kind, default in table} == {
+        key: (flag, kind, rendered(default))
+        for key, (flag, kind, default) in DS4_OPTIONS.items()
+    }
+
+
 def test_provider_type_ids():
     from providers.dwarfstar import DwarfStarProvider
     from providers.lmstudio import LMStudioProvider
