@@ -460,8 +460,13 @@ def test_warm_dwarfstar_estimates_covers_configured_contexts(fake_estimator, mon
 
     # Provider ctx plus the router default, cheapest first, one run each.
     assert [argv[-1] for argv in fake.argvs] == ["4096", "100000"]
-    assert len(messages) == 2
-    assert "ctx=4096" in messages[0] and "source=ds4" in messages[0]
+    # The cheapest run also reports the model family it priced, so a Qwen tree
+    # does not read like a misnamed DeepSeek instance in the startup log; the
+    # first one says what ds4 opened, and the estimates follow.
+    assert len(messages) == 3
+    assert "serves deepseek4" in messages[0]
+    assert "ctx=4096" in messages[1] and "source=ds4" in messages[1]
+    assert "family=deepseek4" in messages[1]
 
 
 class FakeMake:

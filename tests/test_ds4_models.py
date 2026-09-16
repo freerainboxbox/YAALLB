@@ -183,6 +183,130 @@ def test_qwen_uses_its_own_native_context(no_network):
     assert profile_for("deepseek4").native_ctx == 1000000
 
 
+def _estimate(**overrides) -> dict:
+    """A ds4 estimator result, as providers/dwarfstar_estimate.py returns it."""
+    result = {
+        "source": "ds4",
+        "model_name": "Qwen3.8 Flash Next",
+        "model_family": "qwen4exp",
+        "model_id": 5,
+        "model_bytes": 1 << 30,
+        "support_bytes": 0,
+        "vision_bytes": 0,
+        "context_bytes": 1 << 20,
+        "spec_graph_bytes": 0,
+    }
+    return {**result, **overrides}
+
+
+@pytest.fixture
+def estimator(monkeypatch):
+    """Feeds the provider a canned ds4 estimate, as if the GGUF were opened."""
+    import providers.dwarfstar as dsmod
+
+    def install(estimate):
+        calls = []
+
+        def fake(**kwargs):
+            calls.append(kwargs)
+            return estimate
+
+        monkeypatch.setattr(dsmod, "ds4_estimate", fake)
+        return calls
+
+    return install
+
+
+def test_family_is_detected_from_ds4s_answer(no_network, estimator, monkeypatch):
+    estimator(_estimate())
+    warnings = []
+    monkeypatch.setattr("providers.dwarfstar.log.warning", lambda m: warnings.append(m))
+
+    provider = _provider()
+    assert provider.served_profile.family == "deepseek4"  # nothing learned yet
+
+    provider._estimate(8192)
+
+    # ... and now it knows: the aliases switch, and so does the context.
+    assert provider.served_profile.family == "qwen4exp"
+    assert [d.modelId for d in provider.getModelsDescriptors()][:2] == QWEN38_IDS[:2]
+    assert provider._effective_ctx() == 262144
+    assert provider._detected_profile is profile_for("qwen4exp")
+    assert warnings == []
+
+
+def test_detection_names_the_model_ds4_says_it_opened(no_network, estimator):
+    # Flash and PRO share one profile (and one family); ds4's own shape name is
+    # what tells a client which of the two this tree actually holds.
+    estimator(_estimate(model_name="DeepSeek V4 Pro", model_family="deepseek4", model_id=1))
+    provider = _provider()
+    provider._estimate(1000000)
+
+    names = {m["name"] for m in provider.getOAIModels()}
+    assert names == {"DeepSeek V4 Pro"}
+    assert provider._effective_ctx() == 1000000
+
+
+def test_configured_profile_wins_over_detection(no_network, estimator, monkeypatch):
+    messages = []
+    monkeypatch.setattr(
+        "providers.dwarfstar.log.info", lambda message: messages.append(message)
+    )
+    estimator(_estimate())
+    provider = _provider(model_profile="deepseek4")
+    provider._estimate(8192)
+
+    # An explicit profile is an override, so it is kept - but what ds4 actually
+    # reported is still said out loud, because that is the usual shape of "your
+    # config and your GGUF disagree".
+    assert provider.served_profile.family == "deepseek4"
+    assert [d.modelId for d in provider.getModelsDescriptors()] == DEEPSEEK_V4_IDS
+    assert any("model_profile" in m and "qwen4exp" in m for m in messages)
+
+
+def test_unknown_family_keeps_the_default_and_says_so(no_network, estimator, monkeypatch):
+    warnings = []
+    monkeypatch.setattr("providers.dwarfstar.log.warning", lambda m: warnings.append(m))
+    estimator(_estimate(model_family="some-new-family"))
+
+    provider = _provider()
+    provider._estimate(8192)
+
+    assert provider.served_profile is profile_for("deepseek4")
+    assert [d.modelId for d in provider.getModelsDescriptors()] == DEEPSEEK_V4_IDS
+    assert len(warnings) == 1 and "some-new-family" in warnings[0]
+
+
+def test_a_fallback_estimate_does_not_burn_the_detection_chance(
+    no_network, estimator, monkeypatch
+):
+    warnings = []
+    monkeypatch.setattr("providers.dwarfstar.log.warning", lambda m: warnings.append(m))
+    # The size-based fallback knows the GGUF's bytes and nothing about its shape.
+    estimator(_estimate(model_name=None, model_family=None, model_id=None),)
+    provider = _provider()
+    provider._estimate(8192)
+
+    assert provider._detected_profile is None
+    assert warnings == []
+    assert provider._identity_adopted is False
+
+
+def test_detected_family_also_drives_the_warm_log(no_network, estimator, monkeypatch):
+    # warm_dwarfstar_estimates reports the family it priced, so a Qwen tree does
+    # not look like a misnamed DeepSeek instance in the startup log.
+    from providers.dwarfstar import warm_dwarfstar_estimates
+
+    estimator(_estimate())
+    messages = []
+    monkeypatch.setattr("providers.dwarfstar.log.info", lambda message: messages.append(message))
+
+    provider = _provider(ctx_length=8192)
+    warm_dwarfstar_estimates([provider])
+
+    assert any("qwen4exp" in m for m in messages)
+
+
 def test_profile_is_keyed_by_ds4s_family_name():
     assert profile_for("deepseek4").primary_alias == "deepseek-v4-flash"
     assert profile_for("no-such-family") is None

@@ -19,6 +19,7 @@ from providers.ds4_models import (
     DS4_MODEL_PROFILES,
     DS4_SUPPORTED_PARAMETERS,
     Ds4ModelProfile,
+    profile_for,
     profile_named,
 )
 
@@ -138,8 +139,18 @@ class DwarfStarProvider(Provider):
         self.model_profile: str | None = None
         self.resident_model: BaseModel | None = None
         self._process: subprocess.Popen | None = None
+        # What the opened GGUF turned out to be, learned from ds4 itself the
+        # first time its estimator runs (see _adopt_identity).
+        self._detected_profile: Ds4ModelProfile | None = None
+        self._model_name: str | None = None
+        self._identity_adopted = False
         super().__init__(_instance_id, config)
-        self.served_profile = self._resolve_profile()
+        self._explicit_profile = self._resolve_profile()
+
+    @property
+    def served_profile(self) -> Ds4ModelProfile:
+        """Configured profile, else the one ds4 confirmed, else the old default."""
+        return self._explicit_profile or self._detected_profile or DS4_DEFAULT_PROFILE
 
     def _resolve_profile(self) -> Ds4ModelProfile:
         """The configured model profile, or the family YAALLB always assumed.
@@ -149,7 +160,7 @@ class DwarfStarProvider(Provider):
         anywhere: what a model rejects, it logs itself.
         """
         if self.model_profile is None:
-            return DS4_DEFAULT_PROFILE
+            return None
         profile = profile_named(self.model_profile)
         if profile is None:
             accepted = ", ".join(
@@ -160,6 +171,55 @@ class DwarfStarProvider(Provider):
                 f"profile; use one of: {accepted} (or any of their aliases)"
             )
         return profile
+
+    def _adopt_identity(self, estimate: dict) -> None:
+        """Record which model ds4 says the configured GGUF actually is.
+
+        The GGUF - not config.json - decides what a ds4 tree serves, and only ds4
+        knows which shape it read out of the file. So the first estimator result
+        that carries a shape teaches this provider its model IDs, its display
+        name and its context ceiling, which is what stops a Qwen3.8 tree from
+        being presented as DeepSeek V4 Flash with a million tokens of context.
+
+        An estimator that fell back to GGUF file sizes carries no shape, so it
+        does not consume this one chance to learn it.
+        """
+        if self._identity_adopted:
+            return
+        if estimate.get("model_name") is None and estimate.get("model_family") is None:
+            return
+        self._identity_adopted = True
+
+        self._model_name = estimate.get("model_name") or self._model_name
+        family = estimate.get("model_family")
+
+        if self.model_profile is not None:
+            # An explicit profile is an override and stays one; a disagreement
+            # between config and GGUF is still worth reading in the log.
+            log.info(
+                f"ds4 provider #{self._instance_id} serves model_profile="
+                f"{self.model_profile} although ds4 reports family={family!r} "
+                f"name={estimate.get('model_name')!r}"
+            )
+            return
+
+        profile = profile_for(family)
+        if profile is None:
+            log.warning(
+                f"ds4 provider #{self._instance_id} opened a GGUF ds4 reports as "
+                f"family={family!r} ({estimate.get('model_name')!r}), which "
+                "YAALLB has no profile for; presenting "
+                f"{DS4_DEFAULT_PROFILE.primary_alias} and its aliases instead. "
+                "Set model_profile explicitly, or add the family to "
+                "providers/ds4_models.py."
+            )
+            return
+
+        self._detected_profile = profile
+        log.info(
+            f"ds4 provider #{self._instance_id} serves {profile.family} "
+            f"({estimate.get('model_name')}) as {len(profile.aliases)} model ids"
+        )
 
     @property
     def endpoint_uri(self) -> str:
@@ -217,6 +277,13 @@ class DwarfStarProvider(Provider):
 
     def _estimate(self, ctx: int) -> dict:
         """Footprint components (bytes) for one ctx, memoized by the provider."""
+        estimate = self._estimate_uncached(ctx)
+        # The run that prices the model also says what it is. The cheapest
+        # context is estimated first, so the shape is known before the big ones.
+        self._adopt_identity(estimate)
+        return estimate
+
+    def _estimate_uncached(self, ctx: int) -> dict:
         return ds4_estimate(
             ds4_dir=self.ds4_dir or ".",
             gguf_path=self.gguf_path or "",
@@ -239,6 +306,11 @@ class DwarfStarProvider(Provider):
         # only work if clients can name them.
         return [ModelDescriptor(alias, self) for alias in self.served_profile.aliases]
 
+    def _display_name(self) -> str:
+        # ds4's own shape name: it tells Flash from PRO (one profile, one family)
+        # and reports renamed shapes like Vision Experimental.
+        return self._model_name or self.served_profile.display_name
+
     def getOAIModels(self) -> list[dict]:
         # Mirrors ds4-server's own /v1/models (ds4_server.c append_model_json):
         # the server ctx in both context fields, its -n as the completion
@@ -254,7 +326,7 @@ class DwarfStarProvider(Provider):
                 "object": "model",
                 "created": 1767225600,
                 "owned_by": "ds4.c",
-                "name": self.served_profile.display_name,
+                "name": self._display_name(),
                 "context_length": ctx_length,
                 "top_provider": {
                     "context_length": ctx_length,
@@ -398,6 +470,7 @@ def warm_dwarfstar_estimates(providers: list, default_ctx: int | None = None) ->
             estimate = provider._estimate(ctx)
             log.info(
                 f"ds4 VRAM estimate model={provider.gguf_path} ctx={ctx} "
+                f"family={provider.served_profile.family} "
                 f"sessions={provider._sessions()} "
                 f"projected={ds4_estimate_mib(estimate, provider._sessions()):.0f} MiB "
                 f"source={estimate['source']}"
