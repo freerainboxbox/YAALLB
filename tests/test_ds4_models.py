@@ -10,6 +10,8 @@ not in somebody's config.
 
 import pytest
 
+from abstractions.descriptor import ModelDescriptor
+from abstractions.load_options import LoadOptions
 from providers.dwarfstar import DwarfStarProvider
 from providers.ds4_models import (
     DS4_DEFAULT_MAX_COMPLETION_TOKENS,
@@ -23,6 +25,20 @@ DEEPSEEK_V4_IDS = [
     "deepseek-v4-pro",
     "deepseek-chat",
     "deepseek-reasoner",
+]
+
+# Exactly the ids ds4_server.c server_model_alias_known() accepts for the
+# qwen4exp shape: three listed in /v1/models, two no-thinking spellings, and
+# three vendor-prefixed ones (ds4 has no qwen/-prefixed -no-think alias).
+QWEN38_IDS = [
+    "qwen3.8-flash-next",
+    "qwen3.8-flash-next-chat",
+    "qwen3.8-flash-next-reasoner",
+    "qwen3.8-flash-next-no-think",
+    "qwen3.8-flash-next-nothink",
+    "qwen/qwen3.8-flash-next",
+    "qwen/qwen3.8-flash-next-chat",
+    "qwen/qwen3.8-flash-next-reasoner",
 ]
 
 
@@ -80,6 +96,40 @@ def test_oai_listing_mirrors_ds4s_own_model_json(no_network):
         plain["top_provider"]["max_completion_tokens"]
         == DS4_DEFAULT_MAX_COMPLETION_TOKENS
     )
+
+
+def test_qwen_aliases_are_all_registered(no_network):
+    provider = _provider(model_profile="qwen4exp")
+
+    assert [d.modelId for d in provider.getModelsDescriptors()] == QWEN38_IDS
+    assert [m["id"] for m in provider.getOAIModels()] == QWEN38_IDS
+    # ds4 answers all of them for the loaded GGUF; -chat and -no-think/-nothink
+    # reply without thinking, -reasoner insists on it.
+    assert {m["name"] for m in provider.getOAIModels()} == {"Qwen3.8 Flash Next"}
+
+
+def test_qwen_uses_its_own_native_context(no_network):
+    # The GGUF decides the model, but --ctx still comes from YAALLB: a Qwen
+    # shape sized at 262144 must never inherit DeepSeek's million just because
+    # that is what this provider hardcoded before any registry existed.
+    provider = _provider(model_profile="qwen3.8-flash-next")
+    assert provider._effective_ctx() == 262144
+    assert [m["context_length"] for m in provider.getOAIModels()] == [262144] * len(
+        QWEN38_IDS
+    )
+
+    # A documented ceiling only fills the gap when nothing else asks; the
+    # request still wins.
+    model = provider.createModel(
+        ModelDescriptor("qwen3.8-flash-next", provider), LoadOptions(ctx_length=8192)
+    )
+    assert provider._effective_ctx(model) == 8192
+
+    # DeepSeek keeps what it always had.
+    assert _provider()._effective_ctx() == 1000000
+    # ... and a family with no documented ceiling keeps it too, rather than
+    # inventing a number ds4 never stated.
+    assert profile_for("deepseek4").native_ctx == 1000000
 
 
 def test_profile_is_keyed_by_ds4s_family_name():

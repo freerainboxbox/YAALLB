@@ -26,7 +26,8 @@ from providers.ds4_models import (
 # Python, so the model list is built here from the profile registry (see
 # providers/ds4_models.py). Every alias of the served family names the same
 # resident model, and the presented context_length is the ctx that will actually
-# be spawned.
+# be spawned. This is the context used for a family ds4 gives no documented
+# ceiling of its own (and is what DeepSeek V4 has always been given here).
 DS4_CONTEXT_LENGTH = 1000000
 
 DS4_DEFAULT_HOST = "127.0.0.1"
@@ -165,18 +166,30 @@ class DwarfStarProvider(Provider):
         return f"http://{self.host}:{self.port}/v1"
 
     def _effective_ctx(self, model: BaseModel | None = None) -> int:
-        # ds4 sets --ctx once at startup and both served models inherit it, so
+        # ds4 sets --ctx once at startup and every served alias inherits it, so
         # the provider-level ctx_length (when set) overrides any per-model one.
         # A loading model is passed explicitly: at spawn time resident_model is
-        # still None, so without it the fallback DS4_CONTEXT_LENGTH would be
-        # spawned while memory()//v1/models account the request's ctx.
+        # still None, so without it the fallback context would be spawned while
+        # memory()//v1/models account the request's ctx.
         if self.ctx_length is not None:
             return self.ctx_length
         if model is not None:
             return model.loadOptions.ctx_length
         if self.resident_model is not None:
             return self.resident_model.loadOptions.ctx_length
-        return DS4_CONTEXT_LENGTH
+        return self._default_ctx()
+
+    def _default_ctx(self) -> int:
+        """The context used when nothing asked for one: the family's own.
+
+        A GGUF decides which model a ds4 tree serves, but --ctx still comes from
+        here, so a shape built for one context must not be spawned at another
+        family's number: Qwen3.8 Flash Next is sized at 262144, while DeepSeek
+        V4 keeps the million this provider hardcoded before any registry
+        existed. Families ds4 gives no documented ceiling keep that same
+        long-standing value rather than gaining an invented one.
+        """
+        return self.served_profile.native_ctx or DS4_CONTEXT_LENGTH
 
     def _backend_name(self) -> str | None:
         """ds4 backend name for the configured flags.

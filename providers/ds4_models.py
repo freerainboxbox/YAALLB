@@ -2,7 +2,8 @@
 
 ds4 does not have a model list its caller can read: one `ds4-server` process
 serves whatever the GGUF passed at startup *is*, under a fixed set of aliases
-(`deepseek-v4-flash`, ...), and picking a thinking mode is part of that alias
+(`deepseek-v4-flash`, `qwen3.8-flash-next`, ...), and picking a thinking mode is
+part of that alias
 set (`deepseek-chat` / `deepseek-reasoner` change whether the model thinks; see
 ds4_server.c `model_alias_disables_thinking` and
 `model_alias_enables_thinking`). YAALLB schedules and routes by model ID, so it
@@ -94,7 +95,30 @@ DEEPSEEK_V4 = Ds4ModelProfile(
 )
 
 
-DS4_MODEL_PROFILES: tuple[Ds4ModelProfile, ...] = (DEEPSEEK_V4,)
+QWEN38_FLASH_NEXT = Ds4ModelProfile(
+    family="qwen4exp",
+    display_name="Qwen3.8 Flash Next",
+    # ds4_server.c server_model_alias_known(): three aliases ds4 lists, two
+    # no-thinking spellings, and three vendor-prefixed ones. There is no
+    # qwen/-prefixed -no-think alias, so none is invented here.
+    aliases=(
+        "qwen3.8-flash-next",
+        "qwen3.8-flash-next-chat",
+        "qwen3.8-flash-next-reasoner",
+        "qwen3.8-flash-next-no-think",
+        "qwen3.8-flash-next-nothink",
+        "qwen/qwen3.8-flash-next",
+        "qwen/qwen3.8-flash-next-chat",
+        "qwen/qwen3.8-flash-next-reasoner",
+    ),
+    # docs/QWEN38_FLASH_NEXT.md: the native context is 262144; longer needs
+    # static YaRN through DS4_QWEN4_YARN_FACTOR, a ds4 environment knob YAALLB
+    # has no business assuming on its own.
+    native_ctx=262144,
+)
+
+
+DS4_MODEL_PROFILES: tuple[Ds4ModelProfile, ...] = (DEEPSEEK_V4, QWEN38_FLASH_NEXT)
 
 # A ds4 tree whose shape has never been confirmed (no estimator output) has
 # always been treated as DeepSeek V4 Flash/PRO, and still is.
