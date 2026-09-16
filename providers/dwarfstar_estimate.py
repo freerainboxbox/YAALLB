@@ -336,6 +336,21 @@ def gguf_bytes(ds4_dir: str, *paths: str | None) -> int:
     return total
 
 
+# Families with a measured flat context term, in bytes per context token,
+# including the transients that term has always bundled in. DeepSeek V4 Flash on
+# Metal is the shape ``DS4_CTX_BYTES_PER_TOKEN`` was measured from (16,416 against
+# 16,801 measured at ctx 1,000,000 today).
+#
+# Other families are deliberately absent: Qwen3.8 Flash Next's footprint is not
+# one straight line - its KV is 34,128 bytes/token, but its transients follow
+# --prefill-chunk (1,298 MiB at a 1024 chunk vs 7,928 MiB at its default 8192, for
+# the same 32,768-token context) and include a multi-GiB fixed term. Guessing a
+# DeepSeek slope there would under-budget the model by gigabytes, which is the
+# one thing a VRAM scheduler must not do, so it refuses instead (see
+# ``fallback_estimate``).
+DS4_FLAT_CTX_BYTES_PER_TOKEN = {"deepseek4": DS4_CTX_BYTES_PER_TOKEN}
+
+
 def fallback_estimate(
     *,
     ds4_dir: str,
@@ -344,17 +359,34 @@ def fallback_estimate(
     mtp_model: str | None = None,
     vision: str | None = None,
     dspark: bool = False,
+    model_family: str | None = None,
 ) -> dict:
     """Size-aware estimate for when the ds4 estimator cannot run.
 
-    Uses the real GGUF bytes (the dominant term) plus a flat
-    ``DS4_CTX_BYTES_PER_TOKEN`` context term. Only the context term is
-    approximate, and only for shapes/backends/contexts that deviate from the
-    DeepSeek V4 Flash Metal slope it was taken from. A configured drafter also
-    gets ``DS4_DRAFTER_SCRATCH_FALLBACK_MIB`` per session, since none of that
-    scratch can be read off file sizes.
+    Uses the real GGUF bytes (the dominant term) plus a flat context term, and a
+    per-session drafter stand-in (``DS4_DRAFTER_SCRATCH_FALLBACK_MIB``) when one
+    is configured, since none of that scratch follows from file sizes.
+
+    A flat context term only exists for families measured that way. With no
+    family known, this is the estimate YAALLB has always produced; with a family
+    known that has no flat model (Qwen3.8, GLM), it refuses rather than
+    understating a model whose transients follow other options - the estimator is
+    built automatically now, so reaching this branch means that build needs
+    fixing.
     """
-    context_bytes = DS4_CTX_BYTES_PER_TOKEN * max(int(ctx), 1)
+    if model_family is None:
+        flat = DS4_CTX_BYTES_PER_TOKEN
+    else:
+        flat = DS4_FLAT_CTX_BYTES_PER_TOKEN.get(model_family)
+        if flat is None:
+            raise Ds4EstimatorError(
+                f"no flat VRAM model for ds4 family {model_family!r}: its footprint "
+                "does not follow one bytes-per-token slope (Qwen3.8 Flash Next's "
+                "transients follow --prefill-chunk), and YAALLB will not budget it "
+                "from another family's numbers. Fix the estimator build "
+                f"({build_hint(ds4_dir)}) so ds4 can be asked directly."
+            )
+    context_bytes = flat * max(int(ctx), 1)
     model_bytes = gguf_bytes(ds4_dir, gguf_path)
     support_bytes = gguf_bytes(ds4_dir, mtp_model)
     return {
@@ -380,7 +412,7 @@ def fallback_estimate(
 
 def _signature(
     ds4_dir, gguf_path, ctx, binary, backend, prefill_chunk, ssd_streaming,
-    mtp_model, vision, dspark, mtp,
+    mtp_model, vision, dspark, mtp, model_family,
 ) -> tuple:
     return (
         ds4_dir,
@@ -394,6 +426,9 @@ def _signature(
         vision,
         bool(dspark),
         bool(mtp),
+        # A configured family changes what the fallback is allowed to guess,
+        # so it is part of the configuration, not just of the call.
+        model_family,
     )
 
 
@@ -421,6 +456,7 @@ def estimate(
     vision: str | None = None,
     dspark: bool = False,
     mtp: bool = False,
+    model_family: str | None = None,
 ) -> dict:
     """Estimate components in bytes, memoized per serve configuration.
 
@@ -431,7 +467,7 @@ def estimate(
     """
     key = _signature(
         ds4_dir, gguf_path, ctx, binary, backend, prefill_chunk, ssd_streaming,
-        mtp_model, vision, dspark, mtp,
+        mtp_model, vision, dspark, mtp, model_family,
     )
     cached = _ESTIMATE_CACHE.get(key)
     if cached is not None:
@@ -466,6 +502,9 @@ def estimate(
             mtp_model=mtp_model,
             vision=vision,
             dspark=dspark,
+            # Only a family named in config is known here: an estimate that
+            # failed carries no shape of its own.
+            model_family=model_family,
         )
 
     # Fallbacks are cached too: memory() runs per request, so re-running an
@@ -475,20 +514,44 @@ def estimate(
     return result
 
 
+def _shared_prefill_workspace(result: dict, sessions: int) -> bool:
+    """Whether ds4 aliases one prefill arena across the batched sessions.
+
+    ds4-server turns the shared workspace on whenever it batches sessions
+    (`share_session_prefill_workspace = batched_sessions > 0`) and its Metal
+    session graphs alias it (`share = e->share_session_prefill_workspace &&
+    e->backend == DS4_BACKEND_METAL`, in both the DeepSeek and the Qwen3.8
+    session paths), so the chunk-sized transients are allocated once. Other
+    backends keep private graphs. docs/SERVER.md: "an extra slot costs its caches
+    rather than another few GiB of transients".
+    """
+    return sessions > 1 and result.get("backend") == "metal" and "scratch_bytes" in result
+
+
 def estimate_mib(result: dict, sessions: int = 1) -> float:
     """Projected MiB from estimate components: GGUFs + N sessions of context.
 
-    ds4 gives each resident session its own session graphs/caches (ds4-server
-    logs the multiplied total) and its own drafter scratch, so `sessions` scales
-    both per-session terms.
+    ds4 gives each resident session its own caches and its own drafter scratch
+    (ds4-server logs the multiplied total), so those scale with `sessions`. The
+    chunk-sized transients scale only where ds4 does not share them: for Qwen3.8
+    Flash Next they are the largest part of the context term by far (7,928 MiB of
+    a 9,000 MiB context at the default prefill chunk), so counting them per
+    batched session would over-evict for a saving ds4 does not need.
     """
     mib = 2**20
     sessions = max(int(sessions), 1)
+    if _shared_prefill_workspace(result, sessions):
+        context = (
+            (result["raw_bytes"] + result["compressed_bytes"]) * sessions
+            + result["scratch_bytes"]
+        )
+    else:
+        context = result["context_bytes"] * sessions
     total_bytes = (
         result["model_bytes"]
         + result["support_bytes"]
         + result["vision_bytes"]
-        + result["context_bytes"] * sessions
+        + context
         + result.get("spec_graph_bytes", 0) * sessions
     )
     return total_bytes / mib + DS4_PROCESS_OVERHEAD_MIB

@@ -194,13 +194,20 @@ class DwarfStarProvider(Provider):
         family = estimate.get("model_family")
 
         if self.model_profile is not None:
-            # An explicit profile is an override and stays one; a disagreement
-            # between config and GGUF is still worth reading in the log.
-            log.info(
-                f"ds4 provider #{self._instance_id} serves model_profile="
-                f"{self.model_profile} although ds4 reports family={family!r} "
-                f"name={estimate.get('model_name')!r}"
-            )
+            # An explicit profile is an override and stays one either way; when
+            # config and GGUF disagree, that is worth reading in the log.
+            if self.served_profile.family == family:
+                log.info(
+                    f"ds4 provider #{self._instance_id} serves "
+                    f"model_profile={self.model_profile}, confirmed by ds4 "
+                    f"(name={estimate.get('model_name')!r})"
+                )
+            else:
+                log.info(
+                    f"ds4 provider #{self._instance_id} serves model_profile="
+                    f"{self.model_profile} although ds4 reports family={family!r} "
+                    f"name={estimate.get('model_name')!r}"
+                )
             return
 
         profile = profile_for(family)
@@ -298,7 +305,18 @@ class DwarfStarProvider(Provider):
             # the DSpark capture buffers and the support GGUF are budgeted
             # whether or not it is on.
             dspark=bool(self.options.get("dspark", False)),
+            # Qwen3.8 Flash Next and GLM 5.3 carry their MTP block in the main
+            # GGUF, so --mtp (not a support-file path) is what says a drafter is
+            # configured, and ds4's mtp_draft_tokens only answer with it.
+            mtp=bool(self.options.get("mtp", False)),
+            # Only a family named in config is available to guide a fallback
+            # estimate: the estimator is the other source, and it may be the
+            # thing that just failed.
+            model_family=self._configured_family(),
         )
+
+    def _configured_family(self) -> str | None:
+        return self._explicit_profile.family if self._explicit_profile else None
 
     def getModelsDescriptors(self) -> list[ModelDescriptor]:
         # Every alias of the served family is registered, because each is a

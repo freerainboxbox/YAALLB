@@ -261,7 +261,21 @@ def test_configured_profile_wins_over_detection(no_network, estimator, monkeypat
     # config and your GGUF disagree".
     assert provider.served_profile.family == "deepseek4"
     assert [d.modelId for d in provider.getModelsDescriptors()] == DEEPSEEK_V4_IDS
-    assert any("model_profile" in m and "qwen4exp" in m for m in messages)
+    assert any("model_profile" in m and "qwen4exp" in m and "although" in m for m in messages)
+
+
+def test_a_confirmed_profile_is_not_reported_as_a_clash(no_network, estimator, monkeypatch):
+    messages = []
+    monkeypatch.setattr(
+        "providers.dwarfstar.log.info", lambda message: messages.append(message)
+    )
+    estimator(_estimate())
+    provider = _provider(model_profile="qwen4exp")
+    provider._estimate(8192)
+
+    reported = [m for m in messages if "model_profile" in m]
+    assert len(reported) == 1
+    assert "confirmed by ds4" in reported[0] and "although" not in reported[0]
 
 
 def test_unknown_family_keeps_the_default_and_says_so(no_network, estimator, monkeypatch):

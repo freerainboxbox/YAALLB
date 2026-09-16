@@ -348,8 +348,107 @@ def test_estimate_falls_back_once_and_warns(fake_estimator, monkeypatch):
     assert "falling back" in warnings[0] and "exited 1" in warnings[0]
 
 
+def test_embedded_mtp_reaches_the_estimator(fake_estimator):
+    # Qwen3.8 Flash Next / GLM 5.3 keep their drafter in the main GGUF, so it is
+    # the --mtp option (not a support-file path) that tells ds4 what to price.
+    fake = fake_estimator()
+    provider = _provider(options={"mtp": True, "metal": True})
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    )
+    model.memory()
+    assert "--mtp" in fake.argvs[0]
+
+    plain = _provider(options={"metal": True})
+    plain.createModel(
+        ModelDescriptor("deepseek-v4-flash", plain), LoadOptions(ctx_length=8192)
+    ).memory()
+    assert "--mtp" not in fake.argvs[1]
+
+
+def test_batched_sessions_share_the_prefill_scratch_on_metal():
+    # ds4-server turns on a shared prefill workspace whenever it batches
+    # sessions (ds4_server.c parse_options -> share_session_prefill_workspace),
+    # and the Metal session graphs alias it (ds4.c: `share =
+    # e->share_session_prefill_workspace && e->backend == DS4_BACKEND_METAL`), so
+    # an extra slot costs its caches - raw+compressed KV - but not another copy of
+    # the chunk-sized transients. Budgeting them per session was worth several GiB
+    # per slot for Qwen3.8, whose scratch dwarfs its KV.
+    # An estimate as ds4 prints it, with context_bytes the sum of its parts.
+    per_session = dict(
+        ESTIMATE,
+        context_bytes=ESTIMATE["raw_bytes"]
+        + ESTIMATE["compressed_bytes"]
+        + ESTIMATE["scratch_bytes"],
+    )
+    metal = dict(per_session, backend="metal")
+    cuda = dict(per_session, backend="cuda")
+
+    weights = ESTIMATE["model_bytes"] + ESTIMATE["support_bytes"]
+    overhead = dse.DS4_PROCESS_OVERHEAD_MIB
+    kv = ESTIMATE["raw_bytes"] + ESTIMATE["compressed_bytes"]
+
+    assert dse.estimate_mib(metal, 1) == pytest.approx(
+        (weights + per_session["context_bytes"] + ESTIMATE["spec_graph_bytes"]) / MIB
+        + overhead
+    )
+    # Three sessions: three sets of caches, one arena of transients.
+    assert dse.estimate_mib(metal, 3) == pytest.approx(
+        (weights + (kv * 3 + ESTIMATE["scratch_bytes"]) + ESTIMATE["spec_graph_bytes"] * 3)
+        / MIB
+        + overhead
+    )
+    # Without the shared workspace, everything is per session as before.
+    assert dse.estimate_mib(cuda, 3) == pytest.approx(
+        (weights + per_session["context_bytes"] * 3 + ESTIMATE["spec_graph_bytes"] * 3)
+        / MIB
+        + overhead
+    )
+
+
+def test_fallback_only_guesses_where_it_has_a_measured_flat_model(tmp_path):
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"x" * (3 * MIB))
+
+    # DeepSeek V4 Flash on Metal is the shape the flat term was measured from,
+    # so an unknown family keeps the estimate YAALLB has always produced.
+    unknown = dse.fallback_estimate(
+        ds4_dir=str(tmp_path), gguf_path="./m.gguf", ctx=8192
+    )
+    assert unknown["context_bytes"] == dse.DS4_CTX_BYTES_PER_TOKEN * 8192
+
+    # A family whose footprint is not one straight line is not guessed at: a
+    # Qwen3.8 server's transients follow --prefill-chunk (1,298 MiB at 1024 vs
+    # 7,928 MiB at its default 8192 for the same context), so a DeepSeek-shaped
+    # slope would under-budget it by gigabytes.
+    with pytest.raises(dse.Ds4EstimatorError, match="qwen4exp"):
+        dse.fallback_estimate(
+            ds4_dir=str(tmp_path),
+            gguf_path="./m.gguf",
+            ctx=8192,
+            model_family="qwen4exp",
+        )
+
+
+def test_memory_refuses_to_budget_an_unmodellable_family(fake_estimator, monkeypatch):
+    # A configured family with no flat model must not be priced from another
+    # family's slope: memory() failing means the load fails loudly instead of an
+    # eviction decision made on gigabytes that are not there.
+    fake_estimator(returncode=1, stdout="")
+    monkeypatch.setattr(dse.log, "warning", lambda message: None)
+    provider = _provider(model_profile="qwen3.8-flash-next")
+    model = provider.createModel(
+        ModelDescriptor("qwen3.8-flash-next", provider), LoadOptions(ctx_length=8192)
+    )
+    with pytest.raises(dse.Ds4EstimatorError, match="qwen4exp"):
+        model.memory()
+
+
 def test_estimate_mib_scales_the_per_session_terms_by_sessions():
+    # A backend without ds4's shared prefill workspace pays every per-session
+    # term in full: its context (KV *and* transients) and its drafter scratch.
     sessions = 4
+    estimate = dict(ESTIMATE, backend="cuda")
     expected = (
         ESTIMATE["model_bytes"]
         + ESTIMATE["support_bytes"]
@@ -357,9 +456,9 @@ def test_estimate_mib_scales_the_per_session_terms_by_sessions():
         + ESTIMATE["context_bytes"] * sessions
         + ESTIMATE["spec_graph_bytes"] * sessions
     ) / MIB + dse.DS4_PROCESS_OVERHEAD_MIB
-    assert dse.estimate_mib(ESTIMATE, sessions) == pytest.approx(expected)
-    assert dse.estimate_mib(ESTIMATE, 0) == pytest.approx(
-        dse.estimate_mib(ESTIMATE, 1)
+    assert dse.estimate_mib(estimate, sessions) == pytest.approx(expected)
+    assert dse.estimate_mib(estimate, 0) == pytest.approx(
+        dse.estimate_mib(estimate, 1)
     )
 
 
@@ -411,10 +510,13 @@ def test_memory_counts_drafter_gguf_and_batched_sessions(fake_estimator):
 
     projected = model.memory()
     assert provider._sessions() == 3
-    # Context and drafter scratch are per resident session (x3); the support
-    # GGUF is mapped once.
+    # Each session keeps its own caches (raw+compressed) and its own drafter
+    # scratch (x3), but aliases one arena of chunk-sized transients, and the
+    # support GGUF is mapped once.
+    per_session = (ESTIMATE["raw_bytes"] + ESTIMATE["compressed_bytes"]) * 3
+    shared = ESTIMATE["scratch_bytes"]
     assert projected == pytest.approx(
-        (8_000_000_000 + 1_000_000_000 + (1_000_000 + 281_000_000) * 3) / MIB
+        (8_000_000_000 + 1_000_000_000 + per_session + shared + 281_000_000 * 3) / MIB
         + dse.DS4_PROCESS_OVERHEAD_MIB
     )
     assert projected > dse.estimate_mib(ESTIMATE, 1)
