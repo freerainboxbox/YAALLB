@@ -27,7 +27,10 @@ from pathlib import Path
 import log
 
 # Schema version this module can read (tools/ds4_estimate.c prints it).
-DS4_ESTIMATOR_SCHEMA_VERSION = 2
+# Schema 3 added ds4's own model identity (family/id/aliases) plus
+# spec_graph_supported; an older helper cannot say which model a GGUF is, so it
+# is refused with a rebuild hint rather than scheduled under DeepSeek's shape.
+DS4_ESTIMATOR_SCHEMA_VERSION = 3
 
 # Per-run ds4 instance lock, so estimating never collides with a running
 # ds4-server (which holds /tmp/ds4.lock by default) and never blocks one.
@@ -90,6 +93,7 @@ def run_estimator(
     mtp_model: str | None = None,
     vision: str | None = None,
     dspark: bool = False,
+    mtp: bool = False,
 ) -> dict:
     """Ask the ds4 tree for its footprint components (bytes).
 
@@ -119,6 +123,10 @@ def run_estimator(
         argv += ["--mtp-model", mtp_model]
     if dspark:
         argv.append("--dspark")
+    if mtp:
+        # Qwen3.8 Flash Next and GLM 5.3 keep their MTP drafter inside the main
+        # GGUF, so no --mtp-model path reveals that a drafter is configured.
+        argv.append("--mtp")
     if vision:
         argv += ["--vision", vision]
 
@@ -187,9 +195,24 @@ def run_estimator(
             "verifier_scratch_bytes",
             "host_scratch_bytes",
             "spec_graph_bytes",
+            # The model identity schema 3 added; a helper missing any of them
+            # is a schema 2 helper, whose rebuild hint the error below gives.
+            "model_id",
         )
         if not isinstance(estimate.get(key), int) or estimate[key] < 0
     ]
+    for key in ("model_family", "model_aliases", "spec_graph_supported"):
+        value = estimate.get(key)
+        if key == "model_family" and not (isinstance(value, str) and value):
+            missing.append(key)
+        elif key == "model_aliases" and not (
+            isinstance(value, list)
+            and value
+            and all(isinstance(alias, str) and alias for alias in value)
+        ):
+            missing.append(key)
+        elif key == "spec_graph_supported" and not isinstance(value, bool):
+            missing.append(key)
     if missing:
         raise Ds4EstimatorError(
             f"ds4 estimator output is missing {missing}; rebuild it with: "
@@ -240,6 +263,12 @@ def fallback_estimate(
         "source": "fallback",
         "model_name": None,
         "backend": None,
+        # No identity without ds4: the provider keeps its configured model list
+        # and says so, rather than inventing a shape it did not measure.
+        "model_family": None,
+        "model_id": None,
+        "model_aliases": None,
+        "spec_graph_supported": None,
         "ctx": int(ctx),
         "model_bytes": model_bytes,
         "support_bytes": support_bytes,
@@ -253,7 +282,7 @@ def fallback_estimate(
 
 def _signature(
     ds4_dir, gguf_path, ctx, binary, backend, prefill_chunk, ssd_streaming,
-    mtp_model, vision, dspark,
+    mtp_model, vision, dspark, mtp,
 ) -> tuple:
     return (
         ds4_dir,
@@ -266,6 +295,7 @@ def _signature(
         mtp_model,
         vision,
         bool(dspark),
+        bool(mtp),
     )
 
 
@@ -292,6 +322,7 @@ def estimate(
     mtp_model: str | None = None,
     vision: str | None = None,
     dspark: bool = False,
+    mtp: bool = False,
 ) -> dict:
     """Estimate components in bytes, memoized per serve configuration.
 
@@ -302,7 +333,7 @@ def estimate(
     """
     key = _signature(
         ds4_dir, gguf_path, ctx, binary, backend, prefill_chunk, ssd_streaming,
-        mtp_model, vision, dspark,
+        mtp_model, vision, dspark, mtp,
     )
     cached = _ESTIMATE_CACHE.get(key)
     if cached is not None:
@@ -320,6 +351,7 @@ def estimate(
             mtp_model=mtp_model,
             vision=vision,
             dspark=dspark,
+            mtp=mtp,
         )
         result["source"] = "ds4"
     except Ds4EstimatorError as exc:

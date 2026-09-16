@@ -17,7 +17,7 @@ from abstractions.load_options import LoadOptions
 from providers.dwarfstar import DwarfStarProvider, warm_dwarfstar_estimates
 
 ESTIMATE = {
-    "version": 2,
+    "version": 3,
     "model_name": "DeepSeek V4 Flash",
     "backend": "metal",
     "ctx": 8192,
@@ -42,6 +42,16 @@ ESTIMATE = {
     "dspark_capture_stages": 3,
     "has_mtp": False,
     "mtp_draft_tokens": 0,
+    # ds4's own shape identity (ds4_server.c server_model_id_from_engine) plus
+    # the aliases its /v1/models lists for it (send_models()). YAALLB registers
+    # models from these, so a Qwen GGUF never inherits DeepSeek's context.
+    "model_family": "deepseek4",
+    "model_id": 0,
+    "model_aliases": ["deepseek-v4-flash", "deepseek-v4-pro"],
+    # Some families (Qwen3.8, GLM) size their drafter graph elsewhere, so the
+    # DeepSeek-path accessor pair does not describe them and the estimator says
+    # so instead of printing DeepSeek-shaped numbers.
+    "spec_graph_supported": True,
 }
 
 MIB = 2**20
@@ -165,6 +175,57 @@ def test_run_estimator_reports_a_failing_estimator(fake_estimator):
         dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
 
 
+def test_run_estimator_passes_embedded_mtp(fake_estimator):
+    # Qwen3.8 Flash Next and GLM 5.3 build their MTP drafter into the main GGUF
+    # (--mtp, no --mtp-model file). Without the flag the estimator reports
+    # mtp_draft_tokens=0 and budgets no drafter for a config that has one.
+    fake = fake_estimator()
+    dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=8192, mtp=True)
+    assert "--mtp" in fake.argvs[0]
+    dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="n.gguf", ctx=8192)
+    assert "--mtp" not in fake.argvs[1]
+
+
+def test_run_estimator_reports_the_model_identity(fake_estimator):
+    fake_estimator()
+    result = dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=8192)
+    assert result["model_family"] == "deepseek4"
+    assert result["model_id"] == 0
+    assert result["model_aliases"] == ["deepseek-v4-flash", "deepseek-v4-pro"]
+    assert result["spec_graph_supported"] is True
+
+
+def test_run_estimator_rejects_a_schema_2_estimator(fake_estimator):
+    # Schema 2 had no model_family/aliases, so it cannot say what model the
+    # GGUF actually is: a Qwen GGUF would be served DeepSeek's model IDs and
+    # context ceiling. A stale estimator must say "rebuild", not guess.
+    stale = {
+        key: value
+        for key, value in ESTIMATE.items()
+        if key
+        not in (
+            "model_family",
+            "model_id",
+            "model_aliases",
+            "spec_graph_supported",
+        )
+    } | {"version": 2}
+    fake_estimator(stdout=json.dumps(stale))
+    with pytest.raises(dse.Ds4EstimatorError, match="rebuild"):
+        dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
+    # Same schema but a helper that cannot state the identity: also a rebuild.
+    nameless = {key: value for key, value in ESTIMATE.items() if key != "model_family"}
+    fake_estimator(stdout=json.dumps(nameless))
+    with pytest.raises(dse.Ds4EstimatorError, match="model_family"):
+        dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
+    aliases = dict(ESTIMATE, model_aliases="deepseek-v4-flash")
+    fake_estimator(stdout=json.dumps(aliases))
+    with pytest.raises(dse.Ds4EstimatorError, match="model_aliases"):
+        dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
+
 def test_run_estimator_rejects_a_foreign_schema(fake_estimator):
     stale = dict(ESTIMATE, version=99)
     fake_estimator(stdout=json.dumps(stale))
@@ -250,7 +311,9 @@ def test_estimate_memoizes_one_serve_configuration(fake_estimator, monkeypatch):
     dse.estimate(**kwargs)
     dse.estimate(**{**kwargs, "ctx": 16384})
     dse.estimate(**{**kwargs, "mtp_model": "./support.gguf"})
-    assert len(fake.argvs) == 3
+    # ... and so is turning on a drafter that lives inside the main GGUF.
+    dse.estimate(**{**kwargs, "mtp": True})
+    assert len(fake.argvs) == 4
 
 
 def test_estimate_falls_back_once_and_warns(fake_estimator, monkeypatch):
