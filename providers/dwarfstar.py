@@ -13,11 +13,20 @@ from providers.dwarfstar_estimate import (
     estimate as ds4_estimate,
     estimate_mib as ds4_estimate_mib,
 )
+from providers.ds4_models import (
+    DS4_DEFAULT_MAX_COMPLETION_TOKENS,
+    DS4_DEFAULT_PROFILE,
+    DS4_MODEL_PROFILES,
+    DS4_SUPPORTED_PARAMETERS,
+    Ds4ModelProfile,
+    profile_named,
+)
 
 # ds4 cannot answer a native /v1/models while it is spawned/terminated by
-# Python, so its model list is built here. Both model IDs point to the same
-# underlying model; the presented context_length is 1000000 (DeepSeek v4's
-# maximum) unless a model is resident with a different ctx_length.
+# Python, so the model list is built here from the profile registry (see
+# providers/ds4_models.py). Every alias of the served family names the same
+# resident model, and the presented context_length is the ctx that will actually
+# be spawned.
 DS4_CONTEXT_LENGTH = 1000000
 
 DS4_DEFAULT_HOST = "127.0.0.1"
@@ -122,9 +131,34 @@ class DwarfStarProvider(Provider):
         self.estimate_binary: str = DS4_DEFAULT_ESTIMATOR
         self.options: dict = {}
         self.ctx_length: int | None = None
+        # Which ds4 family this instance serves (see providers/ds4_models.py).
+        # None means "whatever the GGUF is", which is confirmed against the ds4
+        # build itself when its footprint is estimated.
+        self.model_profile: str | None = None
         self.resident_model: BaseModel | None = None
         self._process: subprocess.Popen | None = None
         super().__init__(_instance_id, config)
+        self.served_profile = self._resolve_profile()
+
+    def _resolve_profile(self) -> Ds4ModelProfile:
+        """The configured model profile, or the family YAALLB always assumed.
+
+        A wrong `model_profile` is a config error and says so at startup, with
+        the names it accepts. ds4's own flag combinations are not checked
+        anywhere: what a model rejects, it logs itself.
+        """
+        if self.model_profile is None:
+            return DS4_DEFAULT_PROFILE
+        profile = profile_named(self.model_profile)
+        if profile is None:
+            accepted = ", ".join(
+                f"{p.family} ({p.primary_alias})" for p in DS4_MODEL_PROFILES
+            )
+            raise ValueError(
+                f"model_profile {self.model_profile!r} is not a ds4 model "
+                f"profile; use one of: {accepted} (or any of their aliases)"
+            )
+        return profile
 
     @property
     def endpoint_uri(self) -> str:
@@ -187,13 +221,19 @@ class DwarfStarProvider(Provider):
         )
 
     def getModelsDescriptors(self) -> list[ModelDescriptor]:
-        return [
-            ModelDescriptor("deepseek-v4-flash", self),
-            ModelDescriptor("deepseek-v4-pro", self),
-        ]
+        # Every alias of the served family is registered, because each is a
+        # request YAALLB has to route (and budget) - and the thinking aliases
+        # only work if clients can name them.
+        return [ModelDescriptor(alias, self) for alias in self.served_profile.aliases]
 
     def getOAIModels(self) -> list[dict]:
+        # Mirrors ds4-server's own /v1/models (ds4_server.c append_model_json):
+        # the server ctx in both context fields, its -n as the completion
+        # ceiling, one supported_parameters list for every model it serves.
         ctx_length = self._effective_ctx()
+        max_completion = int(
+            self.options.get("tokens") or DS4_DEFAULT_MAX_COMPLETION_TOKENS
+        )
 
         def model_entry(model_id: str) -> dict:
             return {
@@ -201,29 +241,17 @@ class DwarfStarProvider(Provider):
                 "object": "model",
                 "created": 1767225600,
                 "owned_by": "ds4.c",
-                "name": "DeepSeek V4 Flash",
+                "name": self.served_profile.display_name,
                 "context_length": ctx_length,
                 "top_provider": {
-                    "context_length": DS4_CONTEXT_LENGTH,
-                    "max_completion_tokens": 393216,
+                    "context_length": ctx_length,
+                    "max_completion_tokens": max_completion,
                     "is_moderated": False,
                 },
-                "supported_parameters": [
-                    "tools",
-                    "tool_choice",
-                    "max_tokens",
-                    "temperature",
-                    "top_p",
-                    "top_k",
-                    "min_p",
-                    "stop",
-                    "seed",
-                    "stream",
-                    "reasoning_effort",
-                ],
+                "supported_parameters": DS4_SUPPORTED_PARAMETERS,
             }
 
-        return [model_entry("deepseek-v4-flash"), model_entry("deepseek-v4-pro")]
+        return [model_entry(alias) for alias in self.served_profile.aliases]
 
     def createModel(
         self, descriptor: ModelDescriptor, loadOptions: LoadOptions

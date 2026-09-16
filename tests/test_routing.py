@@ -816,7 +816,7 @@ def test_getoaimodels_sends_api_key_header(monkeypatch):
     assert captured["headers"] == {"Authorization": "Bearer sk-test"}
 
 
-def test_dwarfstar_getoaimodels_hardcoded(monkeypatch):
+def test_dwarfstar_getoaimodels_lists_the_served_aliases(monkeypatch):
     from providers.dwarfstar import DwarfStarProvider
 
     def no_network(url):
@@ -826,7 +826,12 @@ def test_dwarfstar_getoaimodels_hardcoded(monkeypatch):
 
     provider = DwarfStarProvider()
     data = provider.getOAIModels()
-    assert [m["id"] for m in data] == ["deepseek-v4-flash", "deepseek-v4-pro"]
+    assert [m["id"] for m in data] == [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek-chat",
+        "deepseek-reasoner",
+    ]
     assert all(m["object"] == "model" for m in data)
 
 
@@ -861,18 +866,19 @@ def test_dwarfstar_resident_model_and_context(monkeypatch):
     provider = DwarfStarProvider(
         config={"ds4_dir": "/tmp/ds4", "gguf_path": "model.gguf"}
     )
-    assert [m["context_length"] for m in provider.getOAIModels()] == [1000000, 1000000]
+    # Every served alias reports the same context: one server, one --ctx.
+    assert [m["context_length"] for m in provider.getOAIModels()] == [1000000] * 4
 
     model = provider.createModel(
         ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
     )
     provider.loadModel(model)
     assert provider.resident_model is model
-    assert [m["context_length"] for m in provider.getOAIModels()] == [8192, 8192]
+    assert [m["context_length"] for m in provider.getOAIModels()] == [8192] * 4
 
     provider.unloadModel(model)
     assert getattr(provider, "resident_model", None) is None
-    assert [m["context_length"] for m in provider.getOAIModels()] == [1000000, 1000000]
+    assert [m["context_length"] for m in provider.getOAIModels()] == [1000000] * 4
 
 
 def test_dwarfstar_build_command():
@@ -946,8 +952,8 @@ def test_dwarfstar_provider_ctx_overrides_model_ctx():
         "--ctx",
         "262144",
     ]
-    # And both served models report it in /v1/models.
-    assert [m["context_length"] for m in provider.getOAIModels()] == [262144, 262144]
+    # And every served alias reports it in /v1/models.
+    assert [m["context_length"] for m in provider.getOAIModels()] == [262144] * 4
 
 
 def test_dwarfstar_build_command_preserves_spaces():
