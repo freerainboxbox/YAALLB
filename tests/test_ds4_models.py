@@ -15,6 +15,7 @@ from abstractions.load_options import LoadOptions
 from providers.dwarfstar import DwarfStarProvider
 from providers.ds4_models import (
     DS4_DEFAULT_MAX_COMPLETION_TOKENS,
+    DS4_MODEL_PROFILES,
     DS4_SUPPORTED_PARAMETERS,
     profile_for,
     profile_named,
@@ -96,6 +97,56 @@ def test_oai_listing_mirrors_ds4s_own_model_json(no_network):
         plain["top_provider"]["max_completion_tokens"]
         == DS4_DEFAULT_MAX_COMPLETION_TOKENS
     )
+
+
+V41_IDS = ["deepseek-v4.1-flash"]
+GLM_53_IDS = [
+    "glm-5.3-flash",
+    "glm-5.3-flash-chat",
+    "glm-5.3-flash-reasoner",
+    "glm-5.3-flash-no-think",
+    "glm-5.3-flash-nothink",
+    "zai/glm-5.3-flash",
+    "zai/glm-5.3-flash-chat",
+    "zai/glm-5.3-flash-reasoner",
+]
+GLM_52_IDS = [
+    "glm-5.2",
+    "glm-5.2-chat",
+    "glm-5.2-reasoner",
+    "glm-5.2-no-think",
+    "glm-5.2-nothink",
+    "zai/glm-5.2",
+    "zai/glm-5.2-chat",
+    "zai/glm-5.2-reasoner",
+]
+
+
+def test_the_other_single_machine_families_are_registered(no_network):
+    expected = {
+        # ds4 gives V4.1 exactly one alias: no thinking variants exist for it.
+        "deepseek41": V41_IDS,
+        "glm53": GLM_53_IDS,
+        "glm52": GLM_52_IDS,
+    }
+    for family, ids in expected.items():
+        provider = _provider(model_profile=family)
+        assert [d.modelId for d in provider.getModelsDescriptors()] == ids, family
+        assert [m["id"] for m in provider.getOAIModels()] == ids, family
+        # None of these families has a documented ceiling, so they keep the
+        # context this provider has always used instead of a invented one.
+        assert provider._effective_ctx() == 1000000, family
+
+
+def test_no_alias_is_shared_between_families():
+    # Two ds4 instances of different families both answer /v1/models, and
+    # routing picks the first provider holding a descriptor: a shared alias
+    # would make a Qwen request silently load a GLM tree.
+    seen = {}
+    for profile in DS4_MODEL_PROFILES:
+        for alias in profile.aliases:
+            assert alias not in seen, f"{alias} in {seen.get(alias)} and {profile.family}"
+            seen[alias] = profile.family
 
 
 def test_qwen_aliases_are_all_registered(no_network):

@@ -118,7 +118,61 @@ QWEN38_FLASH_NEXT = Ds4ModelProfile(
 )
 
 
-DS4_MODEL_PROFILES: tuple[Ds4ModelProfile, ...] = (DEEPSEEK_V4, QWEN38_FLASH_NEXT)
+DEEPSEEK_V41_FLASH = Ds4ModelProfile(
+    family="deepseek41",
+    display_name="DeepSeek V4.1 Flash",
+    # One alias only: ds4's thinking-alias tables have no V4.1 entries (effort
+    # there comes from reasoning_effort / a thinking object instead).
+    aliases=("deepseek-v4.1-flash",),
+    # docs/MODELS.md gives file and weight sizes for V4.1, never a context
+    # ceiling, so none is claimed here either.
+    native_ctx=None,
+)
+
+GLM_53_FLASH = Ds4ModelProfile(
+    family="glm53",
+    display_name="GLM 5.3 Flash",
+    # GLM 5.3 shares ds4's GLM DSA family with 5.2 (ds4 distinguishes them by
+    # variant), which is why ds4's own send_models() answers 5.3 trees with the
+    # 5.2 ids. Both sets are accepted by its chat endpoint, so both are
+    # registered - under their own families, so a 5.3 tree never advertises 5.2.
+    aliases=(
+        "glm-5.3-flash",
+        "glm-5.3-flash-chat",
+        "glm-5.3-flash-reasoner",
+        "glm-5.3-flash-no-think",
+        "glm-5.3-flash-nothink",
+        "zai/glm-5.3-flash",
+        "zai/glm-5.3-flash-chat",
+        "zai/glm-5.3-flash-reasoner",
+    ),
+    native_ctx=None,
+)
+
+GLM_52 = Ds4ModelProfile(
+    family="glm52",
+    display_name="GLM 5.2",
+    aliases=(
+        "glm-5.2",
+        "glm-5.2-chat",
+        "glm-5.2-reasoner",
+        "glm-5.2-no-think",
+        "glm-5.2-nothink",
+        "zai/glm-5.2",
+        "zai/glm-5.2-chat",
+        "zai/glm-5.2-reasoner",
+    ),
+    native_ctx=None,
+)
+
+
+DS4_MODEL_PROFILES: tuple[Ds4ModelProfile, ...] = (
+    DEEPSEEK_V4,
+    DEEPSEEK_V41_FLASH,
+    QWEN38_FLASH_NEXT,
+    GLM_53_FLASH,
+    GLM_52,
+)
 
 # A ds4 tree whose shape has never been confirmed (no estimator output) has
 # always been treated as DeepSeek V4 Flash/PRO, and still is.
