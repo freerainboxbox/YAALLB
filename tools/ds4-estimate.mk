@@ -2,19 +2,27 @@
 #
 # The estimator links ds4's own objects, so it inherits the exact shape/estimator
 # code of that build (see tools/ds4_estimate.c and the ds4 provider docs in
-# README.md). Run make from the ds4 directory and include this fragment; the
-# ds4 Makefile is read first, so CORE_OBJS/CFLAGS/link flags all come from it.
+# README.md). YAALLB builds it by itself on startup, for every ds4 directory
+# config.json mentions, from inside that directory with an absolute -f; the ds4
+# Makefile is read first, so CORE_OBJS/CFLAGS/link flags all come from it.
 #
-#   make -C /path/to/ds4 -f /path/to/yaallb/tools/ds4-estimate.mk
+#   cd /path/to/ds4 && make -f /path/to/yaallb/tools/ds4-estimate.mk
 #
-# Produces ds4-estimate in the ds4 directory (where ds4-server also lives).
+# Produces ds4-estimate in the ds4 directory (where ds4-server also lives). It
+# is additive: only ds4-estimate and ds4_estimate.host.o are written, and make
+# does nothing when the tree is already current.
+#
+# The working-directory form matters: this fragment's own `include Makefile`,
+# and ds4's object rules, are relative to the tree, so passing an absolute -f
+# while staying in the tree is what keeps them meaning that tree.
 #
 # Variants:
-#   - a tree built with `make cpu` has no GPU objects; build the estimator
-#     against CPU_CORE_OBJS and mark it CPU-only:
+#   - a tree built with `make cpu` has no GPU objects to link against; the
+#     CPU-only switch swaps in the CPU object list (a command-line CORE_OBJS=
+#     override would have to quote a make expression, so the switch does it):
 #
-#       make -C /path/to/ds4 -f /path/to/yaallb/tools/ds4-estimate.mk \
-#            CORE_OBJS="$(CPU_CORE_OBJS)" DS4_ESTIMATE_CPU_ONLY=1
+#       cd /path/to/ds4 && make -f /path/to/yaallb/tools/ds4-estimate.mk \
+#            DS4_ESTIMATE_CPU_ONLY=1
 #
 #   - DS4_ESTIMATE_OUT=<name> changes the output name.
 
@@ -38,6 +46,8 @@ endif
 DS4_ESTIMATE_CFLAGS := $(filter-out -std=c99,$(CFLAGS)) -I.
 ifneq ($(strip $(DS4_ESTIMATE_CPU_ONLY)),)
 DS4_ESTIMATE_CFLAGS += -DDS4_ESTIMATE_CPU_ONLY
+# No GPU objects to link, so link the CPU core instead of the default one.
+CORE_OBJS := $(CPU_CORE_OBJS)
 endif
 
 # ds4's Makefile is included first, so its `all:` goal would otherwise win.

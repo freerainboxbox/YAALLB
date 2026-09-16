@@ -30,7 +30,11 @@ from abstractions.provider import Provider
 from abstractions.routing import lookup_model
 from providers.dflash import DflashProvider
 from providers.dflash_cache import ensure_dflash_cache
-from providers.dwarfstar import DwarfStarProvider, warm_dwarfstar_estimates
+from providers.dwarfstar import (
+    DwarfStarProvider,
+    build_dwarfstar_estimators,
+    warm_dwarfstar_estimates,
+)
 from providers.llama_cpp import LlamaCppProvider
 from providers.lmstudio import LMStudioProvider
 from scheduling import ModelNotFound, Scheduler
@@ -795,7 +799,10 @@ def main() -> None:
     DEFAULT_CTX_LENGTH = yaallb["ctx_length"]
 
     # ds4's footprint comes from the ds4 build itself (a subprocess that reads
-    # the GGUF shape), so warm the configured contexts before serving.
+    # the GGUF shape), so that helper is built into each configured ds4 tree
+    # first (additively) and the configured contexts are warmed before serving.
+    # Both must succeed: without them a ds4 model would be scheduled blind.
+    build_dwarfstar_estimators(providers)
     warm_dwarfstar_estimates(providers, DEFAULT_CTX_LENGTH)
 
     set_iogpu_wired_limit(wired_limit_mb)

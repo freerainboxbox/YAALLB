@@ -1,3 +1,4 @@
+import os.path
 import subprocess
 
 import log
@@ -7,6 +8,8 @@ from abstractions.model import Model as BaseModel
 from abstractions.provider import Provider
 from abstractions.ready import wait_server_ready
 from providers.dwarfstar_estimate import (
+    Ds4BuildError,
+    build_estimator,
     estimate as ds4_estimate,
     estimate_mib as ds4_estimate_mib,
 )
@@ -292,6 +295,43 @@ class DwarfStarProvider(Provider):
             self._process = None
         self.resident_model = None
         model._loaded = False
+
+
+def build_dwarfstar_estimators(providers: list) -> None:
+    """Build the footprint estimator into every ds4 tree config.json names.
+
+    YAALLB asks the ds4 build itself what a serve configuration will occupy (see
+    providers/dwarfstar_estimate.py), and the answer is only valid for the exact
+    build it was linked against, so the estimator belongs inside each tree. It
+    is YAALLB's own program: building it *adds* two files next to ds4-server
+    (`ds4-estimate`, `ds4_estimate.host.o`) and rewrites nothing, and make
+    rebuilds nothing when the tree is already current - which is also why the
+    estimator never goes stale against an updated ds4 again.
+
+    Several instances of one tree share one build. Anything that would leave a
+    ds4 instance unbudgeted raises: startup must not continue on a guess.
+    """
+    roots: list[str] = []
+    for provider in providers:
+        if provider._type_id != DwarfStarProvider._type_id:
+            continue
+        ds4_dir = getattr(provider, "ds4_dir", None)
+        if not ds4_dir:
+            raise Ds4BuildError(
+                f"ds4 provider #{provider._instance_id} has no ds4_dir, so its "
+                "footprint estimator cannot be built and its models cannot be "
+                "budgeted"
+            )
+        root = os.path.abspath(ds4_dir)
+        if root not in roots:
+            roots.append(root)
+
+    for root in roots:
+        build_estimator(root)
+        log.info(
+            f"ds4 estimator ready dir={root} "
+            "(added to the tree: ds4-estimate, ds4_estimate.host.o)"
+        )
 
 
 def warm_dwarfstar_estimates(providers: list, default_ctx: int | None = None) -> None:

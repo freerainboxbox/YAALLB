@@ -7,7 +7,9 @@ estimator binary is absent or stale.
 """
 
 import json
+import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +17,7 @@ import providers.dwarfstar_estimate as dse
 from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from providers.dwarfstar import DwarfStarProvider, warm_dwarfstar_estimates
+from providers.lmstudio import LMStudioProvider
 
 ESTIMATE = {
     "version": 3,
@@ -165,8 +168,9 @@ def test_run_estimator_missing_binary_shows_the_build_command(monkeypatch):
     monkeypatch.setattr(subprocess, "run", missing)
     with pytest.raises(dse.Ds4EstimatorError) as exc:
         dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
-    assert "make -C /tmp/ds4" in str(exc.value)
-    assert "tools/ds4-estimate.mk" in str(exc.value)
+    # The hint is the command YAALLB itself runs: absolute -f, cwd = the tree.
+    assert "make -f" in str(exc.value) and "tools/ds4-estimate.mk" in str(exc.value)
+    assert "/tmp/ds4" in str(exc.value)
 
 
 def test_run_estimator_reports_a_failing_estimator(fake_estimator):
@@ -458,6 +462,181 @@ def test_warm_dwarfstar_estimates_covers_configured_contexts(fake_estimator, mon
     assert [argv[-1] for argv in fake.argvs] == ["4096", "100000"]
     assert len(messages) == 2
     assert "ctx=4096" in messages[0] and "source=ds4" in messages[0]
+
+
+class FakeMake:
+    """Records make invocations and replays canned exit codes per attempt."""
+
+    def __init__(self, returncodes=(0,), stdout="", stderr="cc: nope"):
+        self.returncodes = list(returncodes)
+        self.stdout = stdout
+        self.stderr = stderr
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((argv, kwargs))
+
+        class Proc:
+            pass
+
+        proc = Proc()
+        proc.returncode = self.returncodes[min(len(self.calls) - 1, len(self.returncodes) - 1)]
+        proc.stdout = self.stdout
+        proc.stderr = self.stderr
+        return proc
+
+    @property
+    def argvs(self):
+        return [argv for argv, _ in self.calls]
+
+    @property
+    def kwargs(self):
+        return [kw for _, kw in self.calls]
+
+
+@pytest.fixture
+def fake_make(monkeypatch):
+    def install(**kwargs):
+        fake = FakeMake(**kwargs)
+        monkeypatch.setattr(subprocess, "run", fake)
+        return fake
+
+    return install
+
+
+@pytest.fixture
+def ds4_tree(tmp_path):
+    """A ds4 tree that looks built: a Makefile plus one core object."""
+    root = tmp_path / "ds4"
+    root.mkdir()
+    (root / "Makefile").write_text("all:\n\techo built\n")
+    (root / "ds4.o").write_bytes(b"o")
+    return root
+
+
+def test_build_estimator_runs_make_inside_the_ds4_tree(fake_make, ds4_tree):
+    fake = fake_make()
+    assert dse.build_estimator(str(ds4_tree)) == str(ds4_tree)
+
+    argv, kwargs = fake.argvs[0], fake.kwargs[0]
+    # Absolute -f and cwd = the tree: make -C would make the fragment's own
+    # relative paths (its `include Makefile`, ds4's object rules) ambiguous.
+    assert argv[:2] == ["make", "-f"]
+    assert os.path.isabs(argv[2]) and argv[2].endswith("tools/ds4-estimate.mk")
+    assert os.path.exists(argv[2])
+    assert "-C" not in argv
+    assert kwargs["cwd"] == os.path.abspath(str(ds4_tree))
+
+
+def test_build_estimator_retries_cpu_only_then_reports_both(fake_make, ds4_tree):
+    # A tree built with `make cpu` has no GPU objects to link against, so the
+    # CPU-only variant is tried before giving up.
+    fake = fake_make(returncodes=(1, 1), stderr="Undefined symbols: _metal_graph_alloc")
+    with pytest.raises(dse.Ds4BuildError) as exc:
+        dse.build_estimator(str(ds4_tree))
+    assert len(fake.argvs) == 2
+    assert fake.argvs[1][-1] == "DS4_ESTIMATE_CPU_ONLY=1"
+    assert "Undefined symbols" in str(exc.value)
+    assert "make -f" in str(exc.value)
+
+    # A tree whose CPU-only variant links is a success, not an error.
+    ok = fake_make(returncodes=(1, 0))
+    assert dse.build_estimator(str(ds4_tree)) == str(ds4_tree)
+    assert len(ok.argvs) == 2
+    assert ok.argvs[1][-1] == "DS4_ESTIMATE_CPU_ONLY=1"
+
+
+def test_build_estimator_refuses_to_compile_the_whole_engine(fake_make, tmp_path):
+    unbuilt = tmp_path / "ds4-src"
+    unbuilt.mkdir()
+    (unbuilt / "Makefile").write_text("all:\n\tcc -c ds4.c\n")
+    (unbuilt / "ds4.c").write_text("int main(void){return 0;}\n")
+
+    fake = fake_make()
+    with pytest.raises(dse.Ds4BuildError, match="build ds4"):
+        dse.build_estimator(str(unbuilt))
+    # YAALLB appends its own helper to a built engine; it does not decide to
+    # spend twenty minutes compiling somebody's inference engine instead.
+    assert fake.argvs == []
+
+    with pytest.raises(dse.Ds4BuildError, match="not a directory"):
+        dse.build_estimator(str(tmp_path / "not-a-tree"))
+
+    wrong = tmp_path / "not-ds4"
+    wrong.mkdir()
+    with pytest.raises(dse.Ds4BuildError, match="Makefile"):
+        dse.build_estimator(str(wrong))
+
+
+def test_build_estimator_says_when_make_is_missing(monkeypatch, ds4_tree):
+    def missing(argv, **kwargs):
+        raise FileNotFoundError(argv[0])
+
+    monkeypatch.setattr(subprocess, "run", missing)
+    with pytest.raises(dse.Ds4BuildError, match="make"):
+        dse.build_estimator(str(ds4_tree))
+
+
+def test_build_dwarfstar_estimators_builds_each_tree_once(fake_make, tmp_path, ds4_tree):
+    from providers.dwarfstar import build_dwarfstar_estimators
+
+    other = tmp_path / "other-ds4"
+    other.mkdir()
+    (other / "Makefile").write_text("all:\n\techo built\n")
+    (other / "ds4_cpu.o").write_bytes(b"o")
+
+    fake = fake_make()
+    providers = [
+        DwarfStarProvider(0, {"ds4_dir": str(ds4_tree), "gguf_path": "a.gguf"}),
+        DwarfStarProvider(1, {"ds4_dir": str(ds4_tree) + "/", "gguf_path": "b.gguf"}),
+        DwarfStarProvider(2, {"ds4_dir": str(other), "gguf_path": "c.gguf"}),
+    ]
+    build_dwarfstar_estimators(providers + [LMStudioProvider()])
+
+    # Two instances of one tree means one build; a second tree gets its own.
+    dirs = [kw["cwd"] for kw in fake.kwargs]
+    assert dirs == [os.path.abspath(str(ds4_tree)), os.path.abspath(str(other))]
+
+
+def test_build_dwarfstar_estimators_needs_a_ds4_dir(fake_make):
+    from providers.dwarfstar import build_dwarfstar_estimators
+
+    fake = fake_make()
+    with pytest.raises(dse.Ds4BuildError, match="ds4_dir"):
+        build_dwarfstar_estimators([DwarfStarProvider(0, {})])
+    assert fake.argvs == []
+
+
+def test_build_estimator_is_a_real_make_run(tmp_path):
+    # No mocks: the argv/cwd contract has to survive an actual make, including
+    # the fragment-style `include Makefile` the real one relies on.
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "Makefile").write_text("CORE_OBJS =\nCPU_CORE_OBJS =\nall:\n\techo engine\n")
+    (root / "ds4.o").write_bytes(b"o")
+    fragment = tmp_path / "estimate.mk"
+    fragment.write_text(
+        "include Makefile\n"
+        ".DEFAULT_GOAL := ds4-estimate\n"
+        "ds4-estimate:\n"
+        "\tprintf '#!/bin/sh\\nexit 0\\n' > $@\n"
+        "\tchmod +x $@\n"
+    )
+
+    proc = subprocess.run(
+        ["make", "-f", str(fragment)], cwd=root, capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stderr
+    built = root / "ds4-estimate"
+    assert built.exists() and os.access(built, os.X_OK)
+
+
+def test_estimate_mk_offers_a_cpu_only_variant():
+    makefile = (Path(__file__).resolve().parent.parent / "tools" / "ds4-estimate.mk").read_text()
+    assert "DS4_ESTIMATE_CPU_ONLY" in makefile
+    # The CPU switch must swap in the CPU object list itself: passing
+    # CORE_OBJS="$(CPU_CORE_OBJS)" on a make command line is not portable.
+    assert "CORE_OBJS := $(CPU_CORE_OBJS)" in makefile
 
 
 def test_warm_dwarfstar_estimates_without_a_configured_gguf(monkeypatch):

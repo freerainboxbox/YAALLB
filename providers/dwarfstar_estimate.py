@@ -75,10 +75,108 @@ class Ds4EstimatorError(RuntimeError):
     """The ds4 estimator could not produce an estimate."""
 
 
+# Where the estimator's make fragment lives. It is handed to make as an
+# absolute path, with the ds4 tree as the working directory, so the fragment's
+# own relative paths (`include Makefile`, ds4's object rules) unambiguously mean
+# that tree. `make -C` invites exactly that confusion, so it is not used.
+DS4_ESTIMATE_MAKEFILE = (
+    Path(__file__).resolve().parent.parent / "tools" / "ds4-estimate.mk"
+)
+
+# A ds4 tree that has never been compiled has neither of these. Compiling an
+# inference engine is not YAALLB's job (see build_estimator), but noticing that
+# it would have to is.
+DS4_CORE_OBJECTS = ("ds4.o", "ds4_cpu.o")
+
+# make may relink the estimator, or recompile one stale core object it links.
+# It is never asked to build an engine from scratch, so this is generous.
+DS4_BUILD_TIMEOUT = 1800
+
+
+class Ds4BuildError(RuntimeError):
+    """The ds4 estimator could not be built into a ds4 tree."""
+
+
 def build_hint(ds4_dir: str) -> str:
-    """The command that produces the estimator binary for a ds4 tree."""
-    here = Path(__file__).resolve().parent.parent / "tools" / "ds4-estimate.mk"
-    return f"make -C {ds4_dir} -f {here}"
+    """The command that produces the estimator binary for a ds4 tree.
+
+    It is the command YAALLB itself runs: absolute `-f`, the tree as the working
+    directory.
+    """
+    return f"(cd {os.path.abspath(ds4_dir)} && make -f {DS4_ESTIMATE_MAKEFILE})"
+
+
+def _make_command(cpu_only: bool) -> list[str]:
+    argv = ["make", "-f", str(DS4_ESTIMATE_MAKEFILE)]
+    if cpu_only:
+        # A tree built with `make cpu` has no GPU objects to link against.
+        argv.append("DS4_ESTIMATE_CPU_ONLY=1")
+    return argv
+
+
+def build_estimator(ds4_dir: str) -> str:
+    """Build the estimator into one ds4 tree and return that tree's abs path.
+
+    The estimator is YAALLB's own program linked against the tree's *already
+    compiled* objects, because only that build knows its own footprint
+    arithmetic. Building it therefore adds two files to the tree (`ds4-estimate`
+    and `ds4_estimate.host.o`) and changes nothing else - ds4's sources are
+    never touched - and make does no work at all when the tree is current.
+
+    Raises Ds4BuildError when the tree is not a buildable ds4 tree, when `make`
+    is unavailable, or when the build itself fails (a `make cpu` tree fails the
+    normal link, so the CPU-only variant is retried once and both attempts are
+    reported).
+    """
+    root = os.path.abspath(ds4_dir)
+    if not os.path.isdir(root):
+        raise Ds4BuildError(
+            f"cannot build the ds4 estimator: ds4_dir {ds4_dir!r} is not a directory"
+        )
+    if not os.path.isfile(os.path.join(root, "Makefile")):
+        raise Ds4BuildError(
+            f"cannot build the ds4 estimator: {root} has no Makefile; ds4_dir "
+            "must point at a ds4 source tree"
+        )
+    if not any(
+        os.path.exists(os.path.join(root, obj)) for obj in DS4_CORE_OBJECTS
+    ):
+        raise Ds4BuildError(
+            f"{root} has no compiled ds4 objects (looked for "
+            f"{' or '.join(DS4_CORE_OBJECTS)}). YAALLB appends its estimator to "
+            "a built engine rather than compiling one; build ds4 first with "
+            f"(cd {root} && make)."
+        )
+
+    failures = []
+    for cpu_only in (False, True):
+        argv = _make_command(cpu_only)
+        try:
+            proc = subprocess.run(
+                argv,
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=DS4_BUILD_TIMEOUT,
+            )
+        except FileNotFoundError as exc:
+            raise Ds4BuildError(
+                f"make is not available, so the ds4 estimator cannot be built "
+                f"in {root}; build it by hand: {build_hint(root)}"
+            ) from exc
+        except subprocess.TimeoutExpired:
+            failures.append(f"{' '.join(argv)} timed out after {DS4_BUILD_TIMEOUT}s")
+            continue
+        if proc.returncode == 0:
+            return root
+        tail = "\n".join((proc.stderr or proc.stdout or "").strip().splitlines()[-10:])
+        failures.append(f"{' '.join(argv)} exited {proc.returncode}:\n{tail}")
+
+    raise Ds4BuildError(
+        f"building the ds4 estimator failed in {root}:\n\n"
+        + "\n\n".join(failures)
+        + f"\n\nRun it by hand to see the whole error: {build_hint(root)}"
+    )
 
 
 def run_estimator(
