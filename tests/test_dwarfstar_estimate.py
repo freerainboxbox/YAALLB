@@ -348,6 +348,21 @@ def test_estimate_falls_back_once_and_warns(fake_estimator, monkeypatch):
     assert "falling back" in warnings[0] and "exited 1" in warnings[0]
 
 
+def test_env_reaches_the_estimator(fake_estimator):
+    # ds4's environment knobs change the footprint too (static YaRN resizes what
+    # a context costs), so the estimator has to run under the same environment
+    # the server will.
+    fake = fake_estimator()
+    provider = _provider(env={"DS4_QWEN4_YARN_FACTOR": 4}, options={"metal": True})
+    provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    ).memory()
+
+    env = fake.kwargs[0]["env"]
+    assert env["DS4_QWEN4_YARN_FACTOR"] == "4"
+    assert env["DS4_LOCK_FILE"]  # the per-run instance lock is still its own
+
+
 def test_embedded_mtp_reaches_the_estimator(fake_estimator):
     # Qwen3.8 Flash Next / GLM 5.3 keep their drafter in the main GGUF, so it is
     # the --mtp option (not a support-file path) that tells ds4 what to price.

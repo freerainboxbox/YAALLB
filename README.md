@@ -289,6 +289,9 @@ directory.
 | `options`       | `{}`             | no — overrides for ds4-server flags (see below)                          |
 | `estimate_binary` | `./ds4-estimate` | no — footprint estimator, relative to `ds4_dir` (see "VRAM footprint")   |
 | `ctx_length`    | —                | no — provider-level context length, overrides the per-model one          |
+| `model_profile` | detected         | no — which ds4 model family this instance serves (see "served models")   |
+| `env`           | `{}`             | no — extra environment for `ds4-server` **and** the footprint estimator   |
+| `ready_timeout` | `120`            | no — seconds to wait for a spawned `ds4-server` to answer                 |
 
 `ctx_length` is available as a provider-level override,
 and is a key in the provider object (see usage below) rather than model-level (so NOT in the "options" key).
@@ -348,6 +351,9 @@ defaults for everything you don't set.
 | `kv_cache_reject_different_quant`    | `--kv-cache-reject-different-quant`    | flag  | false   |
 | `disable_exact_dsml_tool_replay`     | `--disable-exact-dsml-tool-replay`     | flag  | false   |
 | `tool_memory_max_ids`                | `--tool-memory-max-ids`                | value | 100000  |
+| `dir_steering_file`                  | `--dir-steering-file`                  | value | —       |
+| `dir_steering_ffn`                   | `--dir-steering-ffn`                   | value | —       |
+| `dir_steering_attn`                  | `--dir-steering-attn`                  | value | —       |
 
 For example, the manual command
 

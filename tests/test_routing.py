@@ -1317,6 +1317,164 @@ def test_dwarfstar_drafter_and_vision_flags_reach_the_server():
     ]
 
 
+def test_dwarfstar_steering_flags_reach_the_server():
+    # Directional steering changes what the model says, so it is a model-behaviour
+    # option and belongs in the registry; the distributed/tensor-parallel
+    # families deliberately do not (they are multi-machine, see AGENTS.md).
+    from providers.dwarfstar import DwarfStarProvider
+
+    provider = DwarfStarProvider(
+        config={
+            "ds4_dir": "/tmp/ds4",
+            "gguf_path": "./m.gguf",
+            "options": {
+                "dir_steering_file": "./dir.bin",
+                "dir_steering_ffn": 0.8,
+                "dir_steering_attn": 0,
+            },
+        }
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    )
+
+    command = provider._build_command(model)
+    start = command.index("--dir-steering-file")
+    assert command[start : start + 6] == [
+        "--dir-steering-file",
+        "./dir.bin",
+        "--dir-steering-ffn",
+        "0.8",
+        "--dir-steering-attn",
+        "0",
+    ]
+
+
+def test_dwarfstar_env_reaches_the_spawned_server(monkeypatch):
+    # ds4 reads a few knobs from the environment only: static YaRN for contexts
+    # beyond a shape's native one, and image token caps. Without a way to set
+    # them, those ds4 features are unreachable through YAALLB.
+    import subprocess
+
+    from providers.dwarfstar import DwarfStarProvider
+
+    spawned = {}
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+    def fake_popen(argv, **kwargs):
+        spawned["argv"] = argv
+        spawned["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 200
+
+        return Resp()
+
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
+
+    provider = DwarfStarProvider(
+        config={
+            "ds4_dir": "/tmp/ds4",
+            "gguf_path": "m.gguf",
+            "env": {"DS4_QWEN4_YARN_FACTOR": 2, "DS4_SPEC_MEM_REPORT": True},
+        }
+    )
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    )
+    provider.loadModel(model)
+
+    env = spawned["kwargs"]["env"]
+    # Values arrive as ds4 wants them (strings), and the rest of the
+    # environment is inherited rather than replaced.
+    assert env["DS4_QWEN4_YARN_FACTOR"] == "2"
+    assert env["DS4_SPEC_MEM_REPORT"] == "1"
+    assert "PATH" in env
+
+
+def test_dwarfstar_without_env_inherits_the_environment(monkeypatch):
+    import subprocess
+
+    from providers.dwarfstar import DwarfStarProvider
+
+    spawned = {}
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda argv, **kwargs: spawned.update(kwargs) or FakeProcess(),
+    )
+
+    def fake_get(url, headers=None):
+        class Resp:
+            status_code = 200
+
+        return Resp()
+
+    monkeypatch.setattr("abstractions.ready.httpx.get", fake_get)
+
+    provider = DwarfStarProvider(config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf"})
+    provider.loadModel(
+        provider.createModel(
+            ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+        )
+    )
+
+    # Not passing env at all keeps os.environ semantics for the child.
+    assert spawned.get("env") is None
+
+
+def test_dwarfstar_ready_timeout_is_configurable(monkeypatch):
+    # A 165 GiB GGUF on a slow volume boots far outside the timeout a small
+    # model needs, so the wait is per instance rather than only a constant.
+    import subprocess
+
+    from providers.dwarfstar import DwarfStarProvider
+
+    waits = []
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: FakeProcess())
+
+    def fake_wait_ready(endpoint_uri, process, label, timeout):
+        waits.append(timeout)
+
+    monkeypatch.setattr("providers.dwarfstar.wait_server_ready", fake_wait_ready)
+
+    provider = DwarfStarProvider(
+        config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf", "ready_timeout": 1800}
+    )
+    provider.loadModel(
+        provider.createModel(
+            ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+        )
+    )
+    assert waits == [1800]
+
+    waits.clear()
+    plain = DwarfStarProvider(config={"ds4_dir": "/tmp/ds4", "gguf_path": "m.gguf"})
+    plain.loadModel(
+        plain.createModel(
+            ModelDescriptor("deepseek-v4-flash", plain), LoadOptions(ctx_length=8192)
+        )
+    )
+    assert waits == [120]
+
+
 def test_dwarfstar_options_table_matches_readme():
     """The README ds4 options table is the documentation for DS4_OPTIONS."""
     import re

@@ -179,6 +179,26 @@ def build_estimator(ds4_dir: str) -> str:
     )
 
 
+def env_value(value) -> str:
+    """A ds4 environment value as ds4 reads it: strings, and 1/0 for booleans."""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float, str)):
+        return str(value)
+    raise ValueError(f"ds4 env values must be scalars, got {type(value).__name__}")
+
+
+def merged_env(extra: dict | None) -> dict | None:
+    """The environment for a child process, or None to inherit unchanged.
+
+    None (nothing configured) keeps subprocess's inherit semantics instead of
+    snapshotting os.environ early.
+    """
+    if not extra:
+        return None
+    return {**os.environ, **{key: env_value(value) for key, value in extra.items()}}
+
+
 def run_estimator(
     *,
     ds4_dir: str,
@@ -192,6 +212,7 @@ def run_estimator(
     vision: str | None = None,
     dspark: bool = False,
     mtp: bool = False,
+    extra_env: dict | None = None,
 ) -> dict:
     """Ask the ds4 tree for its footprint components (bytes).
 
@@ -230,7 +251,10 @@ def run_estimator(
 
     DS4_LOCK_DIR.mkdir(parents=True, exist_ok=True)
     lock = DS4_LOCK_DIR / f"ds4-estimate-{os.getpid()}-{next(_LOCK_SEQ)}.lock"
-    env = dict(os.environ)
+    # The environment ds4-server will be started with, so the shape being priced
+    # is the shape that gets served (DS4_QWEN4_YARN_FACTOR changes what a context
+    # costs, among others).
+    env = merged_env(extra_env) or dict(os.environ)
     env["DS4_LOCK_FILE"] = str(lock)
     try:
         proc = subprocess.run(
@@ -412,7 +436,7 @@ def fallback_estimate(
 
 def _signature(
     ds4_dir, gguf_path, ctx, binary, backend, prefill_chunk, ssd_streaming,
-    mtp_model, vision, dspark, mtp, model_family,
+    mtp_model, vision, dspark, mtp, model_family, extra_env,
 ) -> tuple:
     return (
         ds4_dir,
@@ -429,6 +453,9 @@ def _signature(
         # A configured family changes what the fallback is allowed to guess,
         # so it is part of the configuration, not just of the call.
         model_family,
+        # ds4's own env knobs change the answer, so they are part of the
+        # configuration being memoized.
+        tuple(sorted((extra_env or {}).items())),
     )
 
 
@@ -457,6 +484,7 @@ def estimate(
     dspark: bool = False,
     mtp: bool = False,
     model_family: str | None = None,
+    extra_env: dict | None = None,
 ) -> dict:
     """Estimate components in bytes, memoized per serve configuration.
 
@@ -467,7 +495,7 @@ def estimate(
     """
     key = _signature(
         ds4_dir, gguf_path, ctx, binary, backend, prefill_chunk, ssd_streaming,
-        mtp_model, vision, dspark, mtp, model_family,
+        mtp_model, vision, dspark, mtp, model_family, extra_env,
     )
     cached = _ESTIMATE_CACHE.get(key)
     if cached is not None:
@@ -486,6 +514,7 @@ def estimate(
             vision=vision,
             dspark=dspark,
             mtp=mtp,
+            extra_env=extra_env,
         )
         result["source"] = "ds4"
     except Ds4EstimatorError as exc:

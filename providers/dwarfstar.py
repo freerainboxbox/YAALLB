@@ -12,6 +12,7 @@ from providers.dwarfstar_estimate import (
     build_estimator,
     estimate as ds4_estimate,
     estimate_mib as ds4_estimate_mib,
+    merged_env,
 )
 from providers.ds4_models import (
     DS4_DEFAULT_MAX_COMPLETION_TOKENS,
@@ -107,6 +108,13 @@ DS4_OPTIONS = {
     "kv_cache_reject_different_quant": ("--kv-cache-reject-different-quant", "flag", False),
     "disable_exact_dsml_tool_replay": ("--disable-exact-dsml-tool-replay", "flag", False),
     "tool_memory_max_ids": ("--tool-memory-max-ids", "value", 100000),
+    # Directional steering: loaded per layer as f32 vectors, small enough that it
+    # does not need its own footprint term (use safety_buffer_mib if your vectors
+    # are unusually large). ds4 defaults --dir-steering-ffn to 1 when a file is
+    # given without a scale, so the scales are passed whenever configured.
+    "dir_steering_file": ("--dir-steering-file", "value", None),
+    "dir_steering_ffn": ("--dir-steering-ffn", "value", None),
+    "dir_steering_attn": ("--dir-steering-attn", "value", None),
 }
 
 
@@ -133,6 +141,14 @@ class DwarfStarProvider(Provider):
         self.estimate_binary: str = DS4_DEFAULT_ESTIMATOR
         self.options: dict = {}
         self.ctx_length: int | None = None
+        # ds4 reads a handful of knobs from the environment only, and several of
+        # them change the footprint (static YaRN resizes what a context costs), so
+        # they go to the server and to the estimator alike.
+        self.env: dict | None = None
+        # How long to wait for a spawned ds4-server to answer. Loading a 165 GiB
+        # GGUF takes far longer than a small model, and this provider has no
+        # native load/unload to report progress through.
+        self.ready_timeout: int | None = None
         # Which ds4 family this instance serves (see providers/ds4_models.py).
         # None means "whatever the GGUF is", which is confirmed against the ds4
         # build itself when its footprint is estimated.
@@ -313,6 +329,10 @@ class DwarfStarProvider(Provider):
             # estimate: the estimator is the other source, and it may be the
             # thing that just failed.
             model_family=self._configured_family(),
+            # The same environment the server will run under: ds4's own knobs
+            # change what a context costs, so estimating under a different one
+            # would price a configuration it is not asked to run.
+            extra_env=self.env,
         )
 
     def _configured_family(self) -> str | None:
@@ -391,7 +411,12 @@ class DwarfStarProvider(Provider):
             raise ValueError("gguf_path must be set in config before loading")
 
         command = self._build_command(model)
-        self._process = subprocess.Popen(command, cwd=self.ds4_dir)
+        self._process = subprocess.Popen(
+            command,
+            cwd=self.ds4_dir,
+            # None when nothing is configured, so the child simply inherits.
+            env=merged_env(self.env),
+        )
         self.resident_model = model
         # The model is loading until the spawned server actually accepts
         # requests; only then is it marked loaded (ready).
@@ -399,7 +424,12 @@ class DwarfStarProvider(Provider):
         model._load_state = "loading"
         try:
             wait_server_ready(
-                self.endpoint_uri, self._process, "ds4-server", DS4_READY_TIMEOUT
+                self.endpoint_uri,
+                self._process,
+                "ds4-server",
+                # Configured per instance: a 165 GiB GGUF boots far outside the
+                # timeout a small model needs.
+                self.ready_timeout or DS4_READY_TIMEOUT,
             )
         except Exception:
             # A readiness timeout (or server exit) must not orphan the spawned
