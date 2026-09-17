@@ -413,12 +413,14 @@ one:
   same set under `zai/`. No documented ceiling.
 
 - They are **routable IDs naming one resident model**: `single_resident`, and
-  ds4 uses the alias only to pick defaults. Registering the
-  `-chat`/`-reasoner`/`-no-think`/`-nothink` spellings (ds4's thinking-mode
-  aliases, which its chat endpoint honours but its own `/v1/models` omits) is
-  what makes thinking mode a *per-request* choice through YAALLB, and
-  `model_overrides` work on any of them (`on_start` one alias and every other
-  one still routes to the same weights).
+  ds4 uses the alias only to pick defaults, so `on_start` one alias and every
+  other one still routes to the same weights. `model_overrides` are keyed by the
+  id a request asked for, so they work per alias.
+- The `-chat`/`-reasoner`/`-no-think`/`-nothink` spellings are ds4's
+  thinking-mode aliases, and registering them is what makes thinking mode a
+  *per-request* choice. ds4's chat endpoint honours them but its own `/v1/models`
+  omits them; YAALLB lists them too — deliberately, because a client that only
+  ever uses listed models would otherwise never find the choice.
 - `--ctx` is not in the options registry: it comes from `ctx_length`, and every
   alias inherits that one value.
 - A family with no documented ceiling (`—`) is spawned at the 1000000 this

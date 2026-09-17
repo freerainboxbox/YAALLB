@@ -17,7 +17,9 @@ Aliases come from ds4_server.c `server_model_alias_known()` /
 its primary one, i.e. what `server_model_id_from_engine()` answers. Registering
 the thinking aliases at all is what makes thinking mode selectable through
 YAALLB: ds4 honours them on the chat endpoint and does not list them in
-/v1/models.
+/v1/models. YAALLB does list them - a client that only ever uses listed models
+would otherwise never learn that thinking mode is selectable here, and hiding
+them would make the model list the only place where the two providers differ.
 
 They are *routable IDs*, and every one of them names the same resident model:
 `ds4-server` answers for the loaded GGUF whichever alias is asked (ds4 uses the
