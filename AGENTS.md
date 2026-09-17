@@ -24,6 +24,7 @@
 * Pin package versions or remove package versions as needed.
 * Prefer stable versions whenever possible, unless there is no way forward.
 * NEVER use local package patches. All code must be fully reproducible on any machine. Pin old versions if required.
+* Exception: Start-time scripts are allowed to **add** small extensions to engine directories. Treat external engine directories as appliances that can be appended to with helper scripts or binaries, but never patched. Example: C-based VRAM estimation for ds4. All source code for start-time scripts must exist within YAALLB even if they append to external directories. Rule of thumb: If it's fragile and could be reasonably reach conflict on pull and rebase, it is forbidden.
 * Online research is allowed and strongly encouraged. Fetch valid documentation of libraries, or delegate a subagent to do so and report on correct usage. If you are a subagent, do not further delegate.
 * Prefer not to reverse-engineer libraries unless there is an esoteric bug that is not documented on first search.
 * Notify the user if the search engine tool or URL fetching capabilities are faulty (after three attempts on any given query or URL), and return control to the user rather than continue to attempt.
