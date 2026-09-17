@@ -295,10 +295,11 @@ directory.
 
 `ctx_length` is available as a provider-level override,
 and is a key in the provider object (see usage below) rather than model-level (so NOT in the "options" key).
-ds4 sets `--ctx` once at startup and both of its served models
-(`deepseek-v4-flash`, `deepseek-v4-pro`) inherit it, so the provider-level
-`ctx_length` (when set) overrides any per-model `ctx_length` and is what
-`/v1/models` reports for both models.
+ds4 sets `--ctx` once at startup and **every** ID it serves inherits it (see
+"Served models"), so the provider-level `ctx_length` (when set) overrides any
+per-model `ctx_length` and is what `/v1/models` reports for every one of them.
+Left unset, an instance is spawned at the context its own model family was
+built for, which is per-family rather than hardcoded (see "Served models").
 
 `options` keys are the ds4-server flag names with dashes turned into
 underscores. A flag is only emitted when its value differs from the default
@@ -382,6 +383,81 @@ is configured as:
 }
 ```
 
+**Served models** — one `ds4-server` answers for whatever the GGUF you handed
+it *is*, under a fixed set of IDs, and it has no model list YAALLB could read
+(nothing is running when config is parsed, and the process is spawned and
+terminated here). So the IDs are registered here, in
+`providers/ds4_models.py` — the same way `providers/dflash_shortcuts.py` mirrors
+dflash-mlx's registry — while the *family* is not guessed from the file name but
+read off the ds4 build: the footprint estimator answers `model_family`,
+`model_name` and `model_aliases`, so the first estimate tells the provider what
+its GGUF turned out to be. That first estimate is the cheapest context, so the
+shape is known before the expensive ones are priced.
+
+The registry, and the context each family is spawned at when nothing asked for
+one:
+
+- `deepseek4` — `deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-chat`,
+  `deepseek-reasoner`. Native context 1000000.
+- `deepseek41` — `deepseek-v4.1-flash` alone: ds4's thinking-alias tables have
+  no V4.1 entries (effort there comes from `reasoning_effort`). No documented
+  ceiling.
+- `qwen4exp` — `qwen3.8-flash-next`, `qwen3.8-flash-next-chat`,
+  `qwen3.8-flash-next-reasoner`, `qwen3.8-flash-next-no-think`,
+  `qwen3.8-flash-next-nothink`, and `qwen/qwen3.8-flash-next` with its own
+  `-chat`/`-reasoner` (ds4 has no `qwen/`-prefixed no-thinking spelling, so none
+  is invented here). Native context 262144.
+- `glm53` — `glm-5.3-flash`, `-chat`, `-reasoner`, `-no-think`, `-nothink`, and
+  the same three-way set under `zai/`. No documented ceiling.
+- `glm52` — `glm-5.2`, `-chat`, `-reasoner`, `-no-think`, `-nothink`, and the
+  same set under `zai/`. No documented ceiling.
+
+- They are **routable IDs naming one resident model**: `single_resident`, and
+  ds4 uses the alias only to pick defaults. Registering the
+  `-chat`/`-reasoner`/`-no-think`/`-nothink` spellings (ds4's thinking-mode
+  aliases, which its chat endpoint honours but its own `/v1/models` omits) is
+  what makes thinking mode a *per-request* choice through YAALLB, and
+  `model_overrides` work on any of them (`on_start` one alias and every other
+  one still routes to the same weights).
+- `--ctx` is not in the options registry: it comes from `ctx_length`, and every
+  alias inherits that one value.
+- A family with no documented ceiling (`—`) is spawned at the 1000000 this
+  provider hardcoded before any registry existed, rather than an invented
+  number. Going past a shape's native context is ds4's own decision to make, via
+  its environment knobs — e.g. `DS4_QWEN4_YARN_FACTOR` for Qwen3.8 Flash Next —
+  set through `env`, which reaches the estimator too because a resized context
+  costs differently.
+- What `/v1/models` reports as `name` is ds4's own shape name once a GGUF has
+  been opened, which is what separates Flash from PRO (one family, one profile)
+  and catches renamed shapes like Vision Experimental.
+- `model_profile` overrides detection. It accepts a family key or any of its
+  IDs (`"model_profile": "qwen3.8-flash-next"`), a typo fails startup with the
+  names it accepts, and a disagreement with what ds4 reports is logged while
+  config keeps winning.
+- A GGUF ds4 recognises but YAALLB has no profile for keeps being presented as
+  `deepseek-v4-flash` and its aliases, with a warning naming the family it saw;
+  add the family to `providers/ds4_models.py` to serve it properly.
+- A size-only estimate (the estimator missing or stale, see below) carries no
+  shape, so it does not use up the one chance to learn which family a tree
+  serves.
+
+**More than one ds4 instance** — instances that point at the same `ds4_dir`
+share one estimator build (one build per distinct tree), and they may point at
+different GGUFs of different families. Each instance is its own `ds4-server`
+process, so each needs its own `port`, and — because ds4 refuses to start a
+second process on the default `/tmp/ds4.lock` — its own `DS4_LOCK_FILE` in
+`env`:
+
+```json
+{
+  "ds4_dir": "/path/to/ds4",
+  "gguf_path": "./qwen38-flash-next.gguf",
+  "port": 8001,
+  "ctx_length": 32768,
+  "env": { "DS4_LOCK_FILE": "/tmp/ds4-qwen.lock" }
+}
+```
+
 **VRAM footprint** — `Model.memory()` for a ds4 model reports what **ds4 itself**
 computes, not a formula YAALLB maintains. The context/KV/scratch footprint
 depends on the model shape recorded in the GGUF (Flash and Pro differ in layer
@@ -390,19 +466,38 @@ chunk, and the SSD streaming mode, and drafter/MTP support GGUFs add mapped
 weights on top; ds4 already does exactly this arithmetic for its own
 `context buffers … MiB` startup log. `tools/ds4_estimate.c` opens the GGUF
 metadata-only (`inspect_only`), asks ds4 for the components, and prints one JSON
-line. Build it once per ds4 tree, next to `ds4-server`:
+line — including `model_name`, `model_family` and `model_aliases`, which is how
+YAALLB learns what a GGUF actually is (see "Served models").
+
+You do not build it. On startup YAALLB builds the estimator into every `ds4_dir`
+config.json names, exactly once per distinct tree, from inside that tree with an
+absolute `-f`:
 
 ```sh
-make -C /path/to/ds4 -f /path/to/yaallb/tools/ds4-estimate.mk
-
-# a tree built with `make cpu` has no GPU objects to link against
-make -C /path/to/ds4 -f /path/to/yaallb/tools/ds4-estimate.mk \
-  CORE_OBJS="$(CPU_CORE_OBJS)" DS4_ESTIMATE_CPU_ONLY=1
+# what YAALLB runs itself, per ds4_dir in config.json
+(cd /path/to/ds4 && make -f /path/to/yaallb/tools/ds4-estimate.mk)
 ```
 
 The fragment reads the ds4 tree's own `Makefile`, so it links whatever that tree
-was built with (Metal/CUDA/ROCm objects and link flags come from it). The
-estimator is spawned with `ds4_dir` as its cwd — so a relative `gguf_path` means
+was built with (Metal/CUDA/ROCm objects and link flags come from it), and it is
+additive: it writes `ds4-estimate` and `ds4_estimate.host.o` next to
+`ds4-server` and rewrites nothing else. Make does no work at all when the tree
+is already current, which is also why the estimator cannot quietly go stale
+against an updated ds4 any more — the next startup relinks it. A tree built
+with `make cpu` has no GPU objects to link against, so the link is retried once
+as
+
+```sh
+(cd /path/to/ds4 && make -f /path/to/yaallb/tools/ds4-estimate.mk DS4_ESTIMATE_CPU_ONLY=1)
+```
+
+and both attempts are reported when both fail.
+
+Building the estimator *adds to* a compiled engine; it never produces one. A
+tree with neither `ds4.o` nor `ds4_cpu.o` fails startup with the `cd <tree> &&
+make` to run first, rather than being scheduled on a guess.
+
+The estimator is spawned with `ds4_dir` as its cwd — so a relative `gguf_path` means
 the same thing it does in config.json — and takes its own ds4 instance lock, so
 estimating never disturbs (or is refused by) a running `ds4-server`.
 
@@ -410,7 +505,7 @@ estimating never disturbs (or is refused by) a running `ds4-server`.
 startup, one line each:
 
 ```
-… ds4 VRAM estimate model=./ds4flash-0731.gguf ctx=1000000 sessions=1 projected=99088 MiB source=ds4
+… ds4 VRAM estimate model=./ds4flash-0731.gguf ctx=1000000 family=deepseek4 sessions=1 projected=99088 MiB source=ds4
 ```
 
 Requests that ask for a ctx nobody warmed pay one estimator run — well under a
@@ -419,9 +514,18 @@ and reads its metadata — and are memoized afterwards.
 
 Counted in the projection: GGUF bytes (main model plus `mtp_model`/`vision`
 support GGUFs — the whole support file, which is conservative), `batched_session`
-× (ds4's context bytes + ds4's drafter scratch — each resident session gets its
-own session graphs/caches and its own draft buffers), and a fixed process
-overhead (`DS4_PROCESS_OVERHEAD_MIB` in `providers/dwarfstar_estimate.py`).
+× ds4's caches and drafter scratch (each resident session gets its own session
+caches and its own draft buffers), and a fixed process overhead
+(`DS4_PROCESS_OVERHEAD_MIB` in `providers/dwarfstar_estimate.py`).
+
+The chunk-sized transients inside a context term are the exception: on Metal,
+batched sessions share one prefill workspace, so raw+compressed KV is counted
+per session and the workspace exactly once (`docs/SERVER.md`: "an extra slot
+costs its caches rather than another few GiB of transients"). That is not a
+rounding choice — for Qwen3.8 Flash Next the transients are 7928 MiB of a
+~9000 MiB context at ds4's default `--prefill-chunk`, so charging them per
+session would evict for a saving ds4 does not make. Other backends keep private
+session graphs, and there every session is charged its full context term.
 
 The drafter half comes from ds4's `ds4_engine_spec_graph_memory_estimate()`:
 DSpark target-hidden capture buffers, verifier frontier snapshots, MTP projection
@@ -433,27 +537,42 @@ Metal it is 218.98 MiB capture + 86.66 MiB verifier graph + 1.00 MiB host =
 buffers (like the support GGUF itself) are budgeted even with `dspark` off,
 because ds4 maps the support model and configures capture as soon as it is
 loaded; only the verifier half needs `dspark` or a legacy MTP support model.
-That accessor is part of the estimator's link, so `ds4-estimate` needs a ds4 tree
-that has it: rebuild the estimator after updating ds4. Start a server with
+That accessor is part of the estimator's link, so a ds4 tree that predates it
+fails the build loudly at startup instead of under-budgeting DSpark in silence.
+Start a server with
 `DS4_SPEC_MEM_REPORT=1` to see each session print what it allocated next to what
 was projected, flagging any sizing drift.
 
 Not counted, and to be covered with `safety_buffer_mib` when you use them:
 
-- Per-GPU placement (`--gpu-vram`, `--cuda-tensor-parallel`) and distributed
-  layer slices (`--role`/`--layers`/`--tensor-parallel`), which is also why those
-  flag families stay out of the options registry.
+- Per-GPU placement (`--gpu-vram`, `--gpu-devices`, `--cuda-tensor-parallel`).
+  Those are exposed as options, because they change what a backend does, but the
+  projection above is machine-total, so cover the difference with
+  `safety_buffer_mib`.
+- The multi-machine flag families are not in the options registry at all
+  (`--role`, `--layers`, `--listen`, `--coordinator`, `--dist-*`,
+  `--tensor-parallel`, `--transport`, `--rdma-*`, `--debug-hash`): they move or
+  re-slice the model in ways this projection does not describe, and YAALLB
+  schedules one machine. `--chdir` is absent for the same reason — the provider
+  already sets the working directory.
 - `--mtp-model` with `--ssd-streaming`: ds4 refuses that combination at boot, so
   such a config fails at load rather than being mis-budgeted.
 
-**If the estimator is missing or fails** (never built, stale against the ds4
-tree, wrong model path), YAALLB logs one warning per (model, ctx) configuration
-and budgets the model from its **real GGUF bytes plus a flat context term**
-(16416 bytes/token, the DeepSeek V4 Flash Metal slope) plus
-`DS4_DRAFTER_SCRATCH_FALLBACK_MIB` per session when a drafter is configured:
-correct GGUF size, approximate context and scratch. The fallback is cached, so
-the request path stays cheap. A schema-1 estimator (no drafter-scratch output, so
-it would silently under-budget DSpark) is rejected with the same rebuild hint.
+**If the estimator cannot run** (a failed build, a wrong model path, a ds4 tree
+it cannot be linked against), YAALLB logs one warning per (model, ctx)
+configuration and budgets the model from its **real GGUF bytes plus a flat
+context term** — but only where such a term has been measured: 16416
+bytes/token, the DeepSeek V4 Flash Metal slope, plus
+`DS4_DRAFTER_SCRATCH_FALLBACK_MIB` per session when a drafter is configured.
+For a family whose footprint is not one straight line (Qwen3.8 Flash Next, GLM:
+their transients follow `--prefill-chunk`) there is no measured slope to fall
+back to, and YAALLB refuses to price them from another family's numbers — since
+the build is automatic, arriving here means that build needs fixing. A fallback
+answer carries no model shape, so it never becomes an instance's model list
+(see "Served models"). Fallbacks are memoized like real estimates, so the
+request path stays cheap. An estimator of an older schema — one that would
+silently under-budget DSpark, or cannot say which model a GGUF is — is rejected
+with the same rebuild hint.
 
 #### lms
 
