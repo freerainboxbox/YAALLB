@@ -7,7 +7,9 @@ estimator binary is absent or stale.
 """
 
 import json
+import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -15,9 +17,10 @@ import providers.dwarfstar_estimate as dse
 from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from providers.dwarfstar import DwarfStarProvider, warm_dwarfstar_estimates
+from providers.lmstudio import LMStudioProvider
 
 ESTIMATE = {
-    "version": 2,
+    "version": 3,
     "model_name": "DeepSeek V4 Flash",
     "backend": "metal",
     "ctx": 8192,
@@ -42,6 +45,16 @@ ESTIMATE = {
     "dspark_capture_stages": 3,
     "has_mtp": False,
     "mtp_draft_tokens": 0,
+    # ds4's own shape identity (ds4_server.c server_model_id_from_engine) plus
+    # the aliases its /v1/models lists for it (send_models()). YAALLB registers
+    # models from these, so a Qwen GGUF never inherits DeepSeek's context.
+    "model_family": "deepseek4",
+    "model_id": 0,
+    "model_aliases": ["deepseek-v4-flash", "deepseek-v4-pro"],
+    # Some families (Qwen3.8, GLM) size their drafter graph elsewhere, so the
+    # DeepSeek-path accessor pair does not describe them and the estimator says
+    # so instead of printing DeepSeek-shaped numbers.
+    "spec_graph_supported": True,
 }
 
 MIB = 2**20
@@ -155,13 +168,65 @@ def test_run_estimator_missing_binary_shows_the_build_command(monkeypatch):
     monkeypatch.setattr(subprocess, "run", missing)
     with pytest.raises(dse.Ds4EstimatorError) as exc:
         dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
-    assert "make -C /tmp/ds4" in str(exc.value)
-    assert "tools/ds4-estimate.mk" in str(exc.value)
+    # The hint is the command YAALLB itself runs: absolute -f, cwd = the tree.
+    assert "make -f" in str(exc.value) and "tools/ds4-estimate.mk" in str(exc.value)
+    assert "/tmp/ds4" in str(exc.value)
 
 
 def test_run_estimator_reports_a_failing_estimator(fake_estimator):
     fake = fake_estimator(returncode=2, stdout="", stderr="cannot open model")
     with pytest.raises(dse.Ds4EstimatorError, match="cannot open model"):
+        dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
+
+def test_run_estimator_passes_embedded_mtp(fake_estimator):
+    # Qwen3.8 Flash Next and GLM 5.3 build their MTP drafter into the main GGUF
+    # (--mtp, no --mtp-model file). Without the flag the estimator reports
+    # mtp_draft_tokens=0 and budgets no drafter for a config that has one.
+    fake = fake_estimator()
+    dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=8192, mtp=True)
+    assert "--mtp" in fake.argvs[0]
+    dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="n.gguf", ctx=8192)
+    assert "--mtp" not in fake.argvs[1]
+
+
+def test_run_estimator_reports_the_model_identity(fake_estimator):
+    fake_estimator()
+    result = dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=8192)
+    assert result["model_family"] == "deepseek4"
+    assert result["model_id"] == 0
+    assert result["model_aliases"] == ["deepseek-v4-flash", "deepseek-v4-pro"]
+    assert result["spec_graph_supported"] is True
+
+
+def test_run_estimator_rejects_a_schema_2_estimator(fake_estimator):
+    # Schema 2 had no model_family/aliases, so it cannot say what model the
+    # GGUF actually is: a Qwen GGUF would be served DeepSeek's model IDs and
+    # context ceiling. A stale estimator must say "rebuild", not guess.
+    stale = {
+        key: value
+        for key, value in ESTIMATE.items()
+        if key
+        not in (
+            "model_family",
+            "model_id",
+            "model_aliases",
+            "spec_graph_supported",
+        )
+    } | {"version": 2}
+    fake_estimator(stdout=json.dumps(stale))
+    with pytest.raises(dse.Ds4EstimatorError, match="rebuild"):
+        dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
+    # Same schema but a helper that cannot state the identity: also a rebuild.
+    nameless = {key: value for key, value in ESTIMATE.items() if key != "model_family"}
+    fake_estimator(stdout=json.dumps(nameless))
+    with pytest.raises(dse.Ds4EstimatorError, match="model_family"):
+        dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
+    aliases = dict(ESTIMATE, model_aliases="deepseek-v4-flash")
+    fake_estimator(stdout=json.dumps(aliases))
+    with pytest.raises(dse.Ds4EstimatorError, match="model_aliases"):
         dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
 
 
@@ -250,7 +315,9 @@ def test_estimate_memoizes_one_serve_configuration(fake_estimator, monkeypatch):
     dse.estimate(**kwargs)
     dse.estimate(**{**kwargs, "ctx": 16384})
     dse.estimate(**{**kwargs, "mtp_model": "./support.gguf"})
-    assert len(fake.argvs) == 3
+    # ... and so is turning on a drafter that lives inside the main GGUF.
+    dse.estimate(**{**kwargs, "mtp": True})
+    assert len(fake.argvs) == 4
 
 
 def test_estimate_falls_back_once_and_warns(fake_estimator, monkeypatch):
@@ -281,8 +348,122 @@ def test_estimate_falls_back_once_and_warns(fake_estimator, monkeypatch):
     assert "falling back" in warnings[0] and "exited 1" in warnings[0]
 
 
+def test_env_reaches_the_estimator(fake_estimator):
+    # ds4's environment knobs change the footprint too (static YaRN resizes what
+    # a context costs), so the estimator has to run under the same environment
+    # the server will.
+    fake = fake_estimator()
+    provider = _provider(env={"DS4_QWEN4_YARN_FACTOR": 4}, options={"metal": True})
+    provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    ).memory()
+
+    env = fake.kwargs[0]["env"]
+    assert env["DS4_QWEN4_YARN_FACTOR"] == "4"
+    assert env["DS4_LOCK_FILE"]  # the per-run instance lock is still its own
+
+
+def test_embedded_mtp_reaches_the_estimator(fake_estimator):
+    # Qwen3.8 Flash Next / GLM 5.3 keep their drafter in the main GGUF, so it is
+    # the --mtp option (not a support-file path) that tells ds4 what to price.
+    fake = fake_estimator()
+    provider = _provider(options={"mtp": True, "metal": True})
+    model = provider.createModel(
+        ModelDescriptor("deepseek-v4-flash", provider), LoadOptions(ctx_length=8192)
+    )
+    model.memory()
+    assert "--mtp" in fake.argvs[0]
+
+    plain = _provider(options={"metal": True})
+    plain.createModel(
+        ModelDescriptor("deepseek-v4-flash", plain), LoadOptions(ctx_length=8192)
+    ).memory()
+    assert "--mtp" not in fake.argvs[1]
+
+
+def test_batched_sessions_share_the_prefill_scratch_on_metal():
+    # ds4-server turns on a shared prefill workspace whenever it batches
+    # sessions (ds4_server.c parse_options -> share_session_prefill_workspace),
+    # and the Metal session graphs alias it (ds4.c: `share =
+    # e->share_session_prefill_workspace && e->backend == DS4_BACKEND_METAL`), so
+    # an extra slot costs its caches - raw+compressed KV - but not another copy of
+    # the chunk-sized transients. Budgeting them per session was worth several GiB
+    # per slot for Qwen3.8, whose scratch dwarfs its KV.
+    # An estimate as ds4 prints it, with context_bytes the sum of its parts.
+    per_session = dict(
+        ESTIMATE,
+        context_bytes=ESTIMATE["raw_bytes"]
+        + ESTIMATE["compressed_bytes"]
+        + ESTIMATE["scratch_bytes"],
+    )
+    metal = dict(per_session, backend="metal")
+    cuda = dict(per_session, backend="cuda")
+
+    weights = ESTIMATE["model_bytes"] + ESTIMATE["support_bytes"]
+    overhead = dse.DS4_PROCESS_OVERHEAD_MIB
+    kv = ESTIMATE["raw_bytes"] + ESTIMATE["compressed_bytes"]
+
+    assert dse.estimate_mib(metal, 1) == pytest.approx(
+        (weights + per_session["context_bytes"] + ESTIMATE["spec_graph_bytes"]) / MIB
+        + overhead
+    )
+    # Three sessions: three sets of caches, one arena of transients.
+    assert dse.estimate_mib(metal, 3) == pytest.approx(
+        (weights + (kv * 3 + ESTIMATE["scratch_bytes"]) + ESTIMATE["spec_graph_bytes"] * 3)
+        / MIB
+        + overhead
+    )
+    # Without the shared workspace, everything is per session as before.
+    assert dse.estimate_mib(cuda, 3) == pytest.approx(
+        (weights + per_session["context_bytes"] * 3 + ESTIMATE["spec_graph_bytes"] * 3)
+        / MIB
+        + overhead
+    )
+
+
+def test_fallback_only_guesses_where_it_has_a_measured_flat_model(tmp_path):
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"x" * (3 * MIB))
+
+    # DeepSeek V4 Flash on Metal is the shape the flat term was measured from,
+    # so an unknown family keeps the estimate YAALLB has always produced.
+    unknown = dse.fallback_estimate(
+        ds4_dir=str(tmp_path), gguf_path="./m.gguf", ctx=8192
+    )
+    assert unknown["context_bytes"] == dse.DS4_CTX_BYTES_PER_TOKEN * 8192
+
+    # A family whose footprint is not one straight line is not guessed at: a
+    # Qwen3.8 server's transients follow --prefill-chunk (1,298 MiB at 1024 vs
+    # 7,928 MiB at its default 8192 for the same context), so a DeepSeek-shaped
+    # slope would under-budget it by gigabytes.
+    with pytest.raises(dse.Ds4EstimatorError, match="qwen4exp"):
+        dse.fallback_estimate(
+            ds4_dir=str(tmp_path),
+            gguf_path="./m.gguf",
+            ctx=8192,
+            model_family="qwen4exp",
+        )
+
+
+def test_memory_refuses_to_budget_an_unmodellable_family(fake_estimator, monkeypatch):
+    # A configured family with no flat model must not be priced from another
+    # family's slope: memory() failing means the load fails loudly instead of an
+    # eviction decision made on gigabytes that are not there.
+    fake_estimator(returncode=1, stdout="")
+    monkeypatch.setattr(dse.log, "warning", lambda message: None)
+    provider = _provider(model_profile="qwen3.8-flash-next")
+    model = provider.createModel(
+        ModelDescriptor("qwen3.8-flash-next", provider), LoadOptions(ctx_length=8192)
+    )
+    with pytest.raises(dse.Ds4EstimatorError, match="qwen4exp"):
+        model.memory()
+
+
 def test_estimate_mib_scales_the_per_session_terms_by_sessions():
+    # A backend without ds4's shared prefill workspace pays every per-session
+    # term in full: its context (KV *and* transients) and its drafter scratch.
     sessions = 4
+    estimate = dict(ESTIMATE, backend="cuda")
     expected = (
         ESTIMATE["model_bytes"]
         + ESTIMATE["support_bytes"]
@@ -290,9 +471,9 @@ def test_estimate_mib_scales_the_per_session_terms_by_sessions():
         + ESTIMATE["context_bytes"] * sessions
         + ESTIMATE["spec_graph_bytes"] * sessions
     ) / MIB + dse.DS4_PROCESS_OVERHEAD_MIB
-    assert dse.estimate_mib(ESTIMATE, sessions) == pytest.approx(expected)
-    assert dse.estimate_mib(ESTIMATE, 0) == pytest.approx(
-        dse.estimate_mib(ESTIMATE, 1)
+    assert dse.estimate_mib(estimate, sessions) == pytest.approx(expected)
+    assert dse.estimate_mib(estimate, 0) == pytest.approx(
+        dse.estimate_mib(estimate, 1)
     )
 
 
@@ -344,10 +525,13 @@ def test_memory_counts_drafter_gguf_and_batched_sessions(fake_estimator):
 
     projected = model.memory()
     assert provider._sessions() == 3
-    # Context and drafter scratch are per resident session (x3); the support
-    # GGUF is mapped once.
+    # Each session keeps its own caches (raw+compressed) and its own drafter
+    # scratch (x3), but aliases one arena of chunk-sized transients, and the
+    # support GGUF is mapped once.
+    per_session = (ESTIMATE["raw_bytes"] + ESTIMATE["compressed_bytes"]) * 3
+    shared = ESTIMATE["scratch_bytes"]
     assert projected == pytest.approx(
-        (8_000_000_000 + 1_000_000_000 + (1_000_000 + 281_000_000) * 3) / MIB
+        (8_000_000_000 + 1_000_000_000 + per_session + shared + 281_000_000 * 3) / MIB
         + dse.DS4_PROCESS_OVERHEAD_MIB
     )
     assert projected > dse.estimate_mib(ESTIMATE, 1)
@@ -393,8 +577,188 @@ def test_warm_dwarfstar_estimates_covers_configured_contexts(fake_estimator, mon
 
     # Provider ctx plus the router default, cheapest first, one run each.
     assert [argv[-1] for argv in fake.argvs] == ["4096", "100000"]
-    assert len(messages) == 2
-    assert "ctx=4096" in messages[0] and "source=ds4" in messages[0]
+    # The cheapest run also reports the model family it priced, so a Qwen tree
+    # does not read like a misnamed DeepSeek instance in the startup log; the
+    # first one says what ds4 opened, and the estimates follow.
+    assert len(messages) == 3
+    assert "serves deepseek4" in messages[0]
+    assert "ctx=4096" in messages[1] and "source=ds4" in messages[1]
+    assert "family=deepseek4" in messages[1]
+
+
+class FakeMake:
+    """Records make invocations and replays canned exit codes per attempt."""
+
+    def __init__(self, returncodes=(0,), stdout="", stderr="cc: nope"):
+        self.returncodes = list(returncodes)
+        self.stdout = stdout
+        self.stderr = stderr
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((argv, kwargs))
+
+        class Proc:
+            pass
+
+        proc = Proc()
+        proc.returncode = self.returncodes[min(len(self.calls) - 1, len(self.returncodes) - 1)]
+        proc.stdout = self.stdout
+        proc.stderr = self.stderr
+        return proc
+
+    @property
+    def argvs(self):
+        return [argv for argv, _ in self.calls]
+
+    @property
+    def kwargs(self):
+        return [kw for _, kw in self.calls]
+
+
+@pytest.fixture
+def fake_make(monkeypatch):
+    def install(**kwargs):
+        fake = FakeMake(**kwargs)
+        monkeypatch.setattr(subprocess, "run", fake)
+        return fake
+
+    return install
+
+
+@pytest.fixture
+def ds4_tree(tmp_path):
+    """A ds4 tree that looks built: a Makefile plus one core object."""
+    root = tmp_path / "ds4"
+    root.mkdir()
+    (root / "Makefile").write_text("all:\n\techo built\n")
+    (root / "ds4.o").write_bytes(b"o")
+    return root
+
+
+def test_build_estimator_runs_make_inside_the_ds4_tree(fake_make, ds4_tree):
+    fake = fake_make()
+    assert dse.build_estimator(str(ds4_tree)) == str(ds4_tree)
+
+    argv, kwargs = fake.argvs[0], fake.kwargs[0]
+    # Absolute -f and cwd = the tree: make -C would make the fragment's own
+    # relative paths (its `include Makefile`, ds4's object rules) ambiguous.
+    assert argv[:2] == ["make", "-f"]
+    assert os.path.isabs(argv[2]) and argv[2].endswith("tools/ds4-estimate.mk")
+    assert os.path.exists(argv[2])
+    assert "-C" not in argv
+    assert kwargs["cwd"] == os.path.abspath(str(ds4_tree))
+
+
+def test_build_estimator_retries_cpu_only_then_reports_both(fake_make, ds4_tree):
+    # A tree built with `make cpu` has no GPU objects to link against, so the
+    # CPU-only variant is tried before giving up.
+    fake = fake_make(returncodes=(1, 1), stderr="Undefined symbols: _metal_graph_alloc")
+    with pytest.raises(dse.Ds4BuildError) as exc:
+        dse.build_estimator(str(ds4_tree))
+    assert len(fake.argvs) == 2
+    assert fake.argvs[1][-1] == "DS4_ESTIMATE_CPU_ONLY=1"
+    assert "Undefined symbols" in str(exc.value)
+    assert "make -f" in str(exc.value)
+
+    # A tree whose CPU-only variant links is a success, not an error.
+    ok = fake_make(returncodes=(1, 0))
+    assert dse.build_estimator(str(ds4_tree)) == str(ds4_tree)
+    assert len(ok.argvs) == 2
+    assert ok.argvs[1][-1] == "DS4_ESTIMATE_CPU_ONLY=1"
+
+
+def test_build_estimator_refuses_to_compile_the_whole_engine(fake_make, tmp_path):
+    unbuilt = tmp_path / "ds4-src"
+    unbuilt.mkdir()
+    (unbuilt / "Makefile").write_text("all:\n\tcc -c ds4.c\n")
+    (unbuilt / "ds4.c").write_text("int main(void){return 0;}\n")
+
+    fake = fake_make()
+    with pytest.raises(dse.Ds4BuildError, match="build ds4"):
+        dse.build_estimator(str(unbuilt))
+    # YAALLB appends its own helper to a built engine; it does not decide to
+    # spend twenty minutes compiling somebody's inference engine instead.
+    assert fake.argvs == []
+
+    with pytest.raises(dse.Ds4BuildError, match="not a directory"):
+        dse.build_estimator(str(tmp_path / "not-a-tree"))
+
+    wrong = tmp_path / "not-ds4"
+    wrong.mkdir()
+    with pytest.raises(dse.Ds4BuildError, match="Makefile"):
+        dse.build_estimator(str(wrong))
+
+
+def test_build_estimator_says_when_make_is_missing(monkeypatch, ds4_tree):
+    def missing(argv, **kwargs):
+        raise FileNotFoundError(argv[0])
+
+    monkeypatch.setattr(subprocess, "run", missing)
+    with pytest.raises(dse.Ds4BuildError, match="make"):
+        dse.build_estimator(str(ds4_tree))
+
+
+def test_build_dwarfstar_estimators_builds_each_tree_once(fake_make, tmp_path, ds4_tree):
+    from providers.dwarfstar import build_dwarfstar_estimators
+
+    other = tmp_path / "other-ds4"
+    other.mkdir()
+    (other / "Makefile").write_text("all:\n\techo built\n")
+    (other / "ds4_cpu.o").write_bytes(b"o")
+
+    fake = fake_make()
+    providers = [
+        DwarfStarProvider(0, {"ds4_dir": str(ds4_tree), "gguf_path": "a.gguf"}),
+        DwarfStarProvider(1, {"ds4_dir": str(ds4_tree) + "/", "gguf_path": "b.gguf"}),
+        DwarfStarProvider(2, {"ds4_dir": str(other), "gguf_path": "c.gguf"}),
+    ]
+    build_dwarfstar_estimators(providers + [LMStudioProvider()])
+
+    # Two instances of one tree means one build; a second tree gets its own.
+    dirs = [kw["cwd"] for kw in fake.kwargs]
+    assert dirs == [os.path.abspath(str(ds4_tree)), os.path.abspath(str(other))]
+
+
+def test_build_dwarfstar_estimators_needs_a_ds4_dir(fake_make):
+    from providers.dwarfstar import build_dwarfstar_estimators
+
+    fake = fake_make()
+    with pytest.raises(dse.Ds4BuildError, match="ds4_dir"):
+        build_dwarfstar_estimators([DwarfStarProvider(0, {})])
+    assert fake.argvs == []
+
+
+def test_build_estimator_is_a_real_make_run(tmp_path):
+    # No mocks: the argv/cwd contract has to survive an actual make, including
+    # the fragment-style `include Makefile` the real one relies on.
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "Makefile").write_text("CORE_OBJS =\nCPU_CORE_OBJS =\nall:\n\techo engine\n")
+    (root / "ds4.o").write_bytes(b"o")
+    fragment = tmp_path / "estimate.mk"
+    fragment.write_text(
+        "include Makefile\n"
+        ".DEFAULT_GOAL := ds4-estimate\n"
+        "ds4-estimate:\n"
+        "\tprintf '#!/bin/sh\\nexit 0\\n' > $@\n"
+        "\tchmod +x $@\n"
+    )
+
+    proc = subprocess.run(
+        ["make", "-f", str(fragment)], cwd=root, capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stderr
+    built = root / "ds4-estimate"
+    assert built.exists() and os.access(built, os.X_OK)
+
+
+def test_estimate_mk_offers_a_cpu_only_variant():
+    makefile = (Path(__file__).resolve().parent.parent / "tools" / "ds4-estimate.mk").read_text()
+    assert "DS4_ESTIMATE_CPU_ONLY" in makefile
+    # The CPU switch must swap in the CPU object list itself: passing
+    # CORE_OBJS="$(CPU_CORE_OBJS)" on a make command line is not portable.
+    assert "CORE_OBJS := $(CPU_CORE_OBJS)" in makefile
 
 
 def test_warm_dwarfstar_estimates_without_a_configured_gguf(monkeypatch):

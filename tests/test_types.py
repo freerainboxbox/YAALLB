@@ -108,7 +108,14 @@ def test_providers_list_descriptors(monkeypatch):
     assert LMStudioProvider().getModelsDescriptors() == []
     provider = DwarfStarProvider()
     descs = provider.getModelsDescriptors()
-    assert [d.modelId for d in descs] == ["deepseek-v4-flash", "deepseek-v4-pro"]
+    # The DeepSeek thinking aliases are part of the served set: ds4 answers
+    # them, and they are how a client asks for answers without thinking.
+    assert [d.modelId for d in descs] == [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek-chat",
+        "deepseek-reasoner",
+    ]
     assert all(d.provider is provider for d in descs)
 
 
