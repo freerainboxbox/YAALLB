@@ -25,11 +25,13 @@ from providers.ds4_models import (
 )
 
 # ds4 cannot answer a native /v1/models while it is spawned/terminated by
-# Python, so the model list is built here from the profile registry (see
-# providers/ds4_models.py). Every alias of the served family names the same
-# resident model, and the presented context_length is the ctx that will actually
-# be spawned. This is the context used for a family ds4 gives no documented
-# ceiling of its own (and is what DeepSeek V4 has always been given here).
+# Python, so the model list is built here: from the ids the ds4 build reports
+# for the opened GGUF, falling back on the profile registry (see
+# providers/ds4_models.py) for as long as no GGUF has been opened. Every id of
+# the served family names the same resident model, and the presented
+# context_length is the ctx that will actually be spawned. This is the context
+# used for a family ds4 gives no documented ceiling of its own (and is what
+# DeepSeek V4 has always been given here).
 DS4_CONTEXT_LENGTH = 1000000
 
 DS4_DEFAULT_HOST = "127.0.0.1"
@@ -160,6 +162,10 @@ class DwarfStarProvider(Provider):
         self._detected_profile: Ds4ModelProfile | None = None
         self._model_name: str | None = None
         self._identity_adopted = False
+        # The model IDs the ds4 build reported for the opened GGUF. Once ds4
+        # has answered, its list - not the registry - is what this instance
+        # routes, advertises and budgets.
+        self._served_ids: tuple[str, ...] | None = None
         super().__init__(_instance_id, config)
         self._explicit_profile = self._resolve_profile()
 
@@ -167,6 +173,15 @@ class DwarfStarProvider(Provider):
     def served_profile(self) -> Ds4ModelProfile:
         """Configured profile, else the one ds4 confirmed, else the old default."""
         return self._explicit_profile or self._detected_profile or DS4_DEFAULT_PROFILE
+
+    @property
+    def served_ids(self) -> tuple[str, ...]:
+        """The model IDs this instance answers, in advertisement order.
+
+        ds4's own list once its estimator has run (see _adopt_identity), the
+        registry's for the family until then.
+        """
+        return self._served_ids or self.served_profile.served()
 
     def _resolve_profile(self) -> Ds4ModelProfile:
         """The configured model profile, or the family YAALLB always assumed.
@@ -189,13 +204,15 @@ class DwarfStarProvider(Provider):
         return profile
 
     def _adopt_identity(self, estimate: dict) -> None:
-        """Record which model ds4 says the configured GGUF actually is.
+        """Record what ds4 says the configured GGUF actually is.
 
         The GGUF - not config.json - decides what a ds4 tree serves, and only ds4
-        knows which shape it read out of the file. So the first estimator result
-        that carries a shape teaches this provider its model IDs, its display
-        name and its context ceiling, which is what stops a Qwen3.8 tree from
-        being presented as DeepSeek V4 Flash with a million tokens of context.
+        knows which shape it read out of the file and under which IDs it answers
+        for it. So the first estimator result that carries a shape teaches this
+        provider its model IDs, its display name and its context ceiling, which
+        is what stops a Qwen3.8 tree from being presented as DeepSeek V4 Flash
+        with a million tokens of context, and what stops a renamed or dropped ds4
+        alias from staying in YAALLB's model list.
 
         An estimator that fell back to GGUF file sizes carries no shape, so it
         does not consume this one chance to learn it.
@@ -208,11 +225,18 @@ class DwarfStarProvider(Provider):
 
         self._model_name = estimate.get("model_name") or self._model_name
         family = estimate.get("model_family")
+        # What the engine says it serves the opened shape under. A schema-3
+        # estimator always answers this (providers/dwarfstar_estimate.py rejects
+        # an output without it), so an empty list means the shape was not
+        # reported at all rather than reported as nothing.
+        reported = tuple(estimate.get("model_aliases") or ())
 
         if self.model_profile is not None:
             # An explicit profile is an override and stays one either way; when
             # config and GGUF disagree, that is worth reading in the log.
             if self.served_profile.family == family:
+                # Same family, so ds4's ids are the right ones for it.
+                self._served_ids = self.served_profile.served(reported)
                 log.info(
                     f"ds4 provider #{self._instance_id} serves "
                     f"model_profile={self.model_profile}, confirmed by ds4 "
@@ -239,9 +263,12 @@ class DwarfStarProvider(Provider):
             return
 
         self._detected_profile = profile
+        self._served_ids = profile.served(reported)
+        renamed = bool(reported) and reported != profile.aliases
         log.info(
             f"ds4 provider #{self._instance_id} serves {profile.family} "
-            f"({estimate.get('model_name')}) as {len(profile.aliases)} model ids"
+            f"({estimate.get('model_name')}) as {len(self._served_ids)} model ids"
+            + (" (ds4's own list)" if renamed else "")
         )
 
     @property
@@ -339,10 +366,10 @@ class DwarfStarProvider(Provider):
         return self._explicit_profile.family if self._explicit_profile else None
 
     def getModelsDescriptors(self) -> list[ModelDescriptor]:
-        # Every alias of the served family is registered, because each is a
+        # Every id this instance answers is registered, because each is a
         # request YAALLB has to route (and budget) - and the thinking aliases
         # only work if clients can name them.
-        return [ModelDescriptor(alias, self) for alias in self.served_profile.aliases]
+        return [ModelDescriptor(alias, self) for alias in self.served_ids]
 
     def _display_name(self) -> str:
         # ds4's own shape name: it tells Flash from PRO (one profile, one family)
@@ -374,7 +401,7 @@ class DwarfStarProvider(Provider):
                 "supported_parameters": DS4_SUPPORTED_PARAMETERS,
             }
 
-        return [model_entry(alias) for alias in self.served_profile.aliases]
+        return [model_entry(alias) for alias in self.served_ids]
 
     def createModel(
         self, descriptor: ModelDescriptor, loadOptions: LoadOptions

@@ -96,8 +96,11 @@ static const char *model_family(ds4_engine *e) {
  * engine() picks the primary id and send_models() adds the -chat/-reasoner
  * variants. (send_models() itself answers the whole GLM DSA family with the 5.2
  * ids; the 5.3 set below follows server_model_id_from_engine() instead, and
- * YAALLB's registry knows both families' thinking aliases either way.) They are
- * fixed literals, so they need no JSON escaping. */
+ * YAALLB's registry knows both families' thinking aliases either way.) This is
+ * the list YAALLB then routes, advertises and budgets the instance under, so
+ * keep it in step with ds4_server.c: an id added here is one its /v1/models
+ * answers, and one missing here is one its clients are never told about. They
+ * are fixed literals, so they need no JSON escaping. */
 static void print_model_aliases(ds4_engine *e) {
     static const char *const deepseek4[] = {
         "deepseek-v4-flash", "deepseek-v4-pro"};

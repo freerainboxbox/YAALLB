@@ -1,29 +1,44 @@
 """Which model IDs a ds4 tree serves, per model family.
 
-ds4 does not have a model list its caller can read: one `ds4-server` process
-serves whatever the GGUF passed at startup *is*, under a fixed set of aliases
-(`deepseek-v4-flash`, `qwen3.8-flash-next`, ...), and picking a thinking mode is
-part of that alias
-set (`deepseek-chat` / `deepseek-reasoner` change whether the model thinks; see
-ds4_server.c `model_alias_disables_thinking` and
-`model_alias_enables_thinking`). YAALLB schedules and routes by model ID, so it
-mirrors that table here — the same way `providers/dflash_shortcuts.py` mirrors
-dflash-mlx's registry — and confirms the family it is looking at with the ds4
-build itself (`model_family` in the estimator output, see
-providers/dwarfstar_estimate.py).
+ds4 does not have a model list its caller can read *before* it is running: one
+`ds4-server` process serves whatever the GGUF passed at startup *is*, under a
+fixed set of aliases (`deepseek-v4-flash`, `qwen3.8-flash-next`, ...), and
+picking a thinking mode is part of that alias set (ds4_server.c
+`model_alias_disables_thinking` and `model_alias_enables_thinking`). YAALLB
+schedules and routes by model ID, so it needs those IDs before anything is
+spawned.
 
-Aliases come from ds4_server.c `server_model_alias_known()` /
-`server_model_id_from_engine()` / `send_models()`. The first alias of a family is
-its primary one, i.e. what `server_model_id_from_engine()` answers. Registering
-the thinking aliases at all is what makes thinking mode selectable through
-YAALLB: ds4 honours them on the chat endpoint and does not list them in
+Two sources, in order of authority:
+
+1. **ds4 itself.** The footprint estimator answers `model_aliases` for the shape
+   it opened (see providers/dwarfstar_estimate.py and tools/ds4_estimate.c), and
+   the first estimate a provider runs replaces that family's registry list — so
+   a ds4 pull that renames, adds or drops a listed id cannot leave YAALLB
+   advertising an id the engine does not answer. That is the same failure mode
+   `tools/ds4-estimate.mk` was built to remove for the footprint numbers.
+2. **This registry**, for the window before a GGUF has been opened (config is
+   parsed, `/v1/models` is asked, and nothing is running yet), and for what ds4
+   deliberately keeps out of its own model list.
+
+A family's registry `aliases` mirror ds4's `/v1/models` (`send_models()`, which
+is also what `tools/ds4_estimate.c` reports) and its first entry is the primary
+one, i.e. what `server_model_id_from_engine()` answers. `thinking_aliases` are
+the extra spellings ds4's chat endpoint honours but does not list, and each one
+has to be an entry of ds4's own alias tables (`server_model_alias_known()`,
+`model_alias_disables_thinking()`, `model_alias_enables_thinking()`) — an
+invented spelling here is an id whose requests fail. `native_ctx` and
+`display_name` are the only things here that ds4 never reports per shape, and
+the only reason the family is looked up at all.
+
+Registering the thinking aliases at all is what makes thinking mode selectable
+through YAALLB: ds4 honours them on the chat endpoint and does not list them in
 /v1/models. YAALLB does list them - a client that only ever uses listed models
 would otherwise never learn that thinking mode is selectable here, and hiding
 them would make the model list the only place where the two providers differ.
 
-They are *routable IDs*, and every one of them names the same resident model:
-`ds4-server` answers for the loaded GGUF whichever alias is asked (ds4 uses the
-alias only to pick defaults), and the provider is single-resident.
+They are all *routable IDs*, and every one of them names the same resident
+model: `ds4-server` answers for the loaded GGUF whichever alias is asked (ds4
+uses the alias only to pick defaults), and the provider is single-resident.
 """
 
 from dataclasses import dataclass
@@ -59,7 +74,9 @@ class Ds4ModelProfile:
 
     `family` is the `model_family` string a ds4 build reports (tools/
     ds4_estimate.c), so config and auto-detection share one key. `aliases` is
-    ordered: primary first, then the extra aliases.
+    ordered and holds the ids ds4 lists for the family, primary first; it is the
+    fallback for the ids ds4 reports once its estimator has run. Each
+    `thinking_alias` is an id ds4's chat endpoint honours without listing it.
 
     `native_ctx` is the context length that family's shape is documented to
     have, and only a fallback for when neither the request nor the config asks
@@ -70,11 +87,25 @@ class Ds4ModelProfile:
     family: str
     display_name: str
     aliases: tuple[str, ...]
+    thinking_aliases: tuple[str, ...] = ()
     native_ctx: int | None = None
 
     @property
     def primary_alias(self) -> str:
         return self.aliases[0]
+
+    def served(self, reported: tuple[str, ...] | None = None) -> tuple[str, ...]:
+        """The ids to route and advertise for this family.
+
+        `reported` is what a ds4 build said it serves the opened shape under
+        (`model_aliases` in the estimator output); without it, this registry's
+        own list stands in. The thinking aliases are appended either way — they
+        are what ds4 does not list and YAALLB adds on purpose — and an alias ds4
+        now lists is never listed twice.
+        """
+        served = list(reported or self.aliases)
+        served += [alias for alias in self.thinking_aliases if alias not in served]
+        return tuple(served)
 
 
 DEEPSEEK_V4 = Ds4ModelProfile(
@@ -82,12 +113,14 @@ DEEPSEEK_V4 = Ds4ModelProfile(
     # ds4's own shape name; the estimator's model_name replaces it once a GGUF
     # has been opened, which is what tells Flash from PRO or Vision Experimental.
     display_name="DeepSeek V4 Flash",
-    # deepseek-chat / deepseek-reasoner are the DeepSeek-compatible aliases ds4
-    # uses to force thinking off/on. They are not in its /v1/models list, but
-    # chat requests honour them.
     aliases=(
         "deepseek-v4-flash",
         "deepseek-v4-pro",
+    ),
+    # deepseek-chat / deepseek-reasoner are the DeepSeek-compatible aliases ds4
+    # uses to force thinking off/on. They are its only such pair: they exist in
+    # its thinking tables but in no other table, and it lists neither.
+    thinking_aliases=(
         "deepseek-chat",
         "deepseek-reasoner",
     ),
@@ -100,13 +133,16 @@ DEEPSEEK_V4 = Ds4ModelProfile(
 QWEN38_FLASH_NEXT = Ds4ModelProfile(
     family="qwen4exp",
     display_name="Qwen3.8 Flash Next",
-    # ds4_server.c server_model_alias_known(): three aliases ds4 lists, two
-    # no-thinking spellings, and three vendor-prefixed ones. There is no
-    # qwen/-prefixed -no-think alias, so none is invented here.
     aliases=(
         "qwen3.8-flash-next",
         "qwen3.8-flash-next-chat",
         "qwen3.8-flash-next-reasoner",
+    ),
+    # Every one of these is an entry of ds4_server.c server_model_alias_known()
+    # and of its thinking tables: two more no-thinking spellings, and the
+    # vendor-prefixed set (there is no qwen/-prefixed no-thinking spelling, so
+    # none is invented here).
+    thinking_aliases=(
         "qwen3.8-flash-next-no-think",
         "qwen3.8-flash-next-nothink",
         "qwen/qwen3.8-flash-next",
@@ -123,8 +159,9 @@ QWEN38_FLASH_NEXT = Ds4ModelProfile(
 DEEPSEEK_V41_FLASH = Ds4ModelProfile(
     family="deepseek41",
     display_name="DeepSeek V4.1 Flash",
-    # One alias only: ds4's thinking-alias tables have no V4.1 entries (effort
-    # there comes from reasoning_effort / a thinking object instead).
+    # One alias only, and no thinking aliases: ds4's alias tables have no V4.1
+    # entries at all (effort there comes from reasoning_effort / a thinking
+    # object instead).
     aliases=("deepseek-v4.1-flash",),
     # docs/MODELS.md gives file and weight sizes for V4.1, never a context
     # ceiling, so none is claimed here either.
@@ -136,12 +173,14 @@ GLM_53_FLASH = Ds4ModelProfile(
     display_name="GLM 5.3 Flash",
     # GLM 5.3 shares ds4's GLM DSA family with 5.2 (ds4 distinguishes them by
     # variant), which is why ds4's own send_models() answers 5.3 trees with the
-    # 5.2 ids. Both sets are accepted by its chat endpoint, so both are
-    # registered - under their own families, so a 5.3 tree never advertises 5.2.
+    # 5.2 ids. Its alias tables know the 5.3 spellings too, so a 5.3 tree is
+    # presented under its own name - and never advertises 5.2.
     aliases=(
         "glm-5.3-flash",
         "glm-5.3-flash-chat",
         "glm-5.3-flash-reasoner",
+    ),
+    thinking_aliases=(
         "glm-5.3-flash-no-think",
         "glm-5.3-flash-nothink",
         "zai/glm-5.3-flash",
@@ -158,6 +197,8 @@ GLM_52 = Ds4ModelProfile(
         "glm-5.2",
         "glm-5.2-chat",
         "glm-5.2-reasoner",
+    ),
+    thinking_aliases=(
         "glm-5.2-no-think",
         "glm-5.2-nothink",
         "zai/glm-5.2",
@@ -192,13 +233,14 @@ def profile_named(name: str | None) -> Ds4ModelProfile | None:
     """A configured `model_profile`, given as its family key or any of its IDs.
 
     Accepting an alias too keeps config.json writable in the vocabulary clients
-    actually use (`"model_profile": "qwen3.8-flash-next"`).
+    actually use (`"model_profile": "qwen3.8-flash-next"`), thinking spellings
+    included.
     """
     if not name:
         return None
     if name in _BY_FAMILY:
         return _BY_FAMILY[name]
     for profile in DS4_MODEL_PROFILES:
-        if name in profile.aliases:
+        if name in profile.served():
             return profile
     return None

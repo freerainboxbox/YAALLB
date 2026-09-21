@@ -396,32 +396,48 @@ is configured as:
 
 **Served models** — one `ds4-server` answers for whatever the GGUF you handed
 it *is*, under a fixed set of IDs, and it has no model list YAALLB could read
-(nothing is running when config is parsed, and the process is spawned and
-terminated here). So the IDs are registered here, in
-`providers/ds4_models.py` — the same way `providers/dflash_shortcuts.py` mirrors
-dflash-mlx's registry — while the *family* is not guessed from the file name but
-read off the ds4 build: the footprint estimator answers `model_family`,
-`model_name` and `model_aliases`, so the first estimate tells the provider what
-its GGUF turned out to be. That first estimate is the cheapest context, so the
-shape is known before the expensive ones are priced.
+before it is running (nothing is spawned when config is parsed). So the IDs
+come from two places, in this order:
 
-The registry, and the context each family is spawned at when nothing asked for
-one:
+1. **ds4 itself.** The footprint estimator answers `model_family`, `model_name`
+   and `model_aliases` for the shape it opened, so the first estimate tells the
+   provider what its GGUF turned out to be *and under which IDs ds4 answers for
+   it* — and that list, not a hand-written one, is what the instance then
+   registers, advertises and budgets. That first estimate is the cheapest
+   context, so the shape is known before the expensive ones are priced. A ds4
+   pull that renames, adds or drops a listed ID therefore cannot leave YAALLB
+   advertising an ID the engine does not answer (which a client would only find
+   out by getting an error back) or hiding one it does.
+2. **`providers/ds4_models.py`**, for the window before a GGUF has been opened,
+   and for the aliases ds4 deliberately keeps out of its own model list. Its
+   list per family mirrors what `ds4-server` would answer `/v1/models` with
+   (`send_models()`, the same table `tools/ds4_estimate.c` reports), and
+   `tests/test_ds4_models.py` checks it against that file, so the fallback
+   cannot silently drift from the engine either.
 
-- `deepseek4` — `deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-chat`,
-  `deepseek-reasoner`. Native context 1000000.
-- `deepseek41` — `deepseek-v4.1-flash` alone: ds4's thinking-alias tables have
-  no V4.1 entries (effort there comes from `reasoning_effort`). No documented
+The registry's families, and the context each is spawned at when nothing asked
+for one:
+
+- `deepseek4` — `deepseek-v4-flash`, `deepseek-v4-pro`, plus the thinking
+  aliases `deepseek-chat` and `deepseek-reasoner`. Native context 1000000.
+- `deepseek41` — `deepseek-v4.1-flash` alone: ds4's alias tables have no V4.1
+  entries at all (effort there comes from `reasoning_effort`). No documented
   ceiling.
-- `qwen4exp` — `qwen3.8-flash-next`, `qwen3.8-flash-next-chat`,
-  `qwen3.8-flash-next-reasoner`, `qwen3.8-flash-next-no-think`,
-  `qwen3.8-flash-next-nothink`, and `qwen/qwen3.8-flash-next` with its own
-  `-chat`/`-reasoner` (ds4 has no `qwen/`-prefixed no-thinking spelling, so none
-  is invented here). Native context 262144.
-- `glm53` — `glm-5.3-flash`, `-chat`, `-reasoner`, `-no-think`, `-nothink`, and
-  the same three-way set under `zai/`. No documented ceiling.
-- `glm52` — `glm-5.2`, `-chat`, `-reasoner`, `-no-think`, `-nothink`, and the
-  same set under `zai/`. No documented ceiling.
+- `qwen4exp` — `qwen3.8-flash-next`, `-chat`, `-reasoner`, plus ds4's own
+  `qwen3.8-flash-next-no-think`, `qwen3.8-flash-next-nothink` and the
+  `qwen/`-prefixed set (ds4 has no `qwen/`-prefixed no-thinking spelling, so
+  none is invented here). Native context 262144.
+- `glm53` — `glm-5.3-flash`, `-chat`, `-reasoner`, plus `-no-think`, `-nothink`
+  and the same three under `zai/`. No documented ceiling.
+- `glm52` — `glm-5.2`, `-chat`, `-reasoner`, plus `-no-think`, `-nothink` and
+  the same three under `zai/`. No documented ceiling.
+
+The names after "plus" in each family are its `thinking_aliases`, and they are
+the only thing the registry is allowed to add on top of what ds4 says it
+serves: every one of them is an entry of ds4's own alias tables
+(`ds4_server.c` `server_model_alias_known()`, `model_alias_disables_thinking()`,
+`model_alias_enables_thinking()`), because an invented spelling there is an ID
+whose requests fail.
 
 - They are **routable IDs naming one resident model**: `single_resident`, and
   ds4 uses the alias only to pick defaults, so `on_start` one alias and every

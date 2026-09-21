@@ -3,10 +3,17 @@
 The point is that YAALLB registers the model IDs a ds4 tree really answers to -
 including the aliases that turn thinking on and off - and reports them the way
 ds4-server itself would, rather than assuming every ds4 tree is DeepSeek V4
-Flash/PRO. The registry itself is a copy of ds4_server.c's alias tables, so the
-families that matter are asserted literally: a silent rename should fail here,
-not in somebody's config.
+Flash/PRO. What ds4 lists is read off the ds4 build itself (`model_aliases` in
+the estimator output) whenever it is available, and the registry's own list is
+only what is served before a GGUF has been opened; the two are checked against
+`tools/ds4_estimate.c` here so neither can drift from the engine in silence.
+The aliases a family advertises beyond ds4's list have to be documented in
+ds4's own alias tables, so they are asserted literally too: a silent rename
+should fail here, not in somebody's config.
 """
+
+import re
+from pathlib import Path
 
 import pytest
 
@@ -99,6 +106,116 @@ def test_oai_listing_mirrors_ds4s_own_model_json(no_network):
     )
 
 
+# The ids ds4's chat endpoint honours for one family but keeps out of its own
+# /v1/models (ds4_server.c model_alias_disables_thinking /
+# model_alias_enables_thinking / server_model_alias_known). They are the only
+# thing the registry is allowed to add on top of what ds4 says it serves, and
+# there is no such spelling for V4.1, so deepseek41 adds nothing.
+DEEPSEEK_V4_THINKING = ["deepseek-chat", "deepseek-reasoner"]
+QWEN38_THINKING = [
+    "qwen3.8-flash-next-no-think",
+    "qwen3.8-flash-next-nothink",
+    "qwen/qwen3.8-flash-next",
+    "qwen/qwen3.8-flash-next-chat",
+    "qwen/qwen3.8-flash-next-reasoner",
+]
+
+
+def _estimator_lists() -> dict:
+    """The ids tools/ds4_estimate.c says each family is served under.
+
+    The estimator mirrors ds4_server.c send_models(), so this is the one check
+    that the registry's own list of *listed* ids still says what the engine
+    says: it reads the C literals instead of another Python copy of them, which
+    is the only way a rename upstream can be caught without a built ds4 tree.
+    """
+    src = (
+        Path(__file__).resolve().parent.parent / "tools" / "ds4_estimate.c"
+    ).read_text()
+
+    def body(name):
+        start = src.index(name)
+        return src[start : src.index("\n}\n", start)]
+
+    families = body("static const char *model_family(")
+    aliases = body("static void print_model_aliases(")
+
+    arrays = {
+        name: tuple(re.findall(r'"([^"]+)"', ids))
+        for name, ids in re.findall(
+            r"static const char \*const (\w+)\[\] = \{(.*?)\};", aliases, re.S
+        )
+    }
+    # Which array each engine predicate answers with, and which family each
+    # predicate is named after; the fallthroughs are the defaults of their
+    # functions (both DeepSeek V4).
+    by_predicate = dict(
+        re.findall(r"if \((ds4_engine_is_\w+)\(e\)\) \{\s*ids = (\w+);", aliases)
+    )
+    families_by_predicate = dict(
+        re.findall(r'if \((ds4_engine_is_\w+)\(e\)\) return "(\w+)";', families)
+    )
+    default_array = re.search(r"const char \*const \*ids = (\w+);", aliases).group(1)
+    default_family = re.search(r'\n    return "(\w+)";', families).group(1)
+
+    served = {
+        families_by_predicate[predicate]: arrays[name]
+        for predicate, name in by_predicate.items()
+    }
+    served[default_family] = arrays[default_array]
+    assert len(served) == len(DS4_MODEL_PROFILES), served
+    return served
+
+
+# family -> the ids ds4's own build says it serves that family under.
+ESTIMATOR_IDS = _estimator_lists()
+
+
+def test_registry_lists_exactly_what_the_estimator_says_ds4_lists():
+    # Nothing here imports ds4: this is the guard against the failure mode the
+    # estimator exists to remove, a hand-written id table that silently drifts
+    # from the engine it fronts. The registry's listed ids are what is served
+    # before a GGUF has been opened, so they have to be the engine's own.
+    assert {
+        profile.family: profile.aliases for profile in DS4_MODEL_PROFILES
+    } == ESTIMATOR_IDS
+
+
+def test_no_registry_alias_is_something_ds4_does_not_honour():
+    # Everything the registry adds on top of ds4's list has to be a spelling
+    # ds4's chat endpoint accepts, or YAALLB advertises an id whose requests
+    # fail. ds4's tables are the only source for these, family by family, and
+    # none of them may be one ds4 lists itself (that would list it twice).
+    documented = {
+        "deepseek4": DEEPSEEK_V4_THINKING,
+        "deepseek41": [],
+        # ds4 has no qwen/-prefixed no-thinking spelling, so none is invented
+        # here either.
+        "qwen4exp": QWEN38_THINKING,
+        "glm53": [
+            "glm-5.3-flash-no-think",
+            "glm-5.3-flash-nothink",
+            "zai/glm-5.3-flash",
+            "zai/glm-5.3-flash-chat",
+            "zai/glm-5.3-flash-reasoner",
+        ],
+        "glm52": [
+            "glm-5.2-no-think",
+            "glm-5.2-nothink",
+            "zai/glm-5.2",
+            "zai/glm-5.2-chat",
+            "zai/glm-5.2-reasoner",
+        ],
+    }
+    for profile in DS4_MODEL_PROFILES:
+        assert profile.thinking_aliases == tuple(documented[profile.family])
+        assert not set(profile.thinking_aliases) & set(ESTIMATOR_IDS[profile.family])
+        # ... and the family's full table is ds4's list plus exactly those.
+        assert profile.served() == (
+            *ESTIMATOR_IDS[profile.family], *profile.thinking_aliases
+        )
+
+
 V41_IDS = ["deepseek-v4.1-flash"]
 GLM_53_IDS = [
     "glm-5.3-flash",
@@ -144,7 +261,7 @@ def test_no_alias_is_shared_between_families():
     # would make a Qwen request silently load a GLM tree.
     seen = {}
     for profile in DS4_MODEL_PROFILES:
-        for alias in profile.aliases:
+        for alias in profile.served():
             assert alias not in seen, f"{alias} in {seen.get(alias)} and {profile.family}"
             seen[alias] = profile.family
 
@@ -184,11 +301,17 @@ def test_qwen_uses_its_own_native_context(no_network):
 
 
 def _estimate(**overrides) -> dict:
-    """A ds4 estimator result, as providers/dwarfstar_estimate.py returns it."""
+    """A ds4 estimator result, as providers/dwarfstar_estimate.py returns it.
+
+    `model_aliases` follows the family unless given, because a real estimator
+    answer always carries the ids of the shape it opened.
+    """
+    family = overrides.get("model_family", "qwen4exp")
     result = {
         "source": "ds4",
         "model_name": "Qwen3.8 Flash Next",
-        "model_family": "qwen4exp",
+        "model_family": family,
+        "model_aliases": list(ESTIMATOR_IDS.get(family, ESTIMATOR_IDS["deepseek4"])),
         "model_id": 5,
         "model_bytes": 1 << 30,
         "support_bytes": 0,
@@ -233,6 +356,51 @@ def test_family_is_detected_from_ds4s_answer(no_network, estimator, monkeypatch)
     assert provider._effective_ctx() == 262144
     assert provider._detected_profile is profile_for("qwen4exp")
     assert warnings == []
+
+
+def test_ds4s_own_id_list_replaces_the_registry_one(no_network, estimator):
+    # The registry is a mirror, not an authority: whatever the opened GGUF
+    # answers with is what gets routed and budgeted. A ds4 that renames, adds
+    # or drops a listed id must not leave YAALLB advertising an id it does not
+    # answer (a 400-class failure the client cannot do anything about) or
+    # hiding one it does.
+    renamed = ["qwen3.8-flash-next-v2", "qwen3.8-flash-next-chat"]
+    estimator(_estimate(model_aliases=renamed))
+    provider = _provider()
+    provider._estimate(8192)
+
+    ids = [d.modelId for d in provider.getModelsDescriptors()]
+    assert ids[: len(renamed)] == renamed
+    assert "qwen3.8-flash-next" not in ids  # the stale registry id is gone
+    # What ds4 does not list but does honour still rides along, because that is
+    # how thinking mode stays selectable through YAALLB.
+    assert ids[len(renamed) :] == QWEN38_THINKING
+    assert [m["id"] for m in provider.getOAIModels()] == ids
+
+
+def test_a_listed_id_ds4_honours_is_not_listed_twice(no_network, estimator):
+    estimator(_estimate(model_aliases=["qwen3.8-flash-next", *QWEN38_THINKING[:2]]))
+    provider = _provider()
+    provider._estimate(8192)
+
+    ids = [d.modelId for d in provider.getModelsDescriptors()]
+    assert len(ids) == len(set(ids))
+    assert ids[0] == "qwen3.8-flash-next"
+
+
+def test_nothing_is_advertised_that_a_ds4_build_does_not_answer(no_network, estimator):
+    # The same list, seen through the client-facing listing: /v1/models is what
+    # a client like Open WebUI discovers, so every id in it has to be one this
+    # tree answers.
+    reported = ["qwen3.8-flash-next-v2", "qwen3.8-flash-next-v2-reasoner"]
+    estimator(_estimate(model_aliases=reported))
+    provider = _provider()
+    provider._estimate(8192)
+
+    assert [m["id"] for m in provider.getOAIModels()] == [
+        *reported,
+        *QWEN38_THINKING,
+    ]
 
 
 def test_detection_names_the_model_ds4_says_it_opened(no_network, estimator):
@@ -287,7 +455,6 @@ def test_unknown_family_keeps_the_default_and_says_so(no_network, estimator, mon
     provider._estimate(8192)
 
     assert provider.served_profile is profile_for("deepseek4")
-    assert [d.modelId for d in provider.getModelsDescriptors()] == DEEPSEEK_V4_IDS
     assert len(warnings) == 1 and "some-new-family" in warnings[0]
 
 
