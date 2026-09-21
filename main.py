@@ -50,6 +50,17 @@ DEFAULT_YAALLB_CONFIG = {
     "ctx_length": DEFAULT_CTX_LENGTH,
 }
 
+# Providers whose non-200 must be relayed to the client rather than retried as
+# a readiness signal:
+#   - lms answers /chat/completions while models load, and only its 404 means
+#     "still loading" (see the branch that handles it);
+#   - ds4-server loads its GGUF at launch, so loadModel here does not mark a
+#     model loaded until /v1/models already answers (wait_server_ready): by the
+#     time a request is forwarded, everything it says about this request is
+#     final. Retrying a deterministic 400 ten times only hides it.
+# llama_cpp and dflash-mlx keep being treated as still starting up on a non-200.
+_RELAYS_UPSTREAM_ERRORS = ("lms", "ds4")
+
 PROVIDER_TYPES = {
     "lms": LMStudioProvider,
     "ds4": DwarfStarProvider,
@@ -632,14 +643,15 @@ async def chat_completions(body: dict):
                         model._load_state = "ready"
                     break
 
-                if provider._type_id == "lms":
-                    # LM Studio's "still loading" signal is a 404 on
-                    # /chat/completions; anything else is a genuine upstream
-                    # error. Distinguish them so a slow background load doesn't
-                    # exhaust the retry budget (404) while a malformed request
-                    # or over-long prompt doesn't fire a hot loop of duplicate
-                    # retries and misreport as "model not ready" (other 4XX).
-                    if upstream.status_code == 404:
+                if provider._type_id in _RELAYS_UPSTREAM_ERRORS:
+                    # Of these, only LM Studio says "still loading", and only
+                    # with a 404 on /chat/completions; anything else is a
+                    # genuine upstream error. Distinguish them so a slow
+                    # background load doesn't exhaust the retry budget (404)
+                    # while a malformed request or over-long prompt doesn't fire
+                    # a hot loop of duplicate retries and misreport as "model
+                    # not ready" (other 4XX).
+                    if provider._type_id == "lms" and upstream.status_code == 404:
                         await client.aclose()
                         try:
                             await asyncio.to_thread(
@@ -695,10 +707,10 @@ async def chat_completions(body: dict):
                     return
 
                 await client.aclose()
-                # A spawned provider (llama_cpp/ds4/dflash-mlx) returning
-                # non-200 means its model isn't actually ready yet; track that
-                # load state so the retry below continues until readiness.
-                if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx"):
+                # A spawned provider (llama_cpp/dflash-mlx) returning non-200
+                # means its model isn't actually ready yet; track that load
+                # state so the retry below continues until readiness.
+                if provider._type_id in ("llama_cpp", "dflash-mlx"):
                     model._load_state = "loading"
                 failures = _bump_startup_failures(
                     provider, f"upstream status {upstream.status_code}"

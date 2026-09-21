@@ -217,9 +217,20 @@ in-flight (so it isn't evicted) until the upstream reply completes.
 
 When a provider isn't ready yet (e.g. ds4-server is still starting up), the
 forward is **retried internally** up to `STARTUP_ATTEMPTS` (10) times, then an
-SSE error event (`code: provider_start_failed`) is emitted. Each failure bumps
+SSE error event (`code: provider_start_failed`, or `model_not_ready` for a
+spawned provider whose model never became ready) is emitted. Each failure bumps
 a per-provider startup counter, and the counter resets once the provider
 serves a request successfully.
+
+A non-200 from a provider that boots its model *before* it answers HTTP is not a
+readiness signal, so it is not retried: `ds4-server` loads its GGUF at launch
+(YAALLB only marks a ds4 model loaded once `/v1/models` already answers), so a
+400 from it is its verdict on *this request* — a prompt over the server's
+context, `ignore_eos` without an explicit `temperature: 0`, an image while it
+was started without `--vision`. Such an answer, and every other non-404 error
+from LM Studio, is relayed as an SSE error event (`code: upstream_error`) with
+the upstream body in it, rather than being retried ten times and surfacing as
+`model_not_ready`.
 
 ## Cached VRAM estimates
 

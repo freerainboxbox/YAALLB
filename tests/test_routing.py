@@ -427,6 +427,60 @@ def test_chat_completions_lmstudio_400_relayed_not_retried(monkeypatch):
     assert len(calls) == 1
 
 
+def test_chat_completions_ds4_400_relayed_not_retried(monkeypatch):
+    # ds4 loads its model at launch and only then answers HTTP (loadModel here
+    # waits for /v1/models to answer before a model is even considered loaded),
+    # so a non-200 from it is an answer about this request - a prompt that does
+    # not fit, ignore_eos without temperature 0, an image without --vision -
+    # and never a "still loading" signal. It has to reach the client instead of
+    # being retried into model_not_ready.
+    prov_a = FakeProvider("http://a.example/v1", ["model-a"])
+    prov_a._type_id = "ds4"
+    main.PROVIDERS = [prov_a]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    calls = []
+
+    class ErrorResp:
+        status_code = 400
+        headers = {"content-type": "application/json"}
+
+        async def aiter_raw(self):
+            # ds4's own wording for a request it will never accept as written.
+            yield (
+                b'{"error":{"message":"ignore_eos requires an explicit '
+                b'temperature of 0"}}'
+            )
+
+    class OneShotClient:
+        async def aclose(self):
+            pass
+
+        def build_request(self, method, url, json, headers):
+            return {"url": url, "json": json, "headers": headers}
+
+        async def send(self, req, stream=False):
+            calls.append(("send", req["url"], req["json"]))
+            return ErrorResp()
+
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: OneShotClient())
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [], "stream": True},
+        )
+
+    assert resp.status_code == 200
+    assert b'"code": "upstream_error"' in resp.content
+    # ds4's own complaint is what the user reads; before, this was ten attempts
+    # and a "model is not ready" that named nothing.
+    assert b"ignore_eos requires an explicit temperature of 0" in resp.content
+    assert b"model_not_ready" not in resp.content
+    assert len(calls) == 1
+    assert getattr(prov_a, "startup_failures", 0) == 0
+
+
 def test_chat_completions_streams_sse(monkeypatch):
     prov_a = FakeProvider("http://a.example/v1", ["model-a"])
     main.PROVIDERS = [prov_a]
