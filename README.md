@@ -169,6 +169,17 @@ Requests for an eviction target are **line-cut** (served first out of the
 queue) and **drained** (in-flight I/O completes) before the model is actually
 unloaded, so no request is cut off mid-generation.
 
+A request claims its model for exactly as long as it lives: the claim is taken
+when the request is scheduled and returned when the request ends — **including
+when the client hangs up**. An editor that aborts a completion, a chat stopped
+with Esc, or an extension host that exits mid-generation cancels the request
+wherever it is parked (waiting on a model load, in the provider startup-retry
+loop, or relaying tokens), and the claim dies with it, so ctrl+e, the TTL sweep
+and budget reallocation all see the model as idle again. A model whose load
+finished for a client that already left stays resident as an ordinary idle
+model; a request abandoned *before* the coordinator reaches it is dropped
+without loading its model at all.
+
 Pressing **ctrl+e** in the terminal prunes every resident model that is not
 actively serving a request (in-flight I/O keeps a model resident; its
 pruning is never queued). It is a manual cleanup/eviction override — useful

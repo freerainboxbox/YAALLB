@@ -617,3 +617,119 @@ def test_ttl_disabled_no_eviction():
             await s.stop()
 
     run(scenario())
+
+
+# ---- leases: claims that cannot outlive their request ----
+
+
+class SlowLoadProvider(MemProvider):
+    """MemProvider whose load blocks, so a request can be abandoned mid-load."""
+
+    def __init__(self, endpoint_uri, memories, load_delay=0.0):
+        super().__init__(endpoint_uri, memories)
+        self._load_delay = load_delay
+        self.load_calls = []
+        self.unloads = []
+
+    def loadModel(self, model):
+        import time
+
+        self.load_calls.append(model.descriptor.modelId)
+        if self._load_delay:
+            time.sleep(self._load_delay)
+        model._loaded = True
+        self._loaded.append(model)
+
+    def unloadModel(self, model):
+        model._loaded = False
+        if model in self._loaded:
+            self._loaded.remove(model)
+        self.unloads.append(model.descriptor.modelId)
+
+
+def test_lease_cancelled_during_load_leaves_no_claim():
+    async def scenario():
+        p = SlowLoadProvider("http://a", {"m1": 100}, load_delay=0.3)
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        try:
+            lease = s.lease("m1", LoadOptions())
+            task = asyncio.create_task(lease.acquire())
+            await asyncio.sleep(0.05)  # parked in the load
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0.4)  # the coordinator finishes the load
+            assert p.load_calls == ["m1"]
+            # The claim died with the requester: the model is ordinary idle.
+            assert all(n == 0 for n in s.in_flight.values())
+            await s.evict_idle()
+            assert p.unloads == ["m1"]
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_lease_cancelled_while_queued_is_never_loaded():
+    async def scenario():
+        p = SlowLoadProvider("http://a", {"m1": 100, "m2": 100}, load_delay=0.3)
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        try:
+            first = s.lease("m1", LoadOptions())
+            second = s.lease("m2", LoadOptions())
+            t1 = asyncio.create_task(first.acquire())
+            t2 = asyncio.create_task(second.acquire())
+            await asyncio.sleep(0.05)  # m1 loading, m2 queued behind it
+            second.release()
+            t2.cancel()
+            await asyncio.gather(t2, return_exceptions=True)
+            await t1
+            assert p.load_calls == ["m1"], "abandoned request must not load"
+            assert [m.descriptor.modelId for m in s.resident] == ["m1"]
+            first.release()
+            assert all(n == 0 for n in s.in_flight.values())
+            await s.evict_idle()
+            assert p.unloads == ["m1"]
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_lease_release_is_idempotent():
+    async def scenario():
+        p = SlowLoadProvider("http://a", {"m1": 100})
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        try:
+            lease = s.lease("m1", LoadOptions())
+            await lease.acquire()
+            lease.release()
+            lease.release()
+            lease.release()
+            assert all(n == 0 for n in s.in_flight.values())
+        finally:
+            await s.stop()
+
+    run(scenario())
+
+
+def test_lease_release_before_acquire_owns_nothing():
+    async def scenario():
+        p = SlowLoadProvider("http://a", {"m1": 100})
+        s = Scheduler([p], budget_mib=1000)
+        await s.start()
+        try:
+            lease = s.lease("m1", LoadOptions())
+            lease.release()
+            with pytest.raises(asyncio.CancelledError):
+                await lease.acquire()
+            await asyncio.sleep(0.1)
+            assert p.load_calls == []
+            assert all(n == 0 for n in s.in_flight.values())
+        finally:
+            await s.stop()
+
+    run(scenario())

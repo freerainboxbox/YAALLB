@@ -20,6 +20,7 @@ import tty
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import anyio
 import httpx
 from fastapi import FastAPI
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -106,6 +107,21 @@ def _forward_body(body: dict, overrides: dict, provider: Provider) -> dict:
 
 # ctrl+e (ENQ, byte 0x05) triggers a manual prune of all idle models.
 CTRL_E = b"\x05"
+
+
+async def _aclose_quietly(client: "httpx.AsyncClient") -> None:
+    """Close an upstream client without letting the close cancel the request.
+
+    A client disconnect reaches us as a cancellation of this very task, so a
+    plain `await client.aclose()` on the way out can be re-cancelled and never
+    return. Shielded, the connection still gets closed and a failing close
+    never masks the request's own outcome.
+    """
+    with anyio.CancelScope(shield=True):
+        try:
+            await client.aclose()
+        except Exception:
+            pass
 
 
 async def input_monitor(scheduler: "Scheduler") -> None:
@@ -426,10 +442,9 @@ async def _forward_non_streaming(
     no startup-failure retry loop, and no success-code guarantee: a non-200
     upstream is passed through unchanged.
     """
+    lease = SCHEDULER.lease(model_id, LoadOptions(ctx_length=ctx_length))
     try:
-        model = await SCHEDULER.submit(
-            model_id, LoadOptions(ctx_length=ctx_length)
-        )
+        model = await lease.acquire()
     except ModelNotFound:
         log.error(f"model not found: {model_id}")
         return JSONResponse(
@@ -484,10 +499,12 @@ async def _forward_non_streaming(
         async with httpx.AsyncClient(timeout=None) as client:
             upstream = await client.post(url, json=forward_body, headers=headers)
     finally:
-        # Always release the scheduled model, even if the upstream post raises
-        # (network error, upstream reset): otherwise it stays resident with
-        # in_flight=1 forever, wedging eviction and hanging stop()'s drain.
-        SCHEDULER.release(model)
+        # Always give the claim back, even when the upstream post raises
+        # (network error, upstream reset) or this task is cancelled (the client
+        # hung up): a claim that outlives its request leaves the model resident
+        # and unevictable, wedges eviction and hangs stop()'s drain. The lease
+        # release is synchronous and first, so nothing can be skipped.
+        lease.release()
     return Response(
         upstream.content,
         status_code=upstream.status_code,
@@ -564,10 +581,9 @@ async def chat_completions(body: dict):
         # before the scheduler finishes a potentially long model load.
         yield _sse({"status": "processing", "model": model_id, "choices": []})
 
+        lease = SCHEDULER.lease(model_id, LoadOptions(ctx_length=ctx_length))
         try:
-            model = await SCHEDULER.submit(
-                model_id, LoadOptions(ctx_length=ctx_length)
-            )
+            model = await lease.acquire()
         except ModelNotFound:
             log.error(f"model not found: {model_id}")
             yield _sse_error(
@@ -616,137 +632,147 @@ async def chat_completions(body: dict):
         # retry budget, so a slow background load doesn't exhaust the retry
         # budget and SSE-error while LM Studio later completes the request
         # "into the void".
-        failures = 0
-        ready_retries = 0
-        while True:
-            client = httpx.AsyncClient(timeout=None)
-            try:
-                upstream = await client.send(
-                    client.build_request(
-                        "POST", url, json=forward_body, headers=headers
-                    ),
-                    stream=True,
-                )
-            except httpx.HTTPError as e:
-                await client.aclose()
-                # A spawned provider (llama_cpp/ds4/dflash-mlx) not answering
-                # means its model isn't actually ready yet; track that load state.
-                if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx"):
-                    model._load_state = "loading"
-                failures = _bump_startup_failures(provider, f"connection error: {e}")
-            else:
-                if upstream.status_code == 200:
-                    provider.startup_failures = 0
-                    # A spawned provider that transiently 4XX'd/errored was
-                    # marked "loading"; a successful forward means it is ready.
-                    if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx"):
-                        model._load_state = "ready"
-                    break
-
-                if provider._type_id in _RELAYS_UPSTREAM_ERRORS:
-                    # Of these, only LM Studio says "still loading", and only
-                    # with a 404 on /chat/completions; anything else is a
-                    # genuine upstream error. Distinguish them so a slow
-                    # background load doesn't exhaust the retry budget (404)
-                    # while a malformed request or over-long prompt doesn't fire
-                    # a hot loop of duplicate retries and misreport as "model
-                    # not ready" (other 4XX).
-                    if provider._type_id == "lms" and upstream.status_code == 404:
-                        await client.aclose()
-                        try:
-                            await asyncio.to_thread(
-                                provider.wait_loaded, model.descriptor.modelId
-                            )
-                        except Exception as e:
-                            log.error(
-                                f"model {model_id} never became ready on "
-                                f"{provider.endpoint_uri}: {e}"
-                            )
-                            SCHEDULER.release(model)
-                            yield _sse_error(
-                                "model_not_ready",
-                                f"model `{model_id}` never became ready: {e}",
-                            )
-                            return
-                        ready_retries += 1
-                        if ready_retries >= STARTUP_ATTEMPTS:
-                            log.error(
-                                f"model {model_id} kept returning "
-                                f"{upstream.status_code} on "
-                                f"{provider.endpoint_uri} after "
-                                f"{STARTUP_ATTEMPTS} readiness waits"
-                            )
-                            SCHEDULER.release(model)
-                            yield _sse_error(
-                                "model_not_ready",
-                                f"model `{model_id}` is not ready on "
-                                f"{provider.endpoint_uri}",
-                            )
-                            return
-                        continue
-                    # Any other non-200 (400 malformed request, 422 context
-                    # overflow, 401 auth, 5XX) is a genuine upstream error, not
-                    # a readiness signal: relay the upstream error body as an
-                    # SSE error instead of retrying in a hot loop. (Named
-                    # err_body — NOT `body`, which shadows the request-body
-                    # parameter and would trip UnboundLocalError in this scope.)
-                    err_body = b""
-                    try:
-                        async for chunk in upstream.aiter_raw():
-                            err_body += chunk
-                    except httpx.HTTPError:
-                        err_body = b""
-                    await client.aclose()
-                    SCHEDULER.release(model)
-                    yield _sse_error(
-                        "upstream_error",
-                        f"upstream {provider.endpoint_uri} returned "
-                        f"{upstream.status_code}: "
-                        f"{err_body.decode(errors='replace')[:512]}",
-                    )
-                    return
-
-                await client.aclose()
-                # A spawned provider (llama_cpp/dflash-mlx) returning non-200
-                # means its model isn't actually ready yet; track that load
-                # state so the retry below continues until readiness.
-                if provider._type_id in ("llama_cpp", "dflash-mlx"):
-                    model._load_state = "loading"
-                failures = _bump_startup_failures(
-                    provider, f"upstream status {upstream.status_code}"
-                )
-            if failures < STARTUP_ATTEMPTS:
-                await asyncio.sleep(2)
-                continue
-            log.error(
-                f"provider {provider.endpoint_uri} failed to start "
-                f"after {STARTUP_ATTEMPTS} attempts"
-            )
-            SCHEDULER.release(model)
-            # Read the tracked load state to classify the exhaustion: a spawned
-            # provider whose model never became ready (load_state still
-            # "loading") is a readiness failure (model_not_ready), not a
-            # generic provider-start failure.
-            if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx") and model.load_state != "ready":
-                yield _sse_error(
-                    "model_not_ready",
-                    f"model `{model_id}` is not ready on "
-                    f"{provider.endpoint_uri}",
-                )
-            else:
-                yield _sse_error(
-                    "provider_start_failed",
-                    f"provider {provider.endpoint_uri} failed to start",
-                )
-            return
-
-        # Relay the upstream SSE stream chunk-for-chunk.
+        #
+        # Everything after the model is ours -- the startup retry loop and
+        # the relay -- sits under one finally. A client that hangs up gets
+        # cancelled at whatever await it is parked on (waiting for a
+        # provider to answer, sitting in a retry sleep, parked in
+        # wait_loaded, or mid-generation), and no such path may keep
+        # holding the model.
+        client = None
         try:
+            failures = 0
+            ready_retries = 0
+            while True:
+                client = httpx.AsyncClient(timeout=None)
+                try:
+                    upstream = await client.send(
+                        client.build_request(
+                            "POST", url, json=forward_body, headers=headers
+                        ),
+                        stream=True,
+                    )
+                except httpx.HTTPError as e:
+                    await _aclose_quietly(client)
+                    # A spawned provider (llama_cpp/ds4/dflash-mlx) not answering
+                    # means its model isn't actually ready yet; track that load state.
+                    if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx"):
+                        model._load_state = "loading"
+                    failures = _bump_startup_failures(provider, f"connection error: {e}")
+                else:
+                    if upstream.status_code == 200:
+                        provider.startup_failures = 0
+                        # A spawned provider that transiently 4XX'd/errored was
+                        # marked "loading"; a successful forward means it is ready.
+                        if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx"):
+                            model._load_state = "ready"
+                        break
+
+                    if provider._type_id in _RELAYS_UPSTREAM_ERRORS:
+                        # Of these, only LM Studio says "still loading", and only
+                        # with a 404 on /chat/completions; anything else is a
+                        # genuine upstream error. Distinguish them so a slow
+                        # background load doesn't exhaust the retry budget (404)
+                        # while a malformed request or over-long prompt doesn't fire
+                        # a hot loop of duplicate retries and misreport as "model
+                        # not ready" (other 4XX).
+                        if provider._type_id == "lms" and upstream.status_code == 404:
+                            await _aclose_quietly(client)
+                            try:
+                                await asyncio.to_thread(
+                                    provider.wait_loaded, model.descriptor.modelId
+                                )
+                            except Exception as e:
+                                log.error(
+                                    f"model {model_id} never became ready on "
+                                    f"{provider.endpoint_uri}: {e}"
+                                )
+                                yield _sse_error(
+                                    "model_not_ready",
+                                    f"model `{model_id}` never became ready: {e}",
+                                )
+                                return
+                            ready_retries += 1
+                            if ready_retries >= STARTUP_ATTEMPTS:
+                                log.error(
+                                    f"model {model_id} kept returning "
+                                    f"{upstream.status_code} on "
+                                    f"{provider.endpoint_uri} after "
+                                    f"{STARTUP_ATTEMPTS} readiness waits"
+                                )
+                                yield _sse_error(
+                                    "model_not_ready",
+                                    f"model `{model_id}` is not ready on "
+                                    f"{provider.endpoint_uri}",
+                                )
+                                return
+                            continue
+                        # Any other non-200 (400 malformed request, 422 context
+                        # overflow, 401 auth, 5XX) is a genuine upstream error, not
+                        # a readiness signal: relay the upstream error body as an
+                        # SSE error instead of retrying in a hot loop. (Named
+                        # err_body — NOT `body`, which shadows the request-body
+                        # parameter and would trip UnboundLocalError in this scope.)
+                        err_body = b""
+                        try:
+                            async for chunk in upstream.aiter_raw():
+                                err_body += chunk
+                        except httpx.HTTPError:
+                            err_body = b""
+                        await _aclose_quietly(client)
+                        yield _sse_error(
+                            "upstream_error",
+                            f"upstream {provider.endpoint_uri} returned "
+                            f"{upstream.status_code}: "
+                            f"{err_body.decode(errors='replace')[:512]}",
+                        )
+                        return
+
+                    await _aclose_quietly(client)
+                    # A spawned provider (llama_cpp/dflash-mlx) returning non-200
+                    # means its model isn't actually ready yet; track that load
+                    # state so the retry below continues until readiness.
+                    if provider._type_id in ("llama_cpp", "dflash-mlx"):
+                        model._load_state = "loading"
+                    failures = _bump_startup_failures(
+                        provider, f"upstream status {upstream.status_code}"
+                    )
+                if failures < STARTUP_ATTEMPTS:
+                    await asyncio.sleep(2)
+                    continue
+                log.error(
+                    f"provider {provider.endpoint_uri} failed to start "
+                    f"after {STARTUP_ATTEMPTS} attempts"
+                )
+                # Read the tracked load state to classify the exhaustion: a spawned
+                # provider whose model never became ready (load_state still
+                # "loading") is a readiness failure (model_not_ready), not a
+                # generic provider-start failure.
+                if provider._type_id in ("llama_cpp", "ds4", "dflash-mlx") and model.load_state != "ready":
+                    yield _sse_error(
+                        "model_not_ready",
+                        f"model `{model_id}` is not ready on "
+                        f"{provider.endpoint_uri}",
+                    )
+                else:
+                    yield _sse_error(
+                        "provider_start_failed",
+                        f"provider {provider.endpoint_uri} failed to start",
+                    )
+                return
+
+            # Relay the upstream SSE stream chunk-for-chunk.
             async for chunk in upstream.aiter_raw():
                 yield chunk
         finally:
-            await client.aclose()
-            SCHEDULER.release(model)
+            # Release first, and synchronously. This finally can run while
+            # the task is being cancelled by a client disconnect, where any
+            # await raises again and would skip whatever came after it. A
+            # claim left here keeps the model resident and unevictable by
+            # ctrl+e, the TTL sweep and reallocation until YAALLB restarts.
+            lease.release()
+            if client is not None:
+                await _aclose_quietly(client)
 
     return StreamingResponse(
         event_stream(),
