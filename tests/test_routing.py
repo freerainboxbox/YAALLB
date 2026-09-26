@@ -10,6 +10,7 @@ from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.model import Model as BaseModel
 from abstractions.provider import Provider
+from abstractions.routing import lookup_model
 from scheduling import Scheduler
 
 
@@ -2036,6 +2037,79 @@ def test_forward_body_filters_internal_override_keys():
     assert "on_start" not in fb
     assert fb["temperature"] == 0.7
     assert fb["max_tokens"] == 262144
+
+
+def test_forward_body_sends_the_upstream_model_id():
+    # A provider that publishes IDs its engine does not know (ds4's
+    # `custom-prefix`) says so through upstream_model_id(); the wire keeps the
+    # spelling the engine matches on.
+    prov = FakeProvider("http://a.example/v1", ["acme/m"])
+    prov.upstream_model_id = lambda model_id: model_id.removeprefix("acme/")
+    body = {"model": "acme/m", "messages": []}
+    assert main._forward_body(body, {}, prov)["model"] == "m"
+
+
+def test_forward_body_keeps_the_model_of_a_provider_without_a_prefix():
+    prov = FakeProvider("http://a.example/v1", ["m"])
+    body = {"model": "m", "messages": []}
+    assert main._forward_body(body, {}, prov)["model"] == "m"
+
+
+def test_ds4_custom_prefix_reaches_the_engine_unprefixed(monkeypatch):
+    # End to end: a client asks for the published id, the scheduler routes and
+    # budgets it, and ds4 - whose alias tables are exact string compares - gets
+    # the alias it actually knows. Otherwise `acme/deepseek-chat` would be an
+    # unknown model to ds4 and would answer with thinking on.
+    from providers.dwarfstar import DwarfStarProvider
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=0):
+            pass
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr("providers.dwarfstar.subprocess.Popen", lambda *a, **kw: FakeProcess())
+    monkeypatch.setattr(
+        "abstractions.ready.httpx.get",
+        lambda url, headers=None: type("Resp", (), {"status_code": 200})(),
+    )
+    monkeypatch.setattr("providers.dwarfstar.ds4_estimate", lambda **kw: {})
+    monkeypatch.setattr("providers.dwarfstar.ds4_estimate_mib", lambda result, sessions=1: 1024.0)
+
+    prov = DwarfStarProvider(
+        config={
+            "ds4_dir": "/tmp/ds4",
+            "gguf_path": "m.gguf",
+            "custom-prefix": "acme/",
+        }
+    )
+    main.PROVIDERS = [prov]
+    main.SCHEDULER = Scheduler(main.PROVIDERS, 24576)
+
+    fake = FakeAsyncClient(stream=FakeStreamResponse())
+    monkeypatch.setattr("main.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    with TestClient(main.app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "acme/deepseek-chat", "messages": [], "stream": True},
+        )
+
+    assert resp.status_code == 200
+    method, url, json, headers = fake.calls[0]
+    assert json["model"] == "deepseek-chat"
+    # YAALLB's own bookkeeping stays in the published vocabulary: that is the id
+    # the client used, and the one model_overrides and eviction are keyed by.
+    assert main.SCHEDULER.resident[0].descriptor.modelId == "acme/deepseek-chat"
+    # And the engine's own id is not routable on its own any more.
+    assert lookup_model(main.PROVIDERS, "deepseek-chat") is None
 
 
 def test_chat_completions_client_ctx_wins_over_override(monkeypatch):

@@ -19,6 +19,7 @@ import pytest
 
 from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
+from abstractions.routing import lookup_model
 from providers.dwarfstar import DwarfStarProvider
 from providers.ds4_models import (
     DS4_DEFAULT_MAX_COMPLETION_TOKENS,
@@ -514,3 +515,118 @@ def test_unknown_model_profile_is_rejected(no_network):
     # Raised while the provider is built, i.e. at startup, not on first request.
     with pytest.raises(ValueError, match="model_profile"):
         _provider(model_profile="no-such-model")
+
+
+# --------------------------------------------------------------------------- #
+# custom-prefix: publishing one instance's IDs under a name the operator chose.
+#
+# ds4's own IDs are fixed, so two trees of one family answer the same strings
+# and only the first one in config.json is ever reachable. `custom-prefix` puts
+# whatever the operator wants in front of every ID this instance publishes,
+# which renames its whole surface at once: descriptors, /v1/models, and with
+# them routing, budgeting and eviction.
+# --------------------------------------------------------------------------- #
+
+
+def test_custom_prefix_renames_every_published_id(no_network):
+    provider = _provider(**{"custom-prefix": "acme/"})
+
+    assert [d.modelId for d in provider.getModelsDescriptors()] == [
+        f"acme/{alias}" for alias in DEEPSEEK_V4_IDS
+    ]
+    # /v1/models is what a client discovers, so it has to say the routable
+    # spelling rather than the one only ds4 knows.
+    assert [m["id"] for m in provider.getOAIModels()] == [
+        f"acme/{alias}" for alias in DEEPSEEK_V4_IDS
+    ]
+
+
+def test_custom_prefix_is_spelled_with_either_separator(no_network):
+    # Every other key of this provider is an underscore name, and `options`
+    # already treats a ds4 flag's dashes and underscores as one spelling, so a
+    # config written in either vocabulary works.
+    dashed = _provider(**{"custom-prefix": "acme/"})
+    underscored = _provider(custom_prefix="acme/")
+
+    assert [d.modelId for d in underscored.getModelsDescriptors()] == [
+        d.modelId for d in dashed.getModelsDescriptors()
+    ]
+
+
+def test_two_instances_of_one_family_are_routable_apart(no_network):
+    # The reason the key exists: without it both instances answer
+    # `deepseek-v4-flash` and lookup_model hands every request to whichever
+    # instance config.json lists first.
+    first = _provider(**{"custom-prefix": "a/", "port": 8000})
+    second = _provider(**{"custom-prefix": "b/", "port": 8001})
+
+    # Both trees answer exactly the same ds4 aliases; only the prefix tells
+    # them apart from the outside.
+    assert first.served_ids == second.served_ids
+    assert lookup_model([first, second], "a/deepseek-v4-flash") is first
+    assert lookup_model([first, second], "b/deepseek-v4-flash") is second
+    # The bare ds4 id belongs to neither of them any more.
+    assert lookup_model([first, second], "deepseek-v4-flash") is None
+
+
+def test_custom_prefix_renames_the_ids_ds4_reports_too(no_network, estimator):
+    # The prefix is applied to whatever this instance ends up serving, so it
+    # cannot be a list maintained next to the registry the registry replaces.
+    renamed = ["qwen3.8-flash-next-v2", "qwen3.8-flash-next-v2-chat"]
+    estimator(_estimate(model_aliases=renamed))
+    provider = _provider(**{"custom-prefix": "acme/"})
+    provider._estimate(8192)
+
+    assert [d.modelId for d in provider.getModelsDescriptors()] == [
+        "acme/qwen3.8-flash-next-v2",
+        "acme/qwen3.8-flash-next-v2-chat",
+        *[f"acme/{alias}" for alias in QWEN38_THINKING],
+    ]
+
+
+def test_a_prefixed_id_reaches_ds4_as_ds4s_own_alias(no_network):
+    # ds4 matches model aliases by exact string (ds4_server.c
+    # model_alias_disables_thinking / model_alias_enables_thinking), so the
+    # prefix has to be gone before the request leaves YAALLB. A
+    # `acme/deepseek-chat` forwarded verbatim is an alias ds4 does not know,
+    # and thinking would stay on.
+    provider = _provider(**{"custom-prefix": "acme/"})
+
+    assert provider.upstream_model_id("acme/deepseek-chat") == "deepseek-chat"
+    assert (
+        provider.upstream_model_id("acme/qwen3.8-flash-next-nothink")
+        == "qwen3.8-flash-next-nothink"
+    )
+    # An id the prefix is not on is not this instance's to rewrite, and an
+    # instance without a prefix never rewrites anything.
+    assert provider.upstream_model_id("deepseek-chat") == "deepseek-chat"
+    assert _provider().upstream_model_id("deepseek-chat") == "deepseek-chat"
+
+
+def test_custom_prefix_leaves_ds4s_own_ids_alone(no_network):
+    # Everything internal - ds4's alias tables, the registry comparison, the
+    # model_overrides a request's own id resolves against - keeps working in
+    # the engine's vocabulary; only what is published is renamed.
+    provider = _provider(**{"custom-prefix": "acme/"})
+
+    assert provider.served_ids == tuple(DEEPSEEK_V4_IDS)
+    assert "acme/deepseek-v4-flash" not in provider.served_ids
+
+
+def test_conflicting_custom_prefix_spellings_are_rejected(no_network):
+    # Both spellings are accepted, so two that disagree are a config nobody
+    # can mean, and it says so at startup rather than serving one of them.
+    with pytest.raises(ValueError, match="custom-prefix"):
+        _provider(**{"custom-prefix": "a/", "custom_prefix": "b/"})
+
+
+def test_a_non_string_custom_prefix_is_rejected(no_network):
+    with pytest.raises(ValueError, match="custom-prefix"):
+        _provider(**{"custom-prefix": 42})
+
+
+def test_an_empty_custom_prefix_publishes_the_engine_ids(no_network):
+    # Nothing in front is the same instance with nothing in front.
+    provider = _provider(**{"custom-prefix": ""})
+    assert [d.modelId for d in provider.getModelsDescriptors()] == DEEPSEEK_V4_IDS
+    assert provider.upstream_model_id("deepseek-chat") == "deepseek-chat"

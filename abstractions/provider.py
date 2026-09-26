@@ -52,6 +52,17 @@ class Provider(ABC):
         resp.raise_for_status()
         return resp.json().get("data", [])
 
+    def upstream_model_id(self, model_id: str) -> str:
+        """The model ID the engine knows for a published model ID.
+
+        Default: the ID as it was asked for, which is what every provider whose
+        published ID *is* its engine's own ID (lms, llama_cpp, dflash-mlx)
+        wants. Override only where a provider publishes IDs its engine does not
+        know - ds4's `custom-prefix` - because an engine that matches model
+        aliases by exact string would not recognise them.
+        """
+        return model_id
+
     def _auth_headers(self) -> dict:
         if getattr(self, "api_key", None):
             return {"Authorization": f"Bearer {self.api_key}"}
