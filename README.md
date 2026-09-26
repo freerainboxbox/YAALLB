@@ -323,6 +323,7 @@ directory.
 | `estimate_binary` | `./ds4-estimate` | no — footprint estimator, relative to `ds4_dir` (see "VRAM footprint")   |
 | `ctx_length`    | —                | no — provider-level context length, overrides the per-model one          |
 | `model_profile` | detected         | no — which ds4 model family this instance serves (see "served models")   |
+| `custom-prefix` | —                | no — text in front of every model ID this instance publishes (see below) |
 | `env`           | `{}`             | no — extra environment for `ds4-server` **and** the footprint estimator   |
 | `ready_timeout` | `120`            | no — seconds to wait for a spawned `ds4-server` to answer                 |
 
@@ -485,6 +486,26 @@ whose requests fail.
   IDs (`"model_profile": "qwen3.8-flash-next"`), a typo fails startup with the
   names it accepts, and a disagreement with what ds4 reports is logged while
   config keeps winning.
+- `custom-prefix` renames what one instance **publishes**: every ID above is
+  registered, advertised, routed and budgeted with that text in front
+  (`"custom-prefix": "acme/"` → `acme/deepseek-v4-flash`, `acme/deepseek-chat`).
+  The spelling with a dash is the documented one, and `custom_prefix` is
+  accepted too; two spellings that disagree, or a prefix that is not text, fail
+  startup like any other wrong ds4 key. An empty prefix renames nothing.
+- The reason that key exists is that one ds4 build answers a **fixed** set of
+  IDs: two instances of one family advertise the same strings otherwise, and
+  routing hands every request to whichever instance config.json lists first.
+  `acme/` is arbitrary — anything that makes an instance's IDs its own works
+  (`qwen/`, `instance-0/`, `team-a/`).
+- A prefix never reaches ds4. It is taken back off the `model` field of the
+  forwarded request, because ds4 matches aliases by exact string
+  (`ds4_server.c` `server_model_alias_known`, `model_alias_disables_thinking`,
+  `model_alias_enables_thinking`), so an `acme/deepseek-chat` that arrived
+  verbatim would be an unknown model answering with thinking left on.
+  Everything internal — family detection, the registry, ds4's thinking tables —
+  keeps speaking ds4's own IDs, and `model_overrides` (with `on_start` in it)
+  is keyed by the ID a request asked for, so under a prefix it takes the
+  prefixed spelling.
 - A GGUF ds4 recognises but YAALLB has no profile for keeps being presented as
   `deepseek-v4-flash` and its aliases, with a warning naming the family it saw;
   add the family to `providers/ds4_models.py` to serve it properly.

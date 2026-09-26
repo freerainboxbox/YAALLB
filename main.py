@@ -93,7 +93,11 @@ def _forward_body(body: dict, overrides: dict, provider: Provider) -> dict:
     internal model overrides as defaults, defaulting max_tokens to the
     provider's generation capacity so a spawned provider never falls back to a
     small CLI max_tokens and stops mid-thought. An explicit client max_tokens
-    is always respected (setdefault only fills when absent)."""
+    is always respected (setdefault only fills when absent).
+
+    The model id is rewritten to the spelling the engine knows, which is the
+    client's own unless the provider publishes ids its engine does not answer
+    to (ds4's `custom-prefix`)."""
     forward_body = dict(body)
     for key, value in overrides.items():
         if key in INTERNAL_OVERRIDE_KEYS:
@@ -102,6 +106,9 @@ def _forward_body(body: dict, overrides: dict, provider: Provider) -> dict:
     default_max_tokens = _default_max_tokens(provider)
     if default_max_tokens is not None:
         forward_body.setdefault("max_tokens", default_max_tokens)
+    model_id = forward_body.get("model")
+    if isinstance(model_id, str):
+        forward_body["model"] = provider.upstream_model_id(model_id)
     return forward_body
 
 

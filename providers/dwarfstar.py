@@ -120,6 +120,36 @@ DS4_OPTIONS = {
 }
 
 
+# Config keys spelled with a dash in config.json, and the attribute each one
+# configures. Provider.__init__ setattr()s every key it is given, so a dashed
+# key has to be renamed before it gets there or it lands as an attribute no
+# code can name without getattr().
+_DASHED_CONFIG_KEYS = {"custom-prefix": "custom_prefix"}
+
+
+def _config_attributes(config: dict | None) -> dict:
+    """The instance config with dashed keys renamed to their attributes.
+
+    `custom-prefix` is the documented spelling and `custom_prefix` is accepted
+    as well: every other key of this provider is an underscore name, and
+    `options` already treats a ds4 flag's dashes and underscores as one
+    spelling. Two spellings of one key that disagree is a config nobody can
+    mean, so it fails at startup like every other wrong ds4 key does.
+    """
+    normalized = dict(config or {})
+    for key, attribute in _DASHED_CONFIG_KEYS.items():
+        if key not in normalized:
+            continue
+        value = normalized.pop(key)
+        if attribute in normalized and normalized[attribute] != value:
+            raise ValueError(
+                f"{key} and {attribute} are one ds4 setting spelled two ways, "
+                f"and they disagree ({value!r} vs {normalized[attribute]!r})"
+            )
+        normalized.setdefault(attribute, value)
+    return normalized
+
+
 class DwarfStarProvider(Provider):
     _type_id = "ds4"
     single_resident = True
@@ -143,6 +173,12 @@ class DwarfStarProvider(Provider):
         self.estimate_binary: str = DS4_DEFAULT_ESTIMATOR
         self.options: dict = {}
         self.ctx_length: int | None = None
+        # In front of every model ID this instance publishes: one ds4 tree
+        # answers its own fixed aliases, so two trees of one family would
+        # otherwise answer the same strings and only the first one in
+        # config.json would ever be reachable. Requests come back in this
+        # vocabulary and lose it again on the way to ds4 (see upstream_model_id).
+        self.custom_prefix: str | None = None
         # ds4 reads a handful of knobs from the environment only, and several of
         # them change the footprint (static YaRN resizes what a context costs), so
         # they go to the server and to the estimator alike.
@@ -164,10 +200,11 @@ class DwarfStarProvider(Provider):
         self._identity_adopted = False
         # The model IDs the ds4 build reported for the opened GGUF. Once ds4
         # has answered, its list - not the registry - is what this instance
-        # routes, advertises and budgets.
+        # answers, and published_ids is what it routes, advertises and budgets.
         self._served_ids: tuple[str, ...] | None = None
-        super().__init__(_instance_id, config)
+        super().__init__(_instance_id, _config_attributes(config))
         self._explicit_profile = self._resolve_profile()
+        self._validate_custom_prefix()
 
     @property
     def served_profile(self) -> Ds4ModelProfile:
@@ -176,12 +213,63 @@ class DwarfStarProvider(Provider):
 
     @property
     def served_ids(self) -> tuple[str, ...]:
-        """The model IDs this instance answers, in advertisement order.
+        """The IDs ds4 itself answers for this instance, in advertisement order.
 
-        ds4's own list once its estimator has run (see _adopt_identity), the
-        registry's for the family until then.
+        ds4's own vocabulary, prefix or no prefix: ds4's list once its estimator
+        has run (see _adopt_identity), the registry's for the family until then.
+        What clients see is published_ids.
         """
         return self._served_ids or self.served_profile.served()
+
+    @property
+    def published_ids(self) -> tuple[str, ...]:
+        """The IDs this instance is registered and advertised under.
+
+        ds4's own IDs with `custom-prefix` in front of them, which renames the
+        whole published surface at once: routing, budgeting, eviction and
+        /v1/models all key on these. Everything internal keeps speaking ds4's
+        own aliases (see served_ids and upstream_model_id), so detection, the
+        registry comparison and the ds4 alias tables are untouched by a prefix.
+        """
+        return tuple(self._publish(alias) for alias in self.served_ids)
+
+    def _publish(self, model_id: str) -> str:
+        return f"{self.custom_prefix}{model_id}" if self.custom_prefix else model_id
+
+    def upstream_model_id(self, model_id: str) -> str:
+        """The alias ds4 answers for a published ID of this instance.
+
+        ds4 matches model aliases by exact string (ds4_server.c
+        server_model_alias_known, model_alias_disables_thinking,
+        model_alias_enables_thinking), so the prefix has to be off before the
+        request leaves YAALLB: `acme/deepseek-chat` that arrives verbatim is an
+        alias ds4 does not know, and would answer with thinking left on.
+
+        An ID the prefix is not on is passed through unchanged - it is not this
+        instance's to rewrite.
+        """
+        prefix = self.custom_prefix
+        if prefix and model_id.startswith(prefix):
+            return model_id[len(prefix) :]
+        return model_id
+
+    def _validate_custom_prefix(self) -> None:
+        """A prefix is text, or it is nothing at all.
+
+        Wrong here means every ID of this instance is published under a name no
+        client can ask for, so config says so at startup rather than a model
+        list saying it later. An empty prefix renames nothing, and normalising
+        it away keeps one spelling of "no prefix" in this instance's state.
+        """
+        if self.custom_prefix is None:
+            return
+        if not isinstance(self.custom_prefix, str):
+            raise ValueError(
+                "custom-prefix must be the text to put in front of this ds4 "
+                f"instance's model ids, got {self.custom_prefix!r}"
+            )
+        if not self.custom_prefix:
+            self.custom_prefix = None
 
     def _resolve_profile(self) -> Ds4ModelProfile:
         """The configured model profile, or the family YAALLB always assumed.
@@ -369,7 +457,7 @@ class DwarfStarProvider(Provider):
         # Every id this instance answers is registered, because each is a
         # request YAALLB has to route (and budget) - and the thinking aliases
         # only work if clients can name them.
-        return [ModelDescriptor(alias, self) for alias in self.served_ids]
+        return [ModelDescriptor(alias, self) for alias in self.published_ids]
 
     def _display_name(self) -> str:
         # ds4's own shape name: it tells Flash from PRO (one profile, one family)
@@ -401,7 +489,7 @@ class DwarfStarProvider(Provider):
                 "supported_parameters": DS4_SUPPORTED_PARAMETERS,
             }
 
-        return [model_entry(alias) for alias in self.served_ids]
+        return [model_entry(alias) for alias in self.published_ids]
 
     def createModel(
         self, descriptor: ModelDescriptor, loadOptions: LoadOptions
