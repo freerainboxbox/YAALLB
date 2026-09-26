@@ -48,6 +48,20 @@ TTL_CHECK_INTERVAL = 1.0
 QUIESCE_STALL_NOTICE = 30.0
 
 
+def _descriptor_ids(provider: Provider) -> set:
+    """Every model id a provider answers for, resolved off the event loop.
+
+    A descriptor lookup can block on provider HTTP (LM Studio TTL miss), so
+    callers run this through a thread.
+    """
+    try:
+        return {d.modelId for d in provider.getModelsDescriptors()}
+    except Exception:
+        # An unreachable provider cannot tell us its ids; the caller falls back
+        # to exact-id matching, which needs nothing from it.
+        return set()
+
+
 class ModelNotFound(Exception):
     def __init__(self, model_id: str) -> None:
         super().__init__(f"model not found: {model_id}")
@@ -176,10 +190,16 @@ class Scheduler:
         self.resident: list[Model] = []
         self.pending: list[Lease] = []  # queued requests, waiting to be served
         self.in_flight: dict[Model, int] = defaultdict(int)
-        # Requests the coordinator has dequeued but not granted yet (i.e. a
-        # load in progress). Keeps stop() from calling the system quiescent
-        # while a model is half-loaded.
-        self.serving = 0
+        # Leases the coordinator has dequeued but not granted yet (i.e. a load
+        # in progress). Keeps stop() from calling the system quiescent while a
+        # model is half-loaded, and keeps those models out of a prune: the
+        # request is already committed to them.
+        self.serving: set[Lease] = set()
+        # Models whose unload is currently dispatched (a prune running in the
+        # input/TTL task). The coordinator will not grant one of these: for a
+        # provider whose unload terminates a spawned server, granting it would
+        # forward the request to a port that is about to close.
+        self._evicting: set[Model] = set()
         # monotonic() timestamp of when each model last finished a request.
         self.last_finish: dict[Model, float] = {}
         # Model ids that must never be evicted (on_start "always" models).
@@ -294,24 +314,80 @@ class Scheduler:
             return
         lease.future.set_exception(exc)
 
+    def _waiting_on(self, served_ids: dict) -> set:
+        """Resident models some request is queued for or being served for.
+
+        A claim only lands when the coordinator reaches a queue entry, so
+        between "a client asked for this model" and "the claim was granted"
+        the model would otherwise look idle. A provider that keeps one
+        resident model and answers every one of its ids from it (ds4) is
+        targeted by any of its ids, not just the one that happens to be
+        resident, so `served_ids` maps those providers to their full id set.
+        """
+        wanted = {lease.model_id for lease in self.pending}
+        wanted |= {lease.model_id for lease in self.serving}
+        if not wanted:
+            return set()
+        waiting = set()
+        for m in self.resident:
+            if m.descriptor.modelId in wanted:
+                waiting.add(m)
+            elif getattr(m.descriptor.provider, "single_resident", False):
+                if wanted & served_ids.get(m.descriptor.provider, set()):
+                    waiting.add(m)
+        return waiting
+
+    async def _waiting_models(self) -> tuple[set, dict]:
+        """(_waiting_on, provider -> served ids) for the current queue.
+
+        The served-id sets are resolved once and handed back so a caller can
+        re-check without paying for provider HTTP again.
+        """
+        served_ids: dict = {}
+        if self.pending or self.serving:
+            for m in self.resident:
+                provider = m.descriptor.provider
+                if getattr(provider, "single_resident", False):
+                    served_ids.setdefault(
+                        provider, await asyncio.to_thread(_descriptor_ids, provider)
+                    )
+        return self._waiting_on(served_ids), served_ids
+
     async def _prune(self, predicate) -> None:
         """Unload every resident model that is idle, non-protected, and matches
         predicate.
 
-        In-flight models are left resident — their eviction is *not* queued —
-        so a running generation is never cut off. Used by the manual ctrl+e
-        prune (predicate always True) and the TTL auto-eviction.
+        Idle means no in-flight claim *and* no request queued for it or being
+        served toward it (see `_waiting_on`). Pruning a model a request is
+        waiting on is not a cosmetic mistake: for a provider whose unload
+        terminates a spawned server (ds4), the queued request is then
+        forwarded to a dead port and the client errors out or waits out a full
+        respawn. In-flight models are left resident -- their eviction is *not*
+        queued -- so a running generation is never cut off. Used by the manual
+        ctrl+e prune (predicate always True) and the TTL auto-eviction.
         """
-        to_evict = [
+        waiting, served_ids = await self._waiting_models()
+        candidates = [
             m for m in self.resident
             if self.in_flight[m] == 0
+            and m not in waiting
             and m.descriptor.modelId not in self.protected
             and predicate(m)
         ]
-        if not to_evict:
+        if not candidates:
             return
         running = sum(m.vram_mib() for m in self.resident)
-        for m in to_evict:
+        for m in candidates:
+            # Re-check per model: the unloads await off-thread, so a grant can
+            # land on a later candidate while an earlier one is being torn
+            # down, and a queue entry can appear while this prune is running.
+            if self.in_flight[m] > 0 or m in self._waiting_on(served_ids):
+                log.info(
+                    f"prune skipped model={m.descriptor.modelId} "
+                    f"provider={_provider_label(m.descriptor.provider)}: "
+                    "a request is waiting on it"
+                )
+                continue
             impact = m.vram_mib()
             running -= impact
             log.warning(
@@ -319,14 +395,19 @@ class Scheduler:
                 f"provider={_provider_label(m.descriptor.provider)}"
                 + _impact_suffix(running + impact, impact, is_evict=True)
             )
-            await asyncio.to_thread(m.descriptor.provider.unloadModel, m)
-        self.resident = [m for m in self.resident if m not in to_evict]
+            self._evicting.add(m)
+            try:
+                await asyncio.to_thread(m.descriptor.provider.unloadModel, m)
+            finally:
+                self._evicting.discard(m)
+            self.resident = [x for x in self.resident if x is not m]
 
     async def evict_idle(self) -> None:
-        """Prune every resident model that is not actively serving a request.
+        """Prune every resident model that no request holds or is waiting on.
 
         This is the cleanup path for a manual ctrl+e; it never cuts off a
-        running generation and skips protected models.
+        running generation, never pulls a model out from under a queued
+        request, and skips protected models.
         """
         await self._prune(lambda m: True)
 
@@ -359,10 +440,11 @@ class Scheduler:
             # The client hung up before the coordinator got to this request:
             # do not spend a load (and a claim) on nobody.
             return
-        # A load in progress is neither pending nor in-flight yet; count it so
-        # stop() won't see a served-but-unloaded request as quiescent and tear
-        # down the coordinator early.
-        self.serving += 1
+        # A request the coordinator has taken out of the queue but not granted
+        # yet is neither pending nor in-flight: track it as serving so stop()
+        # won't call that quiescent mid-load, and so no prune can evict the
+        # model this request is already committed to.
+        self.serving.add(lease)
         try:
             # Descriptor lookups can block on provider HTTP (LM Studio TTL
             # miss), so run them off the event loop like memory()/loadModel
@@ -374,6 +456,13 @@ class Scheduler:
                 self._reject(lease, ModelNotFound(model_id))
                 return
             resident = self._resident_for(provider, model_id)
+            if resident is not None and resident in self._evicting:
+                # A prune is tearing this model down right now. Wait for that
+                # to land (its process is reaped before the prune moves on) and
+                # resolve again, rather than serving from a dying server.
+                while resident in self._evicting:
+                    await asyncio.sleep(DRAIN_POLL_INTERVAL)
+                resident = self._resident_for(provider, model_id)
             if resident is not None:
                 self._grant(lease, resident)
                 return
@@ -424,7 +513,7 @@ class Scheduler:
         except Exception as e:
             self._reject(lease, e)
         finally:
-            self.serving -= 1
+            self.serving.discard(lease)
 
     async def preload_on_start(self, targets: list[tuple]) -> None:
         """Preload on_start models in deterministic order.

@@ -180,19 +180,30 @@ finished for a client that already left stays resident as an ordinary idle
 model; a request abandoned *before* the coordinator reaches it is dropped
 without loading its model at all.
 
-Pressing **ctrl+e** in the terminal prunes every resident model that is not
-actively serving a request (in-flight I/O keeps a model resident; its
-pruning is never queued). It is a manual cleanup/eviction override — useful
-when you want to free VRAM without a new load forcing evictions. YAALLB puts
-stdin in cbreak mode and reads one byte at a time, so ctrl+e is delivered
-immediately (it is not a signal). The prune skips `on_start: "always"`
-(protected) models and requires stdin to be a TTY (it no-ops when headless/
-piped).
+Pressing **ctrl+e** in the terminal prunes every resident model that is idle.
+It is a manual cleanup/eviction override — useful when you want to free VRAM
+without a new load forcing evictions. Idle means **no request holds it and no
+request is waiting on it**: in-flight I/O keeps a model resident, and so does a
+request that is still queued for it or being served toward it — including a
+request that names one of the other ids of a single-resident instance (ds4
+answers every id from its one loaded model). A model a request is waiting on
+logs `prune skipped model=...: a request is waiting on it` instead of being
+torn down, and its pruning is never queued. That distinction matters most for
+providers whose unload terminates a spawned server: pruning a model a request
+is about to be forwarded to would error that client out or cost it a full
+respawn. A model whose unload is already in flight is never granted to a new
+request either — the request waits for the teardown and then loads cleanly.
+YAALLB puts stdin in cbreak mode and reads one byte at a time, so ctrl+e is
+delivered immediately (it is not a signal). The prune skips `on_start:
+"always"` (protected) models and requires stdin to be a TTY (it no-ops when
+headless/piped).
 
 `ttl` (top-level, optional) is an idle-eviction timer in **seconds**: a
 resident model that has not finished a request for `>= ttl` seconds is
-auto-evicted in the background (skipping protected and in-flight models, so a
-running generation is never cut off). Setting `ttl` to `0` or omitting it
+auto-evicted in the background (skipping protected models, models with
+in-flight I/O, and models a request is queued for, so a running generation is
+never cut off and a queued request never loses its model). Setting `ttl` to
+`0` or omitting it
 disables the feature.
 
 On startup YAALLB sets the macOS Metal VRAM cap to match `wired_limit_mb` via
