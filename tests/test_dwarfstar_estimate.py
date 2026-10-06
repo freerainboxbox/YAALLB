@@ -20,7 +20,7 @@ from providers.dwarfstar import DwarfStarProvider, warm_dwarfstar_estimates
 from providers.lmstudio import LMStudioProvider
 
 ESTIMATE = {
-    "version": 3,
+    "version": 4,
     "model_name": "DeepSeek V4 Flash",
     "backend": "metal",
     "ctx": 8192,
@@ -64,9 +64,13 @@ MIB = 2**20
 def clean_estimate_caches():
     dse._ESTIMATE_CACHE.clear()
     dse._WARNED.clear()
+    dse._WARNED_NO_ACCESSOR.clear()
+    dse._WARNED_UNKNOWN_FAMILY.clear()
     yield
     dse._ESTIMATE_CACHE.clear()
     dse._WARNED.clear()
+    dse._WARNED_NO_ACCESSOR.clear()
+    dse._WARNED_UNKNOWN_FAMILY.clear()
 
 
 class FakeEstimator:
@@ -265,6 +269,141 @@ def test_run_estimator_rejects_a_foreign_schema(fake_estimator):
     fake_estimator(stdout="null")
     with pytest.raises(dse.Ds4EstimatorError, match="not an object"):
         dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
+
+def test_run_estimator_accepts_a_tree_without_the_drafter_accessor(
+    fake_estimator, monkeypatch
+):
+    # ds4_engine_spec_graph_memory_estimate() is not in released ds4: a tree
+    # without it cannot say what a drafter's per-session graph costs, and says
+    # so with null rather than a bool. That is a degraded answer, not a broken
+    # estimator: the measured per-session constant is budgeted in its place,
+    # loudly, instead of silently under-budgeting DSpark.
+    warned = []
+    monkeypatch.setattr(dse.log, "warning", lambda message: warned.append(message))
+    unknown = dict(
+        ESTIMATE,
+        spec_graph_supported=None,
+        spec_graph_bytes=0,
+        dspark_capture_bytes=0,
+        verifier_scratch_bytes=0,
+        host_scratch_bytes=0,
+    )
+    fake_estimator(stdout=json.dumps(unknown))
+
+    result = dse.run_estimator(
+        ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096, dspark=True
+    )
+
+    assert result["spec_graph_supported"] is None
+    assert result["spec_graph_bytes"] == int(
+        dse.DS4_DRAFTER_SCRATCH_FALLBACK_MIB * 2**20
+    )
+    assert any("ds4_engine_spec_graph_memory_estimate" in m for m in warned)
+
+    # One warning per tree, not per estimate: memory() runs per request.
+    dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=8192, dspark=True)
+    assert len(warned) == 1
+
+
+@pytest.mark.parametrize(
+    "family", ["qwen4exp", "deepseek41", "glm52", "glm53"]
+)
+def test_unknown_drafter_answer_stays_zero_without_a_drafter_graph(
+    fake_estimator, monkeypatch, family
+):
+    # ds4's accessor declines these families (they size their session graph
+    # outside the DeepSeek path), so "the tree cannot tell us" costs nothing
+    # for them: charging the DeepSeek-shaped constant would over-evict.
+    warned = []
+    monkeypatch.setattr(dse.log, "warning", lambda message: warned.append(message))
+    fake_estimator(
+        stdout=json.dumps(
+            dict(
+                ESTIMATE,
+                model_family=family,
+                spec_graph_supported=None,
+                spec_graph_bytes=0,
+            )
+        )
+    )
+
+    result = dse.run_estimator(
+        ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096, mtp_model="s.gguf"
+    )
+
+    assert result["spec_graph_bytes"] == 0
+    assert not warned
+
+
+def test_unknown_drafter_answer_is_zero_without_a_configured_drafter(
+    fake_estimator
+):
+    fake_estimator(
+        stdout=json.dumps(
+            dict(ESTIMATE, spec_graph_supported=None, spec_graph_bytes=0)
+        )
+    )
+
+    result = dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
+    assert result["spec_graph_bytes"] == 0
+
+
+def test_run_estimator_flags_a_shape_no_family_covers(fake_estimator, monkeypatch):
+    # A ds4 that grew a fifth model shape answers none of the family predicates
+    # the estimator asks, so it reports the unknown-family sentinel instead of
+    # defaulting to DeepSeek. YAALLB must say so: ds4's footprint numbers are
+    # still exact, but DeepSeek's model IDs are not this shape's, and presenting
+    # them would advertise a model the GGUF never serves.
+    warned = []
+    monkeypatch.setattr(dse.log, "warning", lambda message: warned.append(message))
+    fake_estimator(
+        stdout=json.dumps(
+            dict(
+                ESTIMATE,
+                model_name="DeepSeek V5 Nano",
+                model_family=dse.DS4_UNKNOWN_MODEL_FAMILY,
+                model_aliases=[dse.DS4_UNKNOWN_MODEL_FAMILY],
+            )
+        )
+    )
+
+    result = dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
+    assert result["model_family"] == dse.DS4_UNKNOWN_MODEL_FAMILY
+    # Still ds4's own arithmetic, not the flat fallback.
+    assert result["context_bytes"] == ESTIMATE["context_bytes"]
+    assert any("DeepSeek V5 Nano" in m for m in warned)
+    assert any(dse.DS4_UNKNOWN_MODEL_FAMILY in m for m in warned)
+
+    # Once per (tree, shape), not per request.
+    dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=8192)
+    assert len(warned) == 1
+
+
+def test_run_estimator_does_not_flag_a_known_family(fake_estimator, monkeypatch):
+    warned = []
+    monkeypatch.setattr(dse.log, "warning", lambda message: warned.append(message))
+    fake_estimator()
+
+    result = dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
+    assert result["model_family"] == "deepseek4"
+    assert not warned
+
+
+def test_fallback_prices_an_unnamed_family_from_nothing(fake_estimator, monkeypatch):
+    # The sentinel is not a family with a measured flat slope, so a model that
+    # needs the fallback cannot be priced from DeepSeek's numbers either.
+    dse._WARNED_UNKNOWN_FAMILY.clear()
+    with pytest.raises(dse.Ds4EstimatorError, match="flat VRAM model"):
+        dse.fallback_estimate(
+            ds4_dir="/tmp/ds4",
+            gguf_path="m.gguf",
+            ctx=4096,
+            model_family=dse.DS4_UNKNOWN_MODEL_FAMILY,
+        )
 
 
 def test_fallback_uses_real_gguf_sizes_plus_a_flat_ctx_term(tmp_path):
@@ -759,6 +898,36 @@ def test_estimate_mk_offers_a_cpu_only_variant():
     # The CPU switch must swap in the CPU object list itself: passing
     # CORE_OBJS="$(CPU_CORE_OBJS)" on a make command line is not portable.
     assert "CORE_OBJS := $(CPU_CORE_OBJS)" in makefile
+
+
+def test_estimate_mk_probes_for_the_drafter_accessor():
+    # The drafter-graph accessor is not in released ds4, so the estimator must
+    # build against a tree that lacks it. The fragment detects it by compiling
+    # the call, which catches a signature change as well as a rename.
+    makefile = (
+        Path(__file__).resolve().parent.parent / "tools" / "ds4-estimate.mk"
+    ).read_text()
+    assert "DS4_HAVE_SPEC_GRAPH_ACCESSOR" in makefile
+    assert "ds4_spec_probe.c" in makefile
+    # The DeepSeek identity is a default, so it has to be a checked one: only
+    # the shapes ds4's own server answers with the deepseek-v4 ids may be
+    # labelled deepseek4. Anything else is the unknown-family sentinel.
+    estimator = (
+        Path(__file__).resolve().parent.parent / "tools" / "ds4_estimate.c"
+    ).read_text()
+    assert "DS4_ESTIMATE_FAMILY_UNKNOWN" in estimator
+    assert '"DeepSeek V4 Flash"' in estimator
+    assert '"DeepSeek V4 Pro"' in estimator
+    probe = (
+        Path(__file__).resolve().parent.parent / "tools" / "ds4_spec_probe.c"
+    ).read_text()
+    assert "ds4_engine_spec_graph_memory_estimate" in probe
+    assert "ds4_spec_graph_memory" in probe
+    # The estimator itself must keep the terms behind the same switch.
+    estimator = (
+        Path(__file__).resolve().parent.parent / "tools" / "ds4_estimate.c"
+    ).read_text()
+    assert "DS4_HAVE_SPEC_GRAPH_ACCESSOR" in estimator
 
 
 def test_warm_dwarfstar_estimates_without_a_configured_gguf(monkeypatch):

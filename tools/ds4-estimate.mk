@@ -24,7 +24,11 @@
 #       cd /path/to/ds4 && make -f /path/to/yaallb/tools/ds4-estimate.mk \
 #            DS4_ESTIMATE_CPU_ONLY=1
 #
-#   - DS4_ESTIMATE_OUT=<name> changes the output name.
+#   - DS4_ESTIMATE=<name> changes the output name.
+#
+#   - a tree whose ds4.h has no drafter-graph accessor builds without it, and
+#     ds4-estimate then prints spec_graph_supported: null; see ds4_spec_probe.c.
+#     Nothing has to be passed for that.
 
 DS4_ESTIMATE ?= ds4-estimate
 
@@ -50,11 +54,25 @@ DS4_ESTIMATE_CFLAGS += -DDS4_ESTIMATE_CPU_ONLY
 CORE_OBJS := $(CPU_CORE_OBJS)
 endif
 
+# The drafter-graph accessor (ds4.h ds4_spec_graph_memory) is not part of
+# released ds4, so a tree without it must still build the estimator: it reports
+# the per-session drafter terms as unknown instead (see ds4_spec_probe.c). The
+# probe compiles the call, which catches a changed signature or a renamed field
+# as well as a missing accessor, and it writes nothing to the tree.
+#
+# ds4_estimate.host.o already depends on ds4.h, so a pull that adds or drops the
+# accessor relinks the estimator on its own; nothing here has to be invalidated.
+DS4_ESTIMATE_SPEC_PROBE := $(shell $(CC) $(filter-out -std=c99,$(CFLAGS)) -I. \
+    -fsyntax-only $(DS4_ESTIMATE_DIR)ds4_spec_probe.c >/dev/null 2>&1 && echo yes)
+ifeq ($(DS4_ESTIMATE_SPEC_PROBE),yes)
+DS4_ESTIMATE_CFLAGS += -DDS4_HAVE_SPEC_GRAPH_ACCESSOR
+endif
+
 # ds4's Makefile is included first, so its `all:` goal would otherwise win.
 .DEFAULT_GOAL := $(DS4_ESTIMATE)
 
 $(DS4_ESTIMATE): ds4_estimate.host.o $(CORE_OBJS)
 	$(DS4_ESTIMATE_LINK) -o $@ $^ $(DS4_ESTIMATE_LIBS)
 
-ds4_estimate.host.o: $(DS4_ESTIMATE_DIR)ds4_estimate.c ds4.h
+ds4_estimate.host.o: $(DS4_ESTIMATE_DIR)ds4_estimate.c $(DS4_ESTIMATE_DIR)ds4_spec_probe.c ds4.h
 	$(CC) $(DS4_ESTIMATE_CFLAGS) -c -o $@ $(DS4_ESTIMATE_DIR)ds4_estimate.c

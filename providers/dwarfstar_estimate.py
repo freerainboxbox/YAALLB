@@ -16,6 +16,13 @@ context term is shape-dependent), and `Model.memory()` is called with a
 ctx_length that a request may change. So results are memoized per-process and
 warmed at startup (`warm_dwarfstar_estimates`) instead of being persisted under
 the config-hash cache file.
+
+One component is not in released ds4: the per-session drafter graph scratch, which
+the estimator asks ds4's `ds4_engine_spec_graph_memory_estimate()` for. The build
+probes the tree for it (`tools/ds4_spec_probe.c`), so a tree without it builds
+the same estimator and answers `spec_graph_supported: null`; that is resolved by
+`_unknown_spec_graph` to a measured per-session constant rather than to zero,
+which would under-budget a DSpark session.
 """
 
 import itertools
@@ -30,7 +37,10 @@ import log
 # Schema 3 added ds4's own model identity (family/id/aliases) plus
 # spec_graph_supported; an older helper cannot say which model a GGUF is, so it
 # is refused with a rebuild hint rather than scheduled under DeepSeek's shape.
-DS4_ESTIMATOR_SCHEMA_VERSION = 3
+# Schema 4 widened spec_graph_supported to null: the drafter accessor it reports
+# turned out not to be in released ds4, so a helper built against a tree without
+# it now says "unknown" instead of failing to build (see _unknown_spec_graph).
+DS4_ESTIMATOR_SCHEMA_VERSION = 4
 
 # Per-run ds4 instance lock, so estimating never collides with a running
 # ds4-server (which holds /tmp/ds4.lock by default) and never blocks one.
@@ -62,12 +72,36 @@ DS4_CTX_BYTES_PER_TOKEN = 16416
 # block 5) at ctx 1000000 on Metal: 219 MiB capture + 86.6 MiB verifier graph +
 # 1 MiB host. Context-independent except for the per-stage draft raw cache, so
 # it is a much flatter term than the context slope. The estimator reports it
-# exactly (`spec_graph_bytes`), and this number is only a stand-in for when it
-# cannot run; prefer rebuilding the estimator over trusting it.
+# exactly (`spec_graph_bytes`) where the ds4 tree has the accessor; this number
+# stands in both when the estimator cannot run at all and when it can run but the
+# tree has no accessor to ask (schema 4's `spec_graph_supported: null`). Prefer
+# rebuilding the estimator over trusting it.
 DS4_DRAFTER_SCRATCH_FALLBACK_MIB = 306.65
+
+# Families whose drafter graph ds4's accessor does not size even where it exists:# Qwen3.8 and GLM build their session graphs in their own paths, and V4.1 has no
+# such graph (see spec_graph_supported in tools/ds4_estimate.c). A tree that
+# cannot answer at all therefore costs these families nothing extra, and charging
+# them the DeepSeek-shaped constant above would evict for a saving that does not
+# exist. Keep in step with that function.
+DS4_NO_SPEC_GRAPH_FAMILIES = frozenset(
+    {"qwen4exp", "deepseek41", "glm52", "glm53"}
+)
+
+# The family tools/ds4_estimate.c reports when none of ds4's family predicates
+# covers the shape it opened: a ds4 that grew a fifth model, seen by a YAALLB
+# that predates it. The footprint is still ds4's own arithmetic for that shape,
+# but its identity is not DeepSeek's, and this module must not let the provider
+# adopt DeepSeek's model IDs for a GGUF that does not answer to them. Keep in
+# step with DS4_ESTIMATE_FAMILY_UNKNOWN; providers/ds4_models.py has no profile
+# for it, which is what keeps the configured model list in place.
+DS4_UNKNOWN_MODEL_FAMILY = "unknown"
 
 _ESTIMATE_CACHE: dict[tuple, dict] = {}
 _WARNED: set[tuple] = set()
+# One "this ds4 tree has no drafter accessor" warning per tree, not per request.
+_WARNED_NO_ACCESSOR: set[str] = set()
+# One "ds4 opened a shape no family covers" warning per (tree, shape).
+_WARNED_UNKNOWN_FAMILY: set[tuple] = set()
 _LOCK_SEQ = itertools.count()
 
 
@@ -197,6 +231,69 @@ def merged_env(extra: dict | None) -> dict | None:
     if not extra:
         return None
     return {**os.environ, **{key: env_value(value) for key, value in extra.items()}}
+
+
+def _flag_unknown_family(estimate: dict, ds4_dir: str) -> None:
+    """Say once what an unnamed ds4 shape costs YAALLB.
+
+    The estimator prints ``DS4_UNKNOWN_MODEL_FAMILY`` when none of ds4's family
+    predicates covers the opened shape, rather than defaulting to DeepSeek the way
+    it used to. Nothing here can name that model, and guessing is the failure this
+    guard exists to prevent: DeepSeek's model IDs would be advertised for a GGUF
+    that does not serve them, and its family would be one
+    ``DS4_FLAT_CTX_BYTES_PER_TOKEN`` has no slope for. What is *not* lost is the
+    footprint: ds4 measured it for the shape it actually opened.
+    """
+    if estimate.get("model_family") != DS4_UNKNOWN_MODEL_FAMILY:
+        return
+    key = (ds4_dir, estimate.get("model_name"))
+    if key in _WARNED_UNKNOWN_FAMILY:
+        return
+    log.warning(
+        f"ds4 in {ds4_dir} opened {estimate.get('model_name')!r}, a shape none of "
+        f"this estimator's ds4 family predicates covers: reporting it as "
+        f"{DS4_UNKNOWN_MODEL_FAMILY!r} instead of as DeepSeek, so its model list "
+        "stays the configured one (its footprint is still ds4's own). Add the "
+        "shape to tools/ds4_estimate.c and providers/ds4_models.py to serve it by "
+        "name."
+    )
+    _WARNED_UNKNOWN_FAMILY.add(key)
+
+
+def _unknown_spec_graph(
+    estimate: dict, *, ds4_dir: str, mtp_model: str | None, dspark: bool, mtp: bool
+) -> dict:
+    """Budget the drafter term a ds4 tree without the accessor could not report.
+
+    `spec_graph_supported: null` means the tree has no
+    ds4_engine_spec_graph_memory_estimate() to ask — released ds4 does not carry
+    it, so the estimator was built without that term rather than measuring zero.
+    Where the accessor would have answered, the measured per-session constant is
+    substituted (the same stand-in `fallback_estimate` uses) and the log says the
+    projection is approximate; where ds4's accessor declines the family anyway
+    (``DS4_NO_SPEC_GRAPH_FAMILIES``) there is nothing to stand in for, and 0
+    stays. Inventing a constant there would over-evict; leaving it at 0 for a
+    shape that does allocate would under-budget DSpark, which is the one thing a
+    VRAM scheduler must not do silently.
+    """
+    if estimate.get("spec_graph_supported") is not None:
+        return estimate
+    if not (mtp_model or dspark or mtp):
+        return estimate
+    if estimate.get("model_family") in DS4_NO_SPEC_GRAPH_FAMILIES:
+        return estimate
+    if ds4_dir not in _WARNED_NO_ACCESSOR:
+        log.warning(
+            f"ds4 tree {ds4_dir} has no ds4_engine_spec_graph_memory_estimate(), "
+            "so per-session drafter graph scratch is budgeted from the measured "
+            f"{DS4_DRAFTER_SCRATCH_FALLBACK_MIB} MiB constant instead of reported "
+            "by ds4; the context and GGUF terms are still exact"
+        )
+        _WARNED_NO_ACCESSOR.add(ds4_dir)
+    return {
+        **estimate,
+        "spec_graph_bytes": int(DS4_DRAFTER_SCRATCH_FALLBACK_MIB * 2**20),
+    }
 
 
 def run_estimator(
@@ -333,14 +430,25 @@ def run_estimator(
             and all(isinstance(alias, str) and alias for alias in value)
         ):
             missing.append(key)
-        elif key == "spec_graph_supported" and not isinstance(value, bool):
+        # null is a real answer here: the tree has no drafter accessor. It is
+        # resolved by _unknown_spec_graph, not rejected.
+        elif key == "spec_graph_supported" and not (
+            isinstance(value, bool) or value is None
+        ):
             missing.append(key)
     if missing:
         raise Ds4EstimatorError(
             f"ds4 estimator output is missing {missing}; rebuild it with: "
             f"{build_hint(ds4_dir)}"
         )
-    return estimate
+    _flag_unknown_family(estimate, ds4_dir)
+    return _unknown_spec_graph(
+        estimate,
+        ds4_dir=ds4_dir,
+        mtp_model=mtp_model,
+        dspark=dspark,
+        mtp=mtp,
+    )
 
 
 def gguf_bytes(ds4_dir: str, *paths: str | None) -> int:

@@ -21,6 +21,7 @@ from abstractions.descriptor import ModelDescriptor
 from abstractions.load_options import LoadOptions
 from abstractions.routing import lookup_model
 from providers.dwarfstar import DwarfStarProvider
+from providers.dwarfstar_estimate import DS4_UNKNOWN_MODEL_FAMILY
 from providers.ds4_models import (
     DS4_DEFAULT_MAX_COMPLETION_TOKENS,
     DS4_MODEL_PROFILES,
@@ -157,7 +158,15 @@ def _estimator_lists() -> dict:
         re.findall(r'if \((ds4_engine_is_\w+)\(e\)\) return "(\w+)";', families)
     )
     default_array = re.search(r"const char \*const \*ids = (\w+);", aliases).group(1)
-    default_family = re.search(r'\n    return "(\w+)";', families).group(1)
+    # DeepSeek is the default of both functions, but a *checked* one: the
+    # estimator only falls through to it for the shapes ds4's own server answers
+    # with the deepseek-v4 ids, and the ungated fallback is the unknown-family
+    # sentinel. See test_estimator_gates_its_deepseek_default_on_ds4s_shapes.
+    default_family = re.search(
+        r'return deepseek4_shape_reported\(e\) \? "(\w+)"\s*\n'
+        r"\s*: DS4_ESTIMATE_FAMILY_UNKNOWN;",
+        families,
+    ).group(1)
 
     served = {
         families_by_predicate[predicate]: arrays[name]
@@ -180,6 +189,50 @@ def test_registry_lists_exactly_what_the_estimator_says_ds4_lists():
     assert {
         profile.family: profile.aliases for profile in DS4_MODEL_PROFILES
     } == ESTIMATOR_IDS
+
+
+def test_estimator_gates_its_deepseek_default_on_ds4s_shapes():
+    # The estimator's family and alias functions both default to DeepSeek,
+    # because ds4's own server does. An *ungated* default is the one silent
+    # failure left: a ds4 that grew a fifth shape answers none of the family
+    # predicates, would be labelled deepseek4, and would be registered under
+    # Flash/PRO ids its GGUF never serves. So the default must stay conditional
+    # on ds4's own name for the opened shape, with the sentinel as the fallback.
+    src = (
+        Path(__file__).resolve().parent.parent / "tools" / "ds4_estimate.c"
+    ).read_text()
+
+    shapes = re.search(
+        r"static const char \*const deepseek4_shapes\[\] = \{(.*?)\};", src, re.S
+    )
+    assert shapes, "the estimator lost the DeepSeek shape table"
+    assert tuple(re.findall(r'"([^"]+)"', shapes.group(1))) == (
+        "DeepSeek V4 Flash",
+        "DeepSeek V4 Pro",
+    ), "these are the two shapes ds4_server.c answers with the deepseek-v4 ids"
+
+    assert re.search(
+        r'return deepseek4_shape_reported\(e\) \? "deepseek4"\s*\n'
+        r"\s*: DS4_ESTIMATE_FAMILY_UNKNOWN;",
+        src,
+    ), "model_family() must not fall through to DeepSeek unchecked"
+    # And its aliases must be gated the same way, or the shape would still be
+    # advertised under ids it does not answer to.
+    assert re.search(
+        r'if \(!strcmp\(model_family\(e\), DS4_ESTIMATE_FAMILY_UNKNOWN\)\) \{\s*'
+        r"ids = unknown;",
+        src,
+    )
+
+
+def test_unknown_family_has_no_registry_profile():
+    # What makes the sentinel safe: no profile means the provider keeps the
+    # model list config asked for (and says so) instead of presenting DeepSeek's
+    # ids for a model it cannot name.
+    assert DS4_UNKNOWN_MODEL_FAMILY not in {
+        profile.family for profile in DS4_MODEL_PROFILES
+    }
+    assert profile_for(DS4_UNKNOWN_MODEL_FAMILY) is None
 
 
 def test_no_registry_alias_is_something_ds4_does_not_honour():
