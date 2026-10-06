@@ -28,7 +28,10 @@
  * The JSON carries ds4's own model identity (model_family/model_id/model_aliases
  * — the same predicates ds4-server's HTTP layer uses) so YAALLB can register
  * the model IDs and context ceiling the GGUF will really serve, rather than
- * assuming every ds4 tree serves DeepSeek V4 Flash/PRO.
+ * assuming every ds4 tree serves DeepSeek V4 Flash/PRO. DeepSeek is that
+ * mapping's default because it is ds4-server's default too, but a checked one:
+ * a shape none of the predicates covers reports the unknown-family sentinel
+ * instead of DeepSeek's identity.
  *
  * Build it against a built ds4 tree (objects already compiled):
  *
@@ -65,6 +68,15 @@
  * Keep providers/dwarfstar_estimate.py DS4_ESTIMATOR_SCHEMA_VERSION in step.
  */
 #define DS4_ESTIMATE_SCHEMA_VERSION 4
+
+/* The family for a shape none of ds4's family predicates covers, which is what
+ * a ds4 that grew a fifth model does to this program. The footprint numbers are
+ * still ds4's own and exact for the shape it opened; what is unknowable is its
+ * identity. The sentinel is deliberately not a routable model id:
+ * providers/dwarfstar_estimate.py warns on it and providers/ds4_models.py has no
+ * profile for it, so YAALLB keeps the model list config asked for rather than
+ * serving DeepSeek's ids for a GGUF that does not answer to them. */
+#define DS4_ESTIMATE_FAMILY_UNKNOWN "unknown"
 
 /*
  * The drafter terms exactly as this program prints them.
@@ -123,12 +135,40 @@ static const char *need_value(int *i, int argc, char **argv, const char *opt) {
  * shape except GLM, where 5.2 and 5.3 share the DSA family, so the GLM 5.3
  * predicate has to be asked first. The family strings are the keys of YAALLB's
  * own model registry (providers/ds4_models.py); keep the two in step. */
+
+/* The two shapes ds4's server actually answers with the deepseek-v4 ids: it
+ * falls through to them, and send_models() lists both for that family. So
+ * DeepSeek is a default, but ds4 names the shape it opened and that default can
+ * be checked rather than assumed.
+ *
+ * Without the check, a ds4 that grew a fifth family — a new predicate, or a new
+ * DeepSeek-family shape under a new id — would answer none of the predicates
+ * below and be reported as deepseek4 with Flash/PRO aliases: YAALLB would
+ * register models the GGUF does not serve and price it as a family it is not. A
+ * ds4 that renames one of these strings lands in the same branch — loud, one
+ * line to add, and never a silent DeepSeek label on something else. */
+static const char *const deepseek4_shapes[] = {
+    "DeepSeek V4 Flash", "DeepSeek V4 Pro"};
+#define DS4_N_SHAPES(shapes) (sizeof(shapes) / sizeof((shapes)[0]))
+
+static bool deepseek4_shape_reported(ds4_engine *e) {
+    const char *name = ds4_engine_model_name(e);
+    if (!name) return false;
+    for (size_t i = 0; i < DS4_N_SHAPES(deepseek4_shapes); i++) {
+        if (!strcmp(name, deepseek4_shapes[i])) return true;
+    }
+    return false;
+}
+
 static const char *model_family(ds4_engine *e) {
     if (ds4_engine_is_qwen4(e)) return "qwen4exp";
     if (ds4_engine_is_deepseek41(e)) return "deepseek41";
     if (ds4_engine_is_glm53(e)) return "glm53";
     if (ds4_engine_is_glm_dsa(e)) return "glm52";
-    return "deepseek4";
+    /* The default ds4's own server uses, but only for the shapes that default
+     * describes. */
+    return deepseek4_shape_reported(e) ? "deepseek4"
+                                       : DS4_ESTIMATE_FAMILY_UNKNOWN;
 }
 
 #define DS4_N_ALIASES(ids) (sizeof(ids) / sizeof((ids)[0]))
@@ -154,10 +194,16 @@ static void print_model_aliases(ds4_engine *e) {
         "glm-5.3-flash", "glm-5.3-flash-chat", "glm-5.3-flash-reasoner"};
     static const char *const glm52[] = {
         "glm-5.2", "glm-5.2-chat", "glm-5.2-reasoner"};
+    static const char *const unknown[] = {DS4_ESTIMATE_FAMILY_UNKNOWN};
     const char *const *ids = deepseek4;
     size_t count = DS4_N_ALIASES(deepseek4);
 
-    if (ds4_engine_is_qwen4(e)) {
+    /* ds4's served ids for a shape this program predates are unknowable here,
+     * and inventing DeepSeek's would advertise a model that does not exist. */
+    if (!strcmp(model_family(e), DS4_ESTIMATE_FAMILY_UNKNOWN)) {
+        ids = unknown;
+        count = DS4_N_ALIASES(unknown);
+    } else if (ds4_engine_is_qwen4(e)) {
         ids = qwen4;
         count = DS4_N_ALIASES(qwen4);
     } else if (ds4_engine_is_deepseek41(e)) {

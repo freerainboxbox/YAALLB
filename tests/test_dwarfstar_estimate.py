@@ -65,10 +65,12 @@ def clean_estimate_caches():
     dse._ESTIMATE_CACHE.clear()
     dse._WARNED.clear()
     dse._WARNED_NO_ACCESSOR.clear()
+    dse._WARNED_UNKNOWN_FAMILY.clear()
     yield
     dse._ESTIMATE_CACHE.clear()
     dse._WARNED.clear()
     dse._WARNED_NO_ACCESSOR.clear()
+    dse._WARNED_UNKNOWN_FAMILY.clear()
 
 
 class FakeEstimator:
@@ -346,6 +348,62 @@ def test_unknown_drafter_answer_is_zero_without_a_configured_drafter(
     result = dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
 
     assert result["spec_graph_bytes"] == 0
+
+
+def test_run_estimator_flags_a_shape_no_family_covers(fake_estimator, monkeypatch):
+    # A ds4 that grew a fifth model shape answers none of the family predicates
+    # the estimator asks, so it reports the unknown-family sentinel instead of
+    # defaulting to DeepSeek. YAALLB must say so: ds4's footprint numbers are
+    # still exact, but DeepSeek's model IDs are not this shape's, and presenting
+    # them would advertise a model the GGUF never serves.
+    warned = []
+    monkeypatch.setattr(dse.log, "warning", lambda message: warned.append(message))
+    fake_estimator(
+        stdout=json.dumps(
+            dict(
+                ESTIMATE,
+                model_name="DeepSeek V5 Nano",
+                model_family=dse.DS4_UNKNOWN_MODEL_FAMILY,
+                model_aliases=[dse.DS4_UNKNOWN_MODEL_FAMILY],
+            )
+        )
+    )
+
+    result = dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
+    assert result["model_family"] == dse.DS4_UNKNOWN_MODEL_FAMILY
+    # Still ds4's own arithmetic, not the flat fallback.
+    assert result["context_bytes"] == ESTIMATE["context_bytes"]
+    assert any("DeepSeek V5 Nano" in m for m in warned)
+    assert any(dse.DS4_UNKNOWN_MODEL_FAMILY in m for m in warned)
+
+    # Once per (tree, shape), not per request.
+    dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=8192)
+    assert len(warned) == 1
+
+
+def test_run_estimator_does_not_flag_a_known_family(fake_estimator, monkeypatch):
+    warned = []
+    monkeypatch.setattr(dse.log, "warning", lambda message: warned.append(message))
+    fake_estimator()
+
+    result = dse.run_estimator(ds4_dir="/tmp/ds4", gguf_path="m.gguf", ctx=4096)
+
+    assert result["model_family"] == "deepseek4"
+    assert not warned
+
+
+def test_fallback_prices_an_unnamed_family_from_nothing(fake_estimator, monkeypatch):
+    # The sentinel is not a family with a measured flat slope, so a model that
+    # needs the fallback cannot be priced from DeepSeek's numbers either.
+    dse._WARNED_UNKNOWN_FAMILY.clear()
+    with pytest.raises(dse.Ds4EstimatorError, match="flat VRAM model"):
+        dse.fallback_estimate(
+            ds4_dir="/tmp/ds4",
+            gguf_path="m.gguf",
+            ctx=4096,
+            model_family=dse.DS4_UNKNOWN_MODEL_FAMILY,
+        )
 
 
 def test_fallback_uses_real_gguf_sizes_plus_a_flat_ctx_term(tmp_path):
@@ -851,6 +909,15 @@ def test_estimate_mk_probes_for_the_drafter_accessor():
     ).read_text()
     assert "DS4_HAVE_SPEC_GRAPH_ACCESSOR" in makefile
     assert "ds4_spec_probe.c" in makefile
+    # The DeepSeek identity is a default, so it has to be a checked one: only
+    # the shapes ds4's own server answers with the deepseek-v4 ids may be
+    # labelled deepseek4. Anything else is the unknown-family sentinel.
+    estimator = (
+        Path(__file__).resolve().parent.parent / "tools" / "ds4_estimate.c"
+    ).read_text()
+    assert "DS4_ESTIMATE_FAMILY_UNKNOWN" in estimator
+    assert '"DeepSeek V4 Flash"' in estimator
+    assert '"DeepSeek V4 Pro"' in estimator
     probe = (
         Path(__file__).resolve().parent.parent / "tools" / "ds4_spec_probe.c"
     ).read_text()

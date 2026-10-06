@@ -78,8 +78,7 @@ DS4_CTX_BYTES_PER_TOKEN = 16416
 # rebuilding the estimator over trusting it.
 DS4_DRAFTER_SCRATCH_FALLBACK_MIB = 306.65
 
-# Families whose drafter graph ds4's accessor does not size even where it exists:
-# Qwen3.8 and GLM build their session graphs in their own paths, and V4.1 has no
+# Families whose drafter graph ds4's accessor does not size even where it exists:# Qwen3.8 and GLM build their session graphs in their own paths, and V4.1 has no
 # such graph (see spec_graph_supported in tools/ds4_estimate.c). A tree that
 # cannot answer at all therefore costs these families nothing extra, and charging
 # them the DeepSeek-shaped constant above would evict for a saving that does not
@@ -88,10 +87,21 @@ DS4_NO_SPEC_GRAPH_FAMILIES = frozenset(
     {"qwen4exp", "deepseek41", "glm52", "glm53"}
 )
 
+# The family tools/ds4_estimate.c reports when none of ds4's family predicates
+# covers the shape it opened: a ds4 that grew a fifth model, seen by a YAALLB
+# that predates it. The footprint is still ds4's own arithmetic for that shape,
+# but its identity is not DeepSeek's, and this module must not let the provider
+# adopt DeepSeek's model IDs for a GGUF that does not answer to them. Keep in
+# step with DS4_ESTIMATE_FAMILY_UNKNOWN; providers/ds4_models.py has no profile
+# for it, which is what keeps the configured model list in place.
+DS4_UNKNOWN_MODEL_FAMILY = "unknown"
+
 _ESTIMATE_CACHE: dict[tuple, dict] = {}
 _WARNED: set[tuple] = set()
 # One "this ds4 tree has no drafter accessor" warning per tree, not per request.
 _WARNED_NO_ACCESSOR: set[str] = set()
+# One "ds4 opened a shape no family covers" warning per (tree, shape).
+_WARNED_UNKNOWN_FAMILY: set[tuple] = set()
 _LOCK_SEQ = itertools.count()
 
 
@@ -221,6 +231,33 @@ def merged_env(extra: dict | None) -> dict | None:
     if not extra:
         return None
     return {**os.environ, **{key: env_value(value) for key, value in extra.items()}}
+
+
+def _flag_unknown_family(estimate: dict, ds4_dir: str) -> None:
+    """Say once what an unnamed ds4 shape costs YAALLB.
+
+    The estimator prints ``DS4_UNKNOWN_MODEL_FAMILY`` when none of ds4's family
+    predicates covers the opened shape, rather than defaulting to DeepSeek the way
+    it used to. Nothing here can name that model, and guessing is the failure this
+    guard exists to prevent: DeepSeek's model IDs would be advertised for a GGUF
+    that does not serve them, and its family would be one
+    ``DS4_FLAT_CTX_BYTES_PER_TOKEN`` has no slope for. What is *not* lost is the
+    footprint: ds4 measured it for the shape it actually opened.
+    """
+    if estimate.get("model_family") != DS4_UNKNOWN_MODEL_FAMILY:
+        return
+    key = (ds4_dir, estimate.get("model_name"))
+    if key in _WARNED_UNKNOWN_FAMILY:
+        return
+    log.warning(
+        f"ds4 in {ds4_dir} opened {estimate.get('model_name')!r}, a shape none of "
+        f"this estimator's ds4 family predicates covers: reporting it as "
+        f"{DS4_UNKNOWN_MODEL_FAMILY!r} instead of as DeepSeek, so its model list "
+        "stays the configured one (its footprint is still ds4's own). Add the "
+        "shape to tools/ds4_estimate.c and providers/ds4_models.py to serve it by "
+        "name."
+    )
+    _WARNED_UNKNOWN_FAMILY.add(key)
 
 
 def _unknown_spec_graph(
@@ -404,6 +441,7 @@ def run_estimator(
             f"ds4 estimator output is missing {missing}; rebuild it with: "
             f"{build_hint(ds4_dir)}"
         )
+    _flag_unknown_family(estimate, ds4_dir)
     return _unknown_spec_graph(
         estimate,
         ds4_dir=ds4_dir,

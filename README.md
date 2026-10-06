@@ -430,7 +430,10 @@ come from two places, in this order:
    context, so the shape is known before the expensive ones are priced. A ds4
    pull that renames, adds or drops a listed ID therefore cannot leave YAALLB
    advertising an ID the engine does not answer (which a client would only find
-   out by getting an error back) or hiding one it does.
+   out by getting an error back) or hiding one it does. DeepSeek is the default
+   of that mapping only for the two shapes ds4's own server answers with the
+   `deepseek-v4` ids: a shape none of ds4's family predicates covers — a ds4
+   that grew a fifth model — is reported as `unknown`, never as DeepSeek.
 2. **`providers/ds4_models.py`**, for the window before a GGUF has been opened,
    and for the aliases ds4 deliberately keeps out of its own model list. Its
    list per family mirrors what `ds4-server` would answer `/v1/models` with
@@ -454,6 +457,12 @@ for one:
   and the same three under `zai/`. No documented ceiling.
 - `glm52` — `glm-5.2`, `-chat`, `-reasoner`, plus `-no-think`, `-nothink` and
   the same three under `zai/`. No documented ceiling.
+
+`unknown` is not a family here on purpose. It is the sentinel the estimator
+reports for a shape no ds4 family predicate covers, and with no profile the
+provider keeps the model list config asked for and warns once per shape, rather
+than presenting DeepSeek's ids for a GGUF that does not answer to them. Its
+footprint is unaffected: ds4 measured it for the shape it actually opened.
 
 The names after "plus" in each family are its `thinking_aliases`, and they are
 the only thing the registry is allowed to add on top of what ds4 says it
