@@ -17,6 +17,14 @@
  * JSON also says whether those components describe the opened model at all
  * (spec_graph_supported): Qwen3.8 and GLM build their graphs in their own paths.
  *
+ * That accessor is not in released ds4 either, so ds4-estimate.mk probes the
+ * tree for it (tools/ds4_spec_probe.c) and this program builds without it:
+ * spec_graph_supported is then printed as null, which says "this ds4 cannot
+ * answer" rather than "this model has no such graph", and the terms read 0
+ * because nothing measured them. YAALLB budgets its own measured constant in
+ * that case (providers/dwarfstar_estimate.py), so the difference is a log line
+ * and an approximation, never a build failure.
+ *
  * The JSON carries ds4's own model identity (model_family/model_id/model_aliases
  * — the same predicates ds4-server's HTTP layer uses) so YAALLB can register
  * the model IDs and context ceiling the GGUF will really serve, rather than
@@ -49,7 +57,40 @@
 
 #include "ds4.h"
 
-#define DS4_ESTIMATE_SCHEMA_VERSION 3
+/*
+ * Schema 3 added ds4's own model identity (family/id/aliases) plus
+ * spec_graph_supported. Schema 4 widened spec_graph_supported to null: the
+ * drafter accessor turned out not to be in released ds4, so a tree without it
+ * now builds and has to distinguish "no such graph" from "cannot tell".
+ * Keep providers/dwarfstar_estimate.py DS4_ESTIMATOR_SCHEMA_VERSION in step.
+ */
+#define DS4_ESTIMATE_SCHEMA_VERSION 4
+
+/*
+ * The drafter terms exactly as this program prints them.
+ *
+ * Where the tree exposes the accessor, that struct *is* the answer's type. Where
+ * it does not, the same field names are filled with zeros and
+ * spec_graph_supported is printed as null, which says "this ds4 cannot answer"
+ * rather than "this model has no such graph", so the zeros are unknowns instead
+ * of measurements and YAALLB budgets its own measured constant.
+ *
+ * The name is deliberately this program's own: a tree whose accessor exists but
+ * no longer matches the probe keeps its type out of this compile, so the
+ * estimator degrades to "unknown" rather than failing to build over a struct it
+ * never read.
+ */
+#ifdef DS4_HAVE_SPEC_GRAPH_ACCESSOR
+typedef ds4_spec_graph_memory ds4_estimate_spec_graph;
+#else
+typedef struct {
+    uint64_t dspark_capture_bytes;
+    uint64_t verifier_scratch_bytes;
+    uint64_t host_scratch_bytes;
+    uint64_t total_bytes;
+    uint32_t dspark_capture_stages; /* per-stage draft raw caches reserved */
+} ds4_estimate_spec_graph;
+#endif
 
 static void usage(void) {
     fprintf(stderr,
@@ -143,6 +184,7 @@ static void print_model_aliases(ds4_engine *e) {
  * for the GLM DSA family for exactly that reason), and a CPU backend has no
  * graph at all. Reporting DeepSeek-shaped numbers for those would silently
  * mis-budget a drafter, so the estimator declines instead. */
+#ifdef DS4_HAVE_SPEC_GRAPH_ACCESSOR
 static bool spec_graph_supported(ds4_engine *e, ds4_backend backend) {
     if (backend == DS4_BACKEND_CPU) return false;
     if (ds4_engine_is_qwen4(e)) return false;
@@ -151,6 +193,7 @@ static bool spec_graph_supported(ds4_engine *e, ds4_backend backend) {
     if (ds4_engine_is_glm_dsa(e)) return false;
     return true;
 }
+#endif /* DS4_HAVE_SPEC_GRAPH_ACCESSOR */
 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
@@ -277,12 +320,19 @@ int main(int argc, char **argv) {
      * whenever a DSpark support model is loaded, --dspark or not), the verifier
      * snapshots/MTP buffers/draft logits, and the draft-side host buffers. Only
      * asked when the accessor pair describes the opened model (see
-     * spec_graph_supported). */
+     * spec_graph_supported), and asked at all only when this tree has it —
+     * otherwise null, so the reader knows the zeros are unknowns. */
+#ifdef DS4_HAVE_SPEC_GRAPH_ACCESSOR
     const bool spec_supported = spec_graph_supported(engine, backend);
-    const ds4_spec_graph_memory spec =
+    const ds4_estimate_spec_graph spec =
         spec_supported
             ? ds4_engine_spec_graph_memory_estimate(engine, ctx, effective_chunk)
-            : (ds4_spec_graph_memory){0};
+            : (ds4_estimate_spec_graph){0};
+    const char *const spec_graph_state = spec_supported ? "true" : "false";
+#else
+    const ds4_estimate_spec_graph spec = {0};
+    const char *const spec_graph_state = "null";
+#endif
 
     /* model_name/backend_name are ds4's own fixed shape/backend strings, so
      * they need no JSON escaping; nothing here is model- or path-derived. */
@@ -338,7 +388,7 @@ int main(int argc, char **argv) {
            ds4_engine_mtp_draft_tokens(engine),
            model_family(engine),
            ds4_engine_model_id(engine),
-           spec_supported ? "true" : "false");
+           spec_graph_state);
 
     /* The alias array is built by print_model_aliases() (fixed literals, so it
      * needs no escaping) because printf cannot carry a variable-length list. */

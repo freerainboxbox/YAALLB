@@ -16,7 +16,7 @@ scheduling.py      VRAM-aware model scheduler and eviction
 log.py             Colored, ISO-timestamped logging to stderr
 abstractions/      Base types: Provider, Model, ModelDescriptor, LoadOptions; routing
 providers/         Concrete providers: LMStudioProvider, DwarfStarProvider, LlamaCppProvider, DflashProvider
-tools/             ds4_estimate.c + ds4-estimate.mk: footprint estimator built inside your ds4 tree
+tools/             ds4_estimate.c + ds4_spec_probe.c + ds4-estimate.mk: footprint estimator built inside your ds4 tree
 config.json        Provider instances per type ("lms", "ds4", "llama_cpp", ...)
 tests/             pytest suite
 pyproject.toml     Project metadata and dependencies (uv-managed)
@@ -553,7 +553,10 @@ absolute `-f`:
 The fragment reads the ds4 tree's own `Makefile`, so it links whatever that tree
 was built with (Metal/CUDA/ROCm objects and link flags come from it), and it is
 additive: it writes `ds4-estimate` and `ds4_estimate.host.o` next to
-`ds4-server` and rewrites nothing else. Make does no work at all when the tree
+`ds4-server` and rewrites nothing else. It also compiles `tools/ds4_spec_probe.c`
+against that tree's `ds4.h` to learn whether the tree can report per-session
+drafter graph scratch at all (see the drafter paragraph below); the probe reads the
+tree and writes nothing to it. Make does no work at all when the tree
 is already current, which is also why the estimator cannot quietly go stale
 against an updated ds4 any more — the next startup relinks it. A tree built
 with `make cpu` has no GPU objects to link against, so the link is retried once
@@ -609,11 +612,18 @@ Metal it is 218.98 MiB capture + 86.66 MiB verifier graph + 1.00 MiB host =
 buffers (like the support GGUF itself) are budgeted even with `dspark` off,
 because ds4 maps the support model and configures capture as soon as it is
 loaded; only the verifier half needs `dspark` or a legacy MTP support model.
-That accessor is part of the estimator's link, so a ds4 tree that predates it
-fails the build loudly at startup instead of under-budgeting DSpark in silence.
-Start a server with
-`DS4_SPEC_MEM_REPORT=1` to see each session print what it allocated next to what
-was projected, flagging any sizing drift.
+That accessor is **not in released ds4**, so it cannot be a link requirement:
+`ds4-estimate.mk` probes the tree for it and builds the estimator with those
+terms only when the tree answers. A tree without it builds the same estimator
+and prints `spec_graph_supported: null` — "this ds4 cannot tell", not "this
+model has no such graph" — and YAALLB then budgets `DS4_DRAFTER_SCRATCH_FALLBACK_MIB`
+per session where ds4's accessor would have answered (one warning per tree, the
+context and GGUF terms still exact), and still 0 for the families that accessor
+declines anyway (Qwen3.8, GLM, V4.1). Neither path under-budgets DSpark in
+silence; a tree whose accessor exists but no longer matches the probe degrades to
+null as well, so a ds4 update cannot break startup with a compile error.
+A tree carrying that accessor also prints, with `DS4_SPEC_MEM_REPORT=1`, what
+each session allocated next to what was projected, flagging any sizing drift.
 
 Not counted, and to be covered with `safety_buffer_mib` when you use them:
 
